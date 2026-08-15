@@ -1,0 +1,63 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.buildlog/
+.history
+.svn/
+migrate_working_dir/
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# VS Code (optional — uncomment if you don't want to share launch configs)
+#.vscode/
+
+# Flutter/Dart/Pub related
+**/doc/api/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Android Studio build artifacts
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+# Android related
+android/.gradle/
+android/gradlew
+android/gradlew.bat
+android/local.properties
+android/**/gradle-wrapper.jar
+android/key.properties
+
+# iOS related
+ios/Flutter/Generated.xcconfig
+ios/Runner/GeneratedPluginRegistrant.m
+ios/Pods/
+ios/.symlinks/
+
+# Firebase / secrets — critical for your project
+**/google-services.json
+**/GoogleService-Info.plist
+serviceAccountKey.json
+*.env
+
+# API keys — never commit this file (see lib/api_keys.example.dart for setup)
+lib/api_keys.dart
