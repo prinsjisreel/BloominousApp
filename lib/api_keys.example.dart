@@ -19,4 +19,7 @@ class ApiKeys {
 
   // Get this from PayMongo Dashboard -> Settings -> Developers
   static const String paymongoSecretKey = 'PASTE_YOUR_PAYMONGO_SECRET_KEY_HERE';
+
+  // Get this from https://www.pexels.com/api -> your API key
+  static const String pexelsApiKey = 'PASTE_YOUR_PEXELS_API_KEY_HERE';
 }

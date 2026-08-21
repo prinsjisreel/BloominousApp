@@ -1079,4 +1079,47 @@ class GeminiService {
       'description': text
     };
   }
+
+  /// Searches Pexels for real reference photos of the given flower name
+  /// (e.g. "red roses", "sunflowers"). Returns a list of direct image URLs,
+  /// or an empty list if nothing was found or the call failed -- this is
+  /// a "nice to have" enhancement, so failures here should never block the
+  /// rest of the reservation flow.
+  static Future<List<String>> searchFlowerPhotos(String flowerQuery,
+      {int perPage = 4}) async {
+    if (ApiKeys.pexelsApiKey.isEmpty ||
+        ApiKeys.pexelsApiKey == 'ZsXwWXgTuSlBIXnlLlOJ2QNSX9OmFwzGvrKDvDM2Tfa7vTts88nnkKwx') {
+      print("Pexels key not set -- skipping flower photo search.");
+      return [];
+    }
+
+    try {
+      final url = Uri.parse(
+        'https://api.pexels.com/v1/search?query=${Uri.encodeComponent(flowerQuery)}&per_page=$perPage',
+      );
+
+      final response = await http.get(
+        url,
+        headers: {'Authorization': ApiKeys.pexelsApiKey},
+      );
+
+      if (response.statusCode != 200) {
+        print("Pexels search failed (${response.statusCode}): ${response.body}");
+        return [];
+      }
+
+      final data = json.decode(response.body);
+      final photos = data['photos'] as List?;
+      if (photos == null) return [];
+
+      return photos
+          .map((p) => (p['src']?['medium'] ?? p['src']?['original'])
+      as String?)
+          .whereType<String>()
+          .toList();
+    } catch (e) {
+      print("Error searching Pexels: $e");
+      return [];
+    }
+  }
 }

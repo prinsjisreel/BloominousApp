@@ -1,0 +1,4 @@
+﻿{
+  "contents": [{"parts": [{"text": "a single red rose, photorealistic"}]}],
+  "generationConfig": {"responseModalities": ["TEXT","IMAGE"]}
+}

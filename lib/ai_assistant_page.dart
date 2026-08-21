@@ -2,13 +2,21 @@ import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:image_picker/image_picker.dart';
+
+import 'api_keys.dart';
 import 'gemini_service.dart';
 import 'builder_page.dart';
 import 'product_catalog_page.dart';
+import 'inventory_data.dart';
 
 class AIAssistantPage extends StatefulWidget {
   const AIAssistantPage({super.key});
@@ -34,9 +42,71 @@ class _AIAssistantPageState extends State<AIAssistantPage>
   final TextEditingController _customApiPromptController =
   TextEditingController();
 
+  // True only when a REAL AI-generated image (Gemini or Stability AI) was
+  // produced -- false when generation failed and we're only showing the
+  // free Canvas-drawn placeholder (or nothing at all). The flower
+  // description/theme text is gated on this flag so it's never shown next
+  // to a picture that doesn't actually reflect it.
+  bool _aiImageGenerationSucceeded = false;
+
+  // Reservation Submission State
+  final TextEditingController _firstNameController = TextEditingController();
+  final TextEditingController _middleNameController = TextEditingController();
+  final TextEditingController _lastNameController = TextEditingController();
+  final TextEditingController _phoneController = TextEditingController();
+  DateTime? _selectedEventDate;
+  bool _isSubmittingReservation = false;
+  bool _reservationSubmitted = false;
+
+  // Related flower reference photos fetched from Pexels once we know
+  // which flower the AI recommended -- purely supplementary, never blocks
+  // the rest of the flow if it comes back empty.
+  List<String> _flowerReferencePhotos = [];
+  bool _isLoadingFlowerPhotos = false;
+
+  Future<void> _fetchPexelsPhotos(String query) async {
+    try {
+      final url = Uri.parse(
+          'https://api.pexels.com/v1/search?query=${Uri.encodeComponent("$query flowers")}&per_page=8');
+      final response = await http.get(url, headers: {
+        'Authorization': ApiKeys.pexelsApiKey,
+      });
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        final photosList = data['photos'] as List;
+        final List<String> imageUrls = photosList
+            .map((photo) => photo['src']['medium'].toString())
+            .toList();
+
+        if (mounted) {
+          setState(() {
+            _flowerReferencePhotos = imageUrls;
+            _isLoadingFlowerPhotos = false;
+          });
+        }
+      } else {
+        print("Pexels error: ${response.statusCode} - ${response.body}");
+        if (mounted) {
+          setState(() {
+            _isLoadingFlowerPhotos = false;
+          });
+        }
+      }
+    } catch (e) {
+      print("Error fetching Pexels photos: $e");
+      if (mounted) {
+        setState(() {
+          _isLoadingFlowerPhotos = false;
+        });
+      }
+    }
+  }
+
   Future<void> _generateAiPhotoSynthesis({String? customPrompt}) async {
     setState(() {
       _isSynthesizingAiImage = true;
+      _aiImageGenerationSucceeded = false;
     });
 
     final flowerName = _selectedFlowerType == 'sunflower'
@@ -97,7 +167,8 @@ class _AIAssistantPageState extends State<AIAssistantPage>
           // every single attempt until billing is enabled. Showing a banner
           // every time is just noise; only the final outcome (success or
           // total failure below) is worth surfacing to the user.
-          print("Gemini failed, trying Stability AI fallback: ${geminiError.message}");
+          print(
+              "Gemini failed, trying Stability AI fallback: ${geminiError.message}");
           bytes = await GeminiService.editUserPhotoWithStabilityAI(
             userRoomBytes: _imageBytes!,
             userInstruction: promptText,
@@ -114,6 +185,10 @@ class _AIAssistantPageState extends State<AIAssistantPage>
         setState(() {
           if (bytes != null && bytes.isNotEmpty) {
             _aiSynthesizedImageBytes = bytes;
+            // Real Gemini or Stability AI output -- safe to show the
+            // flower description text now, since it actually matches
+            // what's on screen.
+            _aiImageGenerationSucceeded = true;
           }
           _isSynthesizingAiImage = false;
         });
@@ -187,7 +262,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
               decoration: BoxDecoration(
-                color: Colors.black.withOpacity(0.7),
+                color: Colors.black.withValues(alpha: 0.7),
                 borderRadius: BorderRadius.circular(12),
               ),
               child: const Text(
@@ -207,7 +282,8 @@ class _AIAssistantPageState extends State<AIAssistantPage>
   int _selectedOverlayIndex = 0;
   String _selectedFlowerType =
       'rose'; // 'rose', 'sunflower', 'tulip', 'lily', 'carnation'
-  String _selectedPotType = 'glass'; // 'glass', 'ceramic', 'terracotta', 'gold'
+  String _selectedPotType =
+      'glass'; // 'glass', 'ceramic', 'terracotta', 'gold'
 
   String _getPhotorealisticOverlayUrl() {
     if (_selectedFlowerType == 'rose') {
@@ -319,6 +395,11 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     _visualNoteController.dispose();
     _chatController.dispose();
     _scrollController.dispose();
+    _firstNameController.dispose();
+    _middleNameController.dispose();
+    _lastNameController.dispose();
+    _phoneController.dispose();
+    _customApiPromptController.dispose();
     super.dispose();
   }
 
@@ -334,6 +415,9 @@ class _AIAssistantPageState extends State<AIAssistantPage>
           _imageBytes = bytes;
           _visualResult = null;
           _aiSynthesizedImageBytes = null;
+          _aiImageGenerationSucceeded = false;
+          _flowerReferencePhotos = [];
+          _reservationSubmitted = false;
         });
         // No auto-analysis here -- the user finishes typing their occasion
         // note first, then explicitly taps "Analyze & Match Floral Theme".
@@ -345,6 +429,40 @@ class _AIAssistantPageState extends State<AIAssistantPage>
         );
       }
     }
+  }
+
+  void _showImageSourceBottomSheet() {
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (context) {
+        return SafeArea(
+          child: Wrap(
+            children: [
+              ListTile(
+                leading:
+                const Icon(Icons.photo_camera, color: Color(0xFFF59E0B)),
+                title: const Text('Take a Photo'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _pickImage(ImageSource.camera);
+                },
+              ),
+              ListTile(
+                leading:
+                const Icon(Icons.photo_library, color: Color(0xFFF59E0B)),
+                title: const Text('Choose from Gallery'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _pickImage(ImageSource.gallery);
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
   }
 
   Future<void> _analyzeVisualImage() async {
@@ -401,17 +519,131 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     }
 
     // Step 2: now that _selectedFlowerType/_selectedPotType reflect what the
-    // AI actually recommended, generate the real photo edit using them.
+    // AI actually recommended, generate the real photo edit asynchronously.
     final userNote = _visualNoteController.text.trim();
-    if (_imageBytes != null) {
-      await _generateAiPhotoSynthesis(
-          customPrompt: userNote.isNotEmpty ? userNote : null);
-    }
+
+    _generateAiPhotoSynthesis(
+        customPrompt: userNote.isNotEmpty ? userNote : null);
+
+    // Step 3: fetch real reference photos of the recommended flower concurrently
+    // using Pexels so they show up "as the user generates image".
+    final recommendedList = (result['recommendedFlowers'] as List?) ?? [];
+    final flowerQuery = recommendedList.isNotEmpty
+        ? recommendedList.first.toString()
+        : _selectedFlowerType;
 
     if (mounted) {
       setState(() {
-        _isAnalyzingImage = false;
+        _isLoadingFlowerPhotos = true;
+        _isAnalyzingImage = false; // Ends initial analysis to unlock results UI
       });
+    }
+
+    await _fetchPexelsPhotos(flowerQuery);
+  }
+
+  // Reservation Submission Action
+  Future<void> _submitReservation() async {
+    final firstName = _firstNameController.text.trim();
+    final lastName = _lastNameController.text.trim();
+    final middleName = _middleNameController.text.trim();
+    final phone = _phoneController.text.trim();
+
+    if (firstName.isEmpty ||
+        lastName.isEmpty ||
+        phone.isEmpty ||
+        _selectedEventDate == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+              'Please fill in first name, last name, phone number, and event date.'),
+          backgroundColor: Color(0xFFDC3545),
+        ),
+      );
+      return;
+    }
+
+    setState(() {
+      _isSubmittingReservation = true;
+    });
+
+    try {
+      // Upload whichever image best represents the final design -- the
+      // AI-generated decor if we have one, otherwise the original photo,
+      // so the web admin panel always has something to show if possible.
+      String? uploadedPhotoUrl;
+      final imageToUpload = _aiSynthesizedImageBytes ?? _imageBytes;
+      if (imageToUpload != null) {
+        final uid = FirebaseAuth.instance.currentUser?.uid ?? 'guest';
+        final fileName =
+            '${DateTime.now().millisecondsSinceEpoch}_$uid.png';
+        final ref = FirebaseStorage.instance
+            .ref()
+            .child('reservation_designs')
+            .child(fileName);
+        final uploadTask = await ref.putData(
+          imageToUpload,
+          SettableMetadata(contentType: 'image/png'),
+        );
+        uploadedPhotoUrl = await uploadTask.ref.getDownloadURL();
+      }
+
+      final branchId = InventoryData.selectedBranchId ?? 'main_branch';
+      final fullName = [firstName, middleName, lastName]
+          .where((s) => s.isNotEmpty)
+          .join(' ');
+      final eventDateStr = '${_selectedEventDate!.year.toString().padLeft(4, '0')}-'
+          '${_selectedEventDate!.month.toString().padLeft(2, '0')}-'
+          '${_selectedEventDate!.day.toString().padLeft(2, '0')}';
+
+      await FirebaseFirestore.instance
+          .collection('branches')
+          .doc(branchId)
+          .collection('reservations')
+          .add({
+        'customer_name': fullName,
+        'first_name': firstName,
+        'middle_name': middleName.isEmpty ? null : middleName,
+        'last_name': lastName,
+        'customer_phone': phone,
+        'fulfillment_date': eventDateStr,
+        'arrangement_details': _visualNoteController.text.trim(),
+        'status': 'Pending Review',
+        'source': 'visual_stylist',
+        if (uploadedPhotoUrl != null) 'style_photo_url': uploadedPhotoUrl,
+        if (_visualResult?['detectedTheme'] != null)
+          'detected_theme': _visualResult!['detectedTheme'],
+        if (_visualResult?['recommendedFlowers'] != null)
+          'recommended_flowers': _visualResult!['recommendedFlowers'],
+        'created_at': FieldValue.serverTimestamp(),
+      });
+
+      if (mounted) {
+        setState(() {
+          _isSubmittingReservation = false;
+          _reservationSubmitted = true;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+                '✨ Reservation submitted! Our team will review it shortly.'),
+            backgroundColor: Color(0xFF10B981),
+          ),
+        );
+      }
+    } catch (e) {
+      print("Error submitting reservation: $e");
+      if (mounted) {
+        setState(() {
+          _isSubmittingReservation = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to submit reservation: $e'),
+            backgroundColor: const Color(0xFFDC3545),
+          ),
+        );
+      }
     }
   }
 
@@ -518,7 +750,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
             Container(
               padding: const EdgeInsets.all(6),
               decoration: BoxDecoration(
-                color: const Color(0xFFF59E0B).withOpacity(0.15),
+                color: const Color(0xFFF59E0B).withValues(alpha: 0.15),
                 shape: BoxShape.circle,
               ),
               child: const Icon(Icons.auto_awesome,
@@ -591,7 +823,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
               ),
               borderRadius: BorderRadius.circular(16),
               border:
-              Border.all(color: const Color(0xFFF59E0B).withOpacity(0.3)),
+              Border.all(color: const Color(0xFFF59E0B).withValues(alpha: 0.3)),
             ),
             child: Row(
               children: [
@@ -716,14 +948,16 @@ class _AIAssistantPageState extends State<AIAssistantPage>
             width: double.infinity,
             height: 50,
             child: ElevatedButton.icon(
-              onPressed: _isAnalyzingImage ? null : _analyzeVisualImage,
+              onPressed: (_isAnalyzingImage || _isSynthesizingAiImage)
+                  ? null
+                  : _analyzeVisualImage,
               style: ElevatedButton.styleFrom(
                 backgroundColor: const Color(0xFFF59E0B),
                 foregroundColor: Colors.white,
                 shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(12)),
               ),
-              icon: _isAnalyzingImage
+              icon: (_isAnalyzingImage || _isSynthesizingAiImage)
                   ? const SizedBox(
                 width: 20,
                 height: 20,
@@ -734,6 +968,8 @@ class _AIAssistantPageState extends State<AIAssistantPage>
               label: Text(
                 _isAnalyzingImage
                     ? 'Analyzing with Gemini AI...'
+                    : _isSynthesizingAiImage
+                    ? 'Curating Styled Photo...'
                     : 'Analyze & Match Floral Theme',
                 style:
                 const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
@@ -760,12 +996,12 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                 borderRadius: BorderRadius.circular(16),
                 boxShadow: [
                   BoxShadow(
-                      color: Colors.black.withOpacity(0.05),
+                      color: Colors.black.withValues(alpha: 0.05),
                       blurRadius: 10,
                       offset: const Offset(0, 4))
                 ],
                 border:
-                Border.all(color: const Color(0xFFF59E0B).withOpacity(0.3)),
+                Border.all(color: const Color(0xFFF59E0B).withValues(alpha: 0.3)),
               ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -778,141 +1014,217 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        // Aesthetic Theme
-                        Row(
-                          children: [
-                            const Icon(Icons.style_outlined,
-                                color: Color(0xFFF59E0B), size: 20),
-                            const SizedBox(width: 8),
-                            Text('Detected Theme: ',
-                                style: TextStyle(
-                                    fontWeight: FontWeight.bold,
-                                    color: isDark
-                                        ? Colors.grey[300]
-                                        : Colors.grey[700])),
-                            Expanded(
-                              child: Text(
-                                _visualResult!['detectedTheme'] ??
-                                    'Custom Theme',
-                                style: const TextStyle(
-                                    fontWeight: FontWeight.bold,
-                                    color: Color(0xFFF59E0B)),
+                        // The theme/flower description text below is tied
+                        // to whether a REAL stylized image was generated --
+                        // it describes what's actually on screen, so it
+                        // would be misleading to show it next to a failed
+                        // generation or the generic placeholder.
+                        if (_aiImageGenerationSucceeded) ...[
+                          // Aesthetic Theme
+                          Row(
+                            children: [
+                              const Icon(Icons.style_outlined,
+                                  color: Color(0xFFF59E0B), size: 20),
+                              const SizedBox(width: 8),
+                              Text('Detected Theme: ',
+                                  style: TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      color: isDark
+                                          ? Colors.grey[300]
+                                          : Colors.grey[700])),
+                              Expanded(
+                                child: Text(
+                                  _visualResult!['detectedTheme'] ??
+                                      'Custom Theme',
+                                  style: const TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      color: Color(0xFFF59E0B)),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const Divider(height: 24),
+
+                          // Color Palette
+                          Text('Matching Color Palette:',
+                              style: TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 13,
+                                  color: isDark ? Colors.white : Colors.black87)),
+                          const SizedBox(height: 8),
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 8,
+                            children:
+                            ((_visualResult!['colorPalette'] as List?) ?? [])
+                                .map((color) {
+                              return Chip(
+                                avatar: CircleAvatar(
+                                    backgroundColor:
+                                    const Color(0xFFF59E0B).withValues(alpha: 0.4)),
+                                label: Text(color.toString(),
+                                    style: const TextStyle(
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w600)),
+                                backgroundColor: isDark
+                                    ? const Color(0xFF2A2A2A)
+                                    : const Color(0xFFFFFBEB),
+                              );
+                            }).toList(),
+                          ),
+                          const SizedBox(height: 16),
+
+                          // Recommended Flowers
+                          Text('Recommended Flowers:',
+                              style: TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 13,
+                                  color: isDark ? Colors.white : Colors.black87)),
+                          const SizedBox(height: 6),
+                          ...((_visualResult!['recommendedFlowers'] as List?) ??
+                              [])
+                              .map(
+                                (flower) => Padding(
+                              padding: const EdgeInsets.only(bottom: 4.0),
+                              child: Row(
+                                children: [
+                                  const Icon(Icons.local_florist_rounded,
+                                      color: Color(0xFFF59E0B), size: 16),
+                                  const SizedBox(width: 8),
+                                  Text(flower.toString(),
+                                      style: TextStyle(
+                                          fontSize: 14,
+                                          color: isDark
+                                              ? Colors.grey[200]
+                                              : Colors.grey[800])),
+                                ],
+                              ),
+                            ),
+                          ),
+
+                          const SizedBox(height: 16),
+
+                          // Arrangement Style
+                          Text('Arrangement Style:',
+                              style: TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 13,
+                                  color: isDark ? Colors.white : Colors.black87)),
+                          const SizedBox(height: 4),
+                          Text(_visualResult!['arrangementStyle'] ?? '',
+                              style: TextStyle(
+                                  fontSize: 13,
+                                  color: isDark
+                                      ? Colors.grey[300]
+                                      : Colors.grey[700])),
+
+                          const SizedBox(height: 16),
+
+                          // Matching Reason
+                          Text('Stylist Note:',
+                              style: TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 13,
+                                  color: isDark ? Colors.white : Colors.black87)),
+                          const SizedBox(height: 4),
+                          Text(_visualResult!['matchingReason'] ?? '',
+                              style: TextStyle(
+                                  fontSize: 13,
+                                  color: isDark
+                                      ? Colors.grey[300]
+                                      : Colors.grey[700],
+                                  height: 1.4)),
+
+                          if (_visualResult!['cardMessageSuggestion'] !=
+                              null) ...[
+                            const SizedBox(height: 16),
+                            Container(
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFFF59E0B).withValues(alpha: 0.08),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: Row(
+                                children: [
+                                  const Icon(Icons.card_giftcard,
+                                      color: Color(0xFFF59E0B), size: 20),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: Text(
+                                      '"${_visualResult!['cardMessageSuggestion']}"',
+                                      style: const TextStyle(
+                                          fontStyle: FontStyle.italic,
+                                          fontSize: 12),
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
                           ],
-                        ),
-                        const Divider(height: 24),
-
-                        // Color Palette
-                        Text('Matching Color Palette:',
-                            style: TextStyle(
-                                fontWeight: FontWeight.bold,
-                                fontSize: 13,
-                                color: isDark ? Colors.white : Colors.black87)),
-                        const SizedBox(height: 8),
-                        Wrap(
-                          spacing: 8,
-                          runSpacing: 8,
-                          children:
-                          ((_visualResult!['colorPalette'] as List?) ?? [])
-                              .map((color) {
-                            return Chip(
-                              avatar: CircleAvatar(
-                                  backgroundColor:
-                                  const Color(0xFFF59E0B).withOpacity(0.4)),
-                              label: Text(color.toString(),
-                                  style: const TextStyle(
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w600)),
-                              backgroundColor: isDark
-                                  ? const Color(0xFF2A2A2A)
-                                  : const Color(0xFFFFFBEB),
-                            );
-                          }).toList(),
-                        ),
-                        const SizedBox(height: 16),
-
-                        // Recommended Flowers
-                        Text('Recommended Flowers:',
-                            style: TextStyle(
-                                fontWeight: FontWeight.bold,
-                                fontSize: 13,
-                                color: isDark ? Colors.white : Colors.black87)),
-                        const SizedBox(height: 6),
-                        ...((_visualResult!['recommendedFlowers'] as List?) ??
-                            [])
-                            .map(
-                              (flower) => Padding(
-                            padding: const EdgeInsets.only(bottom: 4.0),
-                            child: Row(
-                              children: [
-                                const Icon(Icons.local_florist_rounded,
-                                    color: Color(0xFFF59E0B), size: 16),
-                                const SizedBox(width: 8),
-                                Text(flower.toString(),
-                                    style: TextStyle(
-                                        fontSize: 14,
-                                        color: isDark
-                                            ? Colors.grey[200]
-                                            : Colors.grey[800])),
-                              ],
-                            ),
-                          ),
-                        ),
-
-                        const SizedBox(height: 16),
-
-                        // Arrangement Style
-                        Text('Arrangement Style:',
-                            style: TextStyle(
-                                fontWeight: FontWeight.bold,
-                                fontSize: 13,
-                                color: isDark ? Colors.white : Colors.black87)),
-                        const SizedBox(height: 4),
-                        Text(_visualResult!['arrangementStyle'] ?? '',
-                            style: TextStyle(
-                                fontSize: 13,
-                                color: isDark
-                                    ? Colors.grey[300]
-                                    : Colors.grey[700])),
-
-                        const SizedBox(height: 16),
-
-                        // Matching Reason
-                        Text('Stylist Note:',
-                            style: TextStyle(
-                                fontWeight: FontWeight.bold,
-                                fontSize: 13,
-                                color: isDark ? Colors.white : Colors.black87)),
-                        const SizedBox(height: 4),
-                        Text(_visualResult!['matchingReason'] ?? '',
-                            style: TextStyle(
-                                fontSize: 13,
-                                color: isDark
-                                    ? Colors.grey[300]
-                                    : Colors.grey[700],
-                                height: 1.4)),
-
-                        if (_visualResult!['cardMessageSuggestion'] !=
-                            null) ...[
-                          const SizedBox(height: 16),
+                        ] else if (_isSynthesizingAiImage) ...[
                           Container(
                             padding: const EdgeInsets.all(12),
                             decoration: BoxDecoration(
-                              color: const Color(0xFFF59E0B).withOpacity(0.08),
+                              color: isDark ? Colors.grey[800] : Colors.grey[100],
                               borderRadius: BorderRadius.circular(10),
+                              border: Border.all(
+                                  color: Colors.grey.withValues(alpha: 0.3)),
                             ),
                             child: Row(
                               children: [
-                                const Icon(Icons.card_giftcard,
-                                    color: Color(0xFFF59E0B), size: 20),
+                                const SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(
+                                        strokeWidth: 2, color: Color(0xFFF59E0B))),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: Text(
+                                    'Analyzing theme and curating your custom styled room photo...',
+                                    style: TextStyle(
+                                        fontSize: 12.5,
+                                        height: 1.4,
+                                        color: isDark
+                                            ? Colors.grey[300]
+                                            : Colors.grey[700]),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ] else ...[
+                          // Fallback shown when AI photo generation didn't
+                          // succeed -- we don't know for certain the theme
+                          // matches an un-generated image, so we say so
+                          // plainly instead of guessing.
+                          Container(
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: (isDark
+                                  ? Colors.grey[800]
+                                  : Colors.grey[100]),
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(
+                                  color: Colors.grey.withValues(alpha: 0.3)),
+                            ),
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Icon(Icons.info_outline,
+                                    color: isDark
+                                        ? Colors.grey[400]
+                                        : Colors.grey[600],
+                                    size: 18),
                                 const SizedBox(width: 8),
                                 Expanded(
                                   child: Text(
-                                    '"${_visualResult!['cardMessageSuggestion']}"',
-                                    style: const TextStyle(
-                                        fontStyle: FontStyle.italic,
-                                        fontSize: 12),
+                                    'We couldn\'t generate a styled photo this time, so we\'re holding back the flower description. Check the reference photos below for inspiration, or try analyzing again.',
+                                    style: TextStyle(
+                                        fontSize: 12.5,
+                                        height: 1.4,
+                                        color: isDark
+                                            ? Colors.grey[300]
+                                            : Colors.grey[700]),
                                   ),
                                 ),
                               ],
@@ -956,6 +1268,270 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                             ),
                           ],
                         ),
+
+                        // Related Flower Reference Photos (from Pexels)
+                        if (_isLoadingFlowerPhotos ||
+                            _flowerReferencePhotos.isNotEmpty) ...[
+                          const SizedBox(height: 20),
+                          const Divider(),
+                          const SizedBox(height: 8),
+                          Text('Related Flower Photos:',
+                              style: TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 13,
+                                  color:
+                                  isDark ? Colors.white : Colors.black87)),
+                          const SizedBox(height: 8),
+                          if (_isLoadingFlowerPhotos)
+                            const Padding(
+                              padding: EdgeInsets.symmetric(vertical: 12),
+                              child: Center(
+                                child: SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Color(0xFFF59E0B)),
+                                ),
+                              ),
+                            )
+                          else
+                            SizedBox(
+                              height: 90,
+                              child: ListView.builder(
+                                scrollDirection: Axis.horizontal,
+                                itemCount: _flowerReferencePhotos.length,
+                                itemBuilder: (context, index) {
+                                  return Padding(
+                                    padding:
+                                    const EdgeInsets.only(right: 8.0),
+                                    child: ClipRRect(
+                                      borderRadius:
+                                      BorderRadius.circular(10),
+                                      child: Image.network(
+                                        _flowerReferencePhotos[index],
+                                        width: 90,
+                                        height: 90,
+                                        fit: BoxFit.cover,
+                                        errorBuilder: (_, __, ___) =>
+                                        const SizedBox.shrink(),
+                                        loadingBuilder:
+                                            (context, child, progress) {
+                                          if (progress == null) return child;
+                                          return Container(
+                                            width: 90,
+                                            height: 90,
+                                            color: isDark
+                                                ? const Color(0xFF2A2A2A)
+                                                : const Color(0xFFF3F4F6),
+                                          );
+                                        },
+                                      ),
+                                    ),
+                                  );
+                                },
+                              ),
+                            ),
+                          Padding(
+                            padding: const EdgeInsets.only(top: 4.0),
+                            child: Text('Photos via Pexels',
+                                style: TextStyle(
+                                    fontSize: 10,
+                                    color: isDark
+                                        ? Colors.grey[500]
+                                        : Colors.grey[500])),
+                          ),
+                        ],
+
+                        // Reservation Details Form
+                        const SizedBox(height: 20),
+                        const Divider(),
+                        const SizedBox(height: 8),
+                        Text('Reserve This for Your Event:',
+                            style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 15,
+                                color:
+                                isDark ? Colors.white : Colors.black87)),
+                        const SizedBox(height: 12),
+                        if (_reservationSubmitted)
+                          Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.all(16),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF10B981).withValues(alpha: 0.1),
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                  color:
+                                  const Color(0xFF10B981).withValues(alpha: 0.4)),
+                            ),
+                            child: const Row(
+                              children: [
+                                Icon(Icons.check_circle,
+                                    color: Color(0xFF10B981)),
+                                SizedBox(width: 10),
+                                Expanded(
+                                  child: Text(
+                                    'Reservation submitted! Our team will review it shortly.',
+                                    style: TextStyle(
+                                        color: Color(0xFF10B981),
+                                        fontWeight: FontWeight.w600,
+                                        fontSize: 13),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          )
+                        else ...[
+                          Row(
+                            children: [
+                              Expanded(
+                                flex: 2,
+                                child: TextField(
+                                  controller: _firstNameController,
+                                  decoration: InputDecoration(
+                                    labelText: 'First Name',
+                                    isDense: true,
+                                    filled: true,
+                                    fillColor: isDark
+                                        ? const Color(0xFF262626)
+                                        : Colors.white,
+                                    border: OutlineInputBorder(
+                                        borderRadius:
+                                        BorderRadius.circular(10)),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                flex: 2,
+                                child: TextField(
+                                  controller: _lastNameController,
+                                  decoration: InputDecoration(
+                                    labelText: 'Last Name',
+                                    isDense: true,
+                                    filled: true,
+                                    fillColor: isDark
+                                        ? const Color(0xFF262626)
+                                        : Colors.white,
+                                    border: OutlineInputBorder(
+                                        borderRadius:
+                                        BorderRadius.circular(10)),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 10),
+                          TextField(
+                            controller: _middleNameController,
+                            decoration: InputDecoration(
+                              labelText: 'Middle Name (optional)',
+                              isDense: true,
+                              filled: true,
+                              fillColor:
+                              isDark ? const Color(0xFF262626) : Colors.white,
+                              border: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(10)),
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          TextField(
+                            controller: _phoneController,
+                            keyboardType: TextInputType.phone,
+                            decoration: InputDecoration(
+                              labelText: 'Contact Phone Number',
+                              hintText: 'e.g., 09123456789',
+                              isDense: true,
+                              filled: true,
+                              fillColor:
+                              isDark ? const Color(0xFF262626) : Colors.white,
+                              prefixIcon: const Icon(Icons.phone_outlined,
+                                  size: 18, color: Color(0xFFF59E0B)),
+                              border: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(10)),
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          InkWell(
+                            onTap: () async {
+                              final picked = await showDatePicker(
+                                context: context,
+                                initialDate: _selectedEventDate ??
+                                    DateTime.now()
+                                        .add(const Duration(days: 3)),
+                                firstDate: DateTime.now(),
+                                lastDate: DateTime.now()
+                                    .add(const Duration(days: 365)),
+                              );
+                              if (picked != null) {
+                                setState(() => _selectedEventDate = picked);
+                              }
+                            },
+                            child: InputDecorator(
+                              decoration: InputDecoration(
+                                labelText: 'Event Date',
+                                isDense: true,
+                                filled: true,
+                                fillColor: isDark
+                                    ? const Color(0xFF262626)
+                                    : Colors.white,
+                                prefixIcon: const Icon(
+                                    Icons.calendar_month_outlined,
+                                    size: 18,
+                                    color: Color(0xFFF59E0B)),
+                                border: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(10)),
+                              ),
+                              child: Text(
+                                _selectedEventDate == null
+                                    ? 'Tap to select a date'
+                                    : '${_selectedEventDate!.month}/${_selectedEventDate!.day}/${_selectedEventDate!.year}',
+                                style: TextStyle(
+                                  color: _selectedEventDate == null
+                                      ? Colors.grey[500]
+                                      : (isDark
+                                      ? Colors.white
+                                      : Colors.black87),
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 14),
+                          SizedBox(
+                            width: double.infinity,
+                            height: 48,
+                            child: ElevatedButton.icon(
+                              onPressed: _isSubmittingReservation
+                                  ? null
+                                  : _submitReservation,
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: const Color(0xFFF59E0B),
+                                foregroundColor: Colors.white,
+                                shape: RoundedRectangleBorder(
+                                    borderRadius:
+                                    BorderRadius.circular(12)),
+                              ),
+                              icon: _isSubmittingReservation
+                                  ? const SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    color: Colors.white),
+                              )
+                                  : const Icon(Icons.event_available),
+                              label: Text(
+                                _isSubmittingReservation
+                                    ? 'Submitting...'
+                                    : 'Submit Reservation',
+                                style: const TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 14),
+                              ),
+                            ),
+                          ),
+                        ],
                       ],
                     ),
                   ),
@@ -1119,7 +1695,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                                     : const Color(0xFFF3F4F6)),
                           ),
                           Container(
-                            color: Colors.black.withOpacity(0.35),
+                            color: Colors.black.withValues(alpha: 0.35),
                           ),
                           Positioned(
                             top: 10,
@@ -1128,11 +1704,11 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                               padding: const EdgeInsets.symmetric(
                                   horizontal: 10, vertical: 5),
                               decoration: BoxDecoration(
-                                color: Colors.black.withOpacity(0.75),
+                                color: Colors.black.withValues(alpha: 0.75),
                                 borderRadius: BorderRadius.circular(20),
                                 border: Border.all(
                                     color:
-                                    const Color(0xFFF59E0B).withOpacity(0.6)),
+                                    const Color(0xFFF59E0B).withValues(alpha: 0.6)),
                               ),
                               child: const Row(
                                 mainAxisSize: MainAxisSize.min,
@@ -1189,7 +1765,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                                         Radius.circular(50)),
                                     boxShadow: [
                                       BoxShadow(
-                                        color: Colors.black.withOpacity(0.55),
+                                        color: Colors.black.withValues(alpha: 0.55),
                                         blurRadius: 18,
                                         spreadRadius: 6,
                                         offset: const Offset(0, 4),
@@ -1220,12 +1796,12 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                                         padding: const EdgeInsets.symmetric(
                                             vertical: 4, horizontal: 8),
                                         decoration: BoxDecoration(
-                                          color: Colors.black.withOpacity(0.75),
+                                          color: Colors.black.withValues(alpha: 0.75),
                                           borderRadius:
                                           BorderRadius.circular(12),
                                           border: Border.all(
                                               color: const Color(0xFFF59E0B)
-                                                  .withOpacity(0.6)),
+                                                  .withValues(alpha: 0.6)),
                                         ),
                                         child: Row(
                                           mainAxisSize: MainAxisSize.min,
@@ -1277,10 +1853,10 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                         padding: const EdgeInsets.symmetric(
                             horizontal: 12, vertical: 8),
                         decoration: BoxDecoration(
-                          color: Colors.black.withOpacity(0.80),
+                          color: Colors.black.withValues(alpha: 0.80),
                           borderRadius: BorderRadius.circular(12),
                           border: Border.all(
-                              color: const Color(0xFFF59E0B).withOpacity(0.8)),
+                              color: const Color(0xFFF59E0B).withValues(alpha: 0.8)),
                         ),
                         child: Row(
                           children: [
@@ -1314,10 +1890,10 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                       padding: const EdgeInsets.symmetric(
                           horizontal: 10, vertical: 5),
                       decoration: BoxDecoration(
-                        color: Colors.black.withOpacity(0.85),
+                        color: Colors.black.withValues(alpha: 0.85),
                         borderRadius: BorderRadius.circular(20),
                         border: Border.all(
-                            color: const Color(0xFFF59E0B).withOpacity(0.8)),
+                            color: const Color(0xFFF59E0B).withValues(alpha: 0.8)),
                       ),
                       child: Row(
                         mainAxisSize: MainAxisSize.min,
@@ -1359,7 +1935,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                                 padding: const EdgeInsets.symmetric(
                                     horizontal: 8, vertical: 5),
                                 decoration: BoxDecoration(
-                                  color: Colors.black.withOpacity(0.75),
+                                  color: Colors.black.withValues(alpha: 0.75),
                                   borderRadius: BorderRadius.circular(20),
                                   border: Border.all(color: Colors.white30),
                                 ),
@@ -1420,441 +1996,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
               ),
             ),
           ),
-
-          // Tools Toolbar: Scale slider, Paso Style & Flower Selectors
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-            color: isDark ? const Color(0xFF262626) : const Color(0xFFFFFBEB),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // Direct Gemini API Prompt Input Section
-                Container(
-                  margin: const EdgeInsets.only(bottom: 10),
-                  padding: const EdgeInsets.all(8),
-                  decoration: BoxDecoration(
-                    color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(
-                        color: const Color(0xFFF59E0B).withOpacity(0.5)),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          const Icon(Icons.auto_fix_high,
-                              size: 16, color: Color(0xFFF59E0B)),
-                          const SizedBox(width: 6),
-                          Expanded(
-                            child: Text(
-                              'Sabihin sa Gemini API: "Edit the pic design it"',
-                              style: TextStyle(
-                                fontSize: 11,
-                                fontWeight: FontWeight.bold,
-                                color: isDark
-                                    ? Colors.amber[300]
-                                    : const Color(0xFFD97706),
-                              ),
-                            ),
-                          ),
-                          if (_aiSynthesizedImageBytes != null)
-                            InkWell(
-                              onTap: () {
-                                setState(() {
-                                  _aiSynthesizedImageBytes = null;
-                                });
-                              },
-                              child: const Padding(
-                                padding: EdgeInsets.symmetric(horizontal: 4),
-                                child: Text('Reset',
-                                    style: TextStyle(
-                                        fontSize: 10,
-                                        color: Colors.grey,
-                                        fontWeight: FontWeight.bold)),
-                              ),
-                            ),
-                        ],
-                      ),
-                      const SizedBox(height: 6),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: TextField(
-                              controller: _customApiPromptController,
-                              style: TextStyle(
-                                  fontSize: 11,
-                                  color:
-                                  isDark ? Colors.white : Colors.black87),
-                              decoration: InputDecoration(
-                                hintText:
-                                'e.g., Integrate floral arrangement on stool next to plant with realistic shadows',
-                                hintStyle: TextStyle(
-                                    fontSize: 10,
-                                    color: isDark
-                                        ? Colors.grey[500]
-                                        : Colors.grey[600]),
-                                isDense: true,
-                                contentPadding: const EdgeInsets.symmetric(
-                                    horizontal: 10, vertical: 8),
-                                filled: true,
-                                fillColor: isDark
-                                    ? const Color(0xFF2A2A2A)
-                                    : const Color(0xFFF9FAFB),
-                                border: OutlineInputBorder(
-                                  borderRadius: BorderRadius.circular(8),
-                                  borderSide: BorderSide.none,
-                                ),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 6),
-                          ElevatedButton.icon(
-                            onPressed: _isSynthesizingAiImage
-                                ? null
-                                : () => _generateAiPhotoSynthesis(),
-                            icon: _isSynthesizingAiImage
-                                ? const SizedBox(
-                              width: 12,
-                              height: 12,
-                              child: CircularProgressIndicator(
-                                  strokeWidth: 2, color: Colors.white),
-                            )
-                                : const Icon(Icons.send_rounded, size: 14),
-                            label: Text(
-                              _isSynthesizingAiImage
-                                  ? 'Editing...'
-                                  : 'Send API',
-                              style: const TextStyle(
-                                  fontSize: 11, fontWeight: FontWeight.bold),
-                            ),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: const Color(0xFFF59E0B),
-                              foregroundColor: Colors.white,
-                              padding: const EdgeInsets.symmetric(
-                                  horizontal: 10, vertical: 8),
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(8),
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 6),
-                      SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        child: Row(
-                          children: [
-                            ActionChip(
-                              avatar: const Icon(Icons.auto_awesome,
-                                  size: 12, color: Color(0xFFD97706)),
-                              label: const Text(
-                                  '✨ In-Paint Bouquet on Stool (Accurate Shadow)',
-                                  style: TextStyle(
-                                      fontSize: 10,
-                                      fontWeight: FontWeight.bold)),
-                              backgroundColor: isDark
-                                  ? const Color(0xFF332B15)
-                                  : const Color(0xFFFEF3C7),
-                              side: BorderSide(
-                                  color:
-                                  const Color(0xFFF59E0B).withOpacity(0.5)),
-                              padding:
-                              const EdgeInsets.symmetric(horizontal: 4),
-                              onPressed: () {
-                                _customApiPromptController.text =
-                                "Integrate a lush, architecturally composed floral bouquet in a modern ceramic vase on the wooden stool next to the plant, with natural soft daylight from left and realistic contact shadow";
-                                _generateAiPhotoSynthesis();
-                              },
-                            ),
-                            const SizedBox(width: 6),
-                            ActionChip(
-                              avatar: const Icon(Icons.local_florist,
-                                  size: 12, color: Color(0xFF10B981)),
-                              label: const Text('🌹 Roses & Lilies on Stool',
-                                  style: TextStyle(fontSize: 10)),
-                              backgroundColor: isDark
-                                  ? const Color(0xFF1E2923)
-                                  : const Color(0xFFD1FAE5),
-                              side: BorderSide(
-                                  color:
-                                  const Color(0xFF10B981).withOpacity(0.5)),
-                              padding:
-                              const EdgeInsets.symmetric(horizontal: 4),
-                              onPressed: () {
-                                _customApiPromptController.text =
-                                "Place a high-end bouquet of red roses and white lilies in a ceramic vase on the stool under daylight";
-                                _generateAiPhotoSynthesis();
-                              },
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                // Style & View Mode Toggles
-                Wrap(
-                  spacing: 6,
-                  runSpacing: 6,
-                  crossAxisAlignment: WrapCrossAlignment.center,
-                  children: [
-                    const Icon(Icons.style_outlined,
-                        size: 16, color: Color(0xFFF59E0B)),
-                    Text(
-                      'Mode:',
-                      style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                          color: isDark ? Colors.grey[300] : Colors.grey[800]),
-                    ),
-                    GestureDetector(
-                      onTap: () {
-                        setState(() {
-                          _usePhotorealisticMode = true;
-                          _showFullGeminiAiBlend = true;
-                        });
-                        _generateAiPhotoSynthesis();
-                      },
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 8, vertical: 4),
-                        decoration: BoxDecoration(
-                          color: _showFullGeminiAiBlend
-                              ? const Color(0xFFF59E0B)
-                              : (isDark
-                              ? const Color(0xFF1E1E1E)
-                              : Colors.white),
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(
-                              color: _showFullGeminiAiBlend
-                                  ? const Color(0xFFF59E0B)
-                                  : Colors.grey.withOpacity(0.3)),
-                        ),
-                        child: Text(
-                          '✨ Gemini AI Photo Synthesis',
-                          style: TextStyle(
-                            fontSize: 10,
-                            fontWeight: _showFullGeminiAiBlend
-                                ? FontWeight.bold
-                                : FontWeight.normal,
-                            color: _showFullGeminiAiBlend
-                                ? Colors.white
-                                : (isDark
-                                ? Colors.grey[300]
-                                : Colors.grey[800]),
-                          ),
-                        ),
-                      ),
-                    ),
-                    GestureDetector(
-                      onTap: () async {
-                        setState(() {
-                          _usePhotorealisticMode = true;
-                          _showFullGeminiAiBlend = false;
-                        });
-                        if (_imageBytes != null) {
-                          final updatedEdited =
-                          await GeminiService.compositeEditedRoomPhoto(
-                            userRoomBytes: _imageBytes!,
-                            flowerType: _selectedFlowerType,
-                            potType: _selectedPotType,
-                          );
-                          if (mounted) {
-                            setState(() {
-                              _aiSynthesizedImageBytes = updatedEdited;
-                            });
-                          }
-                        }
-                      },
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 8, vertical: 4),
-                        decoration: BoxDecoration(
-                          color: !_showFullGeminiAiBlend
-                              ? const Color(0xFFF59E0B)
-                              : (isDark
-                              ? const Color(0xFF1E1E1E)
-                              : Colors.white),
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(
-                              color: !_showFullGeminiAiBlend
-                                  ? const Color(0xFFF59E0B)
-                                  : Colors.grey.withOpacity(0.3)),
-                        ),
-                        child: Text(
-                          '📸 Photorealistic HD Drag',
-                          style: TextStyle(
-                            fontSize: 10,
-                            fontWeight: !_showFullGeminiAiBlend
-                                ? FontWeight.bold
-                                : FontWeight.normal,
-                            color: !_showFullGeminiAiBlend
-                                ? Colors.white
-                                : (isDark
-                                ? Colors.grey[300]
-                                : Colors.grey[800]),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-
-                const SizedBox(height: 6),
-
-                // Size Slider
-                Row(
-                  children: [
-                    const Icon(Icons.aspect_ratio,
-                        size: 16, color: Color(0xFFF59E0B)),
-                    const SizedBox(width: 8),
-                    Text(
-                      'Laki / Size:',
-                      style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                          color: isDark ? Colors.grey[300] : Colors.grey[800]),
-                    ),
-                    Expanded(
-                      child: Slider(
-                        value: _flowerScale,
-                        min: 0.5,
-                        max: 1.8,
-                        activeColor: const Color(0xFFF59E0B),
-                        onChanged: (val) {
-                          setState(() => _flowerScale = val);
-                        },
-                      ),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.restart_alt, size: 18),
-                      tooltip: 'Reset Position',
-                      onPressed: () {
-                        setState(() {
-                          _flowerPosition = const Offset(90, 60);
-                          _flowerScale = 1.0;
-                        });
-                      },
-                    ),
-                  ],
-                ),
-
-                const SizedBox(height: 4),
-
-                // Paso / Pot Style Selector
-                Row(
-                  children: [
-                    const Icon(Icons.yard_outlined,
-                        size: 15, color: Color(0xFFF59E0B)),
-                    const SizedBox(width: 6),
-                    Text(
-                      'Paso / Vase:',
-                      style: TextStyle(
-                          fontSize: 11,
-                          fontWeight: FontWeight.bold,
-                          color: isDark ? Colors.grey[300] : Colors.grey[800]),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        child: Row(
-                          children: [
-                            _buildPotChip('🪴 Clay Paso', 'terracotta', isDark),
-                            _buildPotChip('🏺 Ceramic Vase', 'ceramic', isDark),
-                            _buildPotChip('🥛 Glass Vase', 'glass', isDark),
-                            _buildPotChip('🪙 Gold Paso', 'gold', isDark),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-
-                const SizedBox(height: 6),
-
-                // Bulaklak / Flower Type Selector
-                Row(
-                  children: [
-                    const Icon(Icons.local_florist_outlined,
-                        size: 15, color: Color(0xFFF59E0B)),
-                    const SizedBox(width: 6),
-                    Text(
-                      'Bulaklak:',
-                      style: TextStyle(
-                          fontSize: 11,
-                          fontWeight: FontWeight.bold,
-                          color: isDark ? Colors.grey[300] : Colors.grey[800]),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        child: Row(
-                          children: [
-                            _buildFlowerChip(
-                                '🌻 Mirasol (Sunflower)', 'sunflower', isDark),
-                            _buildFlowerChip('🌹 Red Rose', 'rose', isDark),
-                            _buildFlowerChip('🌷 Pink Tulip', 'tulip', isDark),
-                            _buildFlowerChip('🤍 White Lily', 'lily', isDark),
-                            _buildFlowerChip(
-                                '🌸 Carnation', 'carnation', isDark),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-
-                const SizedBox(height: 8),
-
-                // Preset Combinations
-                SizedBox(
-                  height: 32,
-                  child: ListView.builder(
-                    scrollDirection: Axis.horizontal,
-                    itemCount: _overlayPresets.length,
-                    itemBuilder: (context, index) {
-                      final item = _overlayPresets[index];
-                      final isSelected = _selectedOverlayIndex == index;
-                      return Padding(
-                        padding: const EdgeInsets.only(right: 6.0),
-                        child: ChoiceChip(
-                          selected: isSelected,
-                          showCheckmark: false,
-                          label: Text(
-                            item['name']!,
-                            style: TextStyle(
-                              fontSize: 10,
-                              fontWeight: isSelected
-                                  ? FontWeight.bold
-                                  : FontWeight.normal,
-                              color: isSelected
-                                  ? Colors.white
-                                  : (isDark
-                                  ? Colors.grey[300]
-                                  : Colors.grey[800]),
-                            ),
-                          ),
-                          backgroundColor:
-                          isDark ? const Color(0xFF1E1E1E) : Colors.white,
-                          selectedColor: const Color(0xFFF59E0B),
-                          onSelected: (_) {
-                            setState(() {
-                              _selectedOverlayIndex = index;
-                              _selectedFlowerType = item['flowerType']!;
-                              _selectedPotType = item['potType']!;
-                            });
-                          },
-                        ),
-                      );
-                    },
-                  ),
-                ),
-              ],
-            ),
-          ),
         ] else ...[
           // Reference Catalog Photo View
           if (_visualResult!['imageUrl'] != null)
@@ -1877,7 +2018,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                       padding: const EdgeInsets.symmetric(
                           horizontal: 10, vertical: 4),
                       decoration: BoxDecoration(
-                        color: Colors.black.withOpacity(0.75),
+                        color: Colors.black.withValues(alpha: 0.75),
                         borderRadius: BorderRadius.circular(20),
                       ),
                       child: const Row(
@@ -1902,144 +2043,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
             ),
         ],
       ],
-    );
-  }
-
-  Widget _buildPotChip(String label, String value, bool isDark) {
-    final isSelected = _selectedPotType == value;
-    return Padding(
-      padding: const EdgeInsets.only(right: 6.0),
-      child: GestureDetector(
-        onTap: () async {
-          setState(() {
-            _selectedPotType = value;
-            _usePhotorealisticMode = true;
-          });
-          if (_imageBytes != null) {
-            final instantEdited = await GeminiService.compositeEditedRoomPhoto(
-              userRoomBytes: _imageBytes!,
-              flowerType: _selectedFlowerType,
-              potType: value,
-            );
-            if (mounted) {
-              setState(() {
-                _aiSynthesizedImageBytes = instantEdited;
-              });
-            }
-            _generateAiPhotoSynthesis();
-          }
-        },
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-          decoration: BoxDecoration(
-            color: isSelected
-                ? const Color(0xFFF59E0B)
-                : (isDark ? const Color(0xFF1E1E1E) : Colors.white),
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(
-              color: isSelected
-                  ? const Color(0xFFF59E0B)
-                  : Colors.grey.withOpacity(0.3),
-            ),
-          ),
-          child: Text(
-            label,
-            style: TextStyle(
-              fontSize: 10,
-              fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-              color: isSelected
-                  ? Colors.white
-                  : (isDark ? Colors.grey[300] : Colors.grey[800]),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildFlowerChip(String label, String value, bool isDark) {
-    final isSelected = _selectedFlowerType == value;
-    return Padding(
-      padding: const EdgeInsets.only(right: 6.0),
-      child: GestureDetector(
-        onTap: () async {
-          setState(() {
-            _selectedFlowerType = value;
-            _usePhotorealisticMode = true;
-          });
-          if (_imageBytes != null) {
-            final instantEdited = await GeminiService.compositeEditedRoomPhoto(
-              userRoomBytes: _imageBytes!,
-              flowerType: value,
-              potType: _selectedPotType,
-            );
-            if (mounted) {
-              setState(() {
-                _aiSynthesizedImageBytes = instantEdited;
-              });
-            }
-            _generateAiPhotoSynthesis();
-          }
-        },
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-          decoration: BoxDecoration(
-            color: isSelected
-                ? const Color(0xFFF59E0B)
-                : (isDark ? const Color(0xFF1E1E1E) : Colors.white),
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(
-              color: isSelected
-                  ? const Color(0xFFF59E0B)
-                  : Colors.grey.withOpacity(0.3),
-            ),
-          ),
-          child: Text(
-            label,
-            style: TextStyle(
-              fontSize: 10,
-              fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-              color: isSelected
-                  ? Colors.white
-                  : (isDark ? Colors.grey[300] : Colors.grey[800]),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  void _showImageSourceBottomSheet() {
-    showModalBottomSheet(
-      context: context,
-      shape: const RoundedRectangleBorder(
-          borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
-      builder: (context) {
-        return SafeArea(
-          child: Wrap(
-            children: [
-              ListTile(
-                leading:
-                const Icon(Icons.photo_camera, color: Color(0xFFF59E0B)),
-                title: const Text('Take a Photo'),
-                onTap: () {
-                  Navigator.pop(context);
-                  _pickImage(ImageSource.camera);
-                },
-              ),
-              ListTile(
-                leading:
-                const Icon(Icons.photo_library, color: Color(0xFFF59E0B)),
-                title: const Text('Choose from Gallery'),
-                onTap: () {
-                  Navigator.pop(context);
-                  _pickImage(ImageSource.gallery);
-                },
-              ),
-            ],
-          ),
-        );
-      },
     );
   }
 
@@ -2199,10 +2202,10 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                 color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
                 borderRadius: BorderRadius.circular(16),
                 border:
-                Border.all(color: const Color(0xFFF59E0B).withOpacity(0.4)),
+                Border.all(color: const Color(0xFFF59E0B).withValues(alpha: 0.4)),
                 boxShadow: [
                   BoxShadow(
-                      color: Colors.black.withOpacity(0.06),
+                      color: Colors.black.withValues(alpha: 0.06),
                       blurRadius: 12,
                       offset: const Offset(0, 4))
                 ],
@@ -2236,7 +2239,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                                 borderRadius: BorderRadius.circular(20),
                                 boxShadow: [
                                   BoxShadow(
-                                      color: Colors.black.withOpacity(0.2),
+                                      color: Colors.black.withValues(alpha: 0.2),
                                       blurRadius: 4),
                                 ],
                               ),
@@ -2307,7 +2310,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                                   padding: const EdgeInsets.all(4),
                                   decoration: BoxDecoration(
                                     color: const Color(0xFFF59E0B)
-                                        .withOpacity(0.15),
+                                        .withValues(alpha: 0.15),
                                     shape: BoxShape.circle,
                                   ),
                                   child: const Icon(Icons.local_florist,
@@ -2342,7 +2345,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                             borderRadius: BorderRadius.circular(12),
                             border: Border.all(
                                 color:
-                                const Color(0xFFF59E0B).withOpacity(0.3)),
+                                const Color(0xFFF59E0B).withValues(alpha: 0.3)),
                           ),
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
@@ -2549,7 +2552,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                   backgroundColor:
                   isDark ? const Color(0xFF2A2A2A) : Colors.white,
                   side: BorderSide(
-                      color: const Color(0xFFF59E0B).withOpacity(0.4)),
+                      color: const Color(0xFFF59E0B).withValues(alpha: 0.4)),
                   onPressed: () => _sendChatMessage(q),
                 ),
               );
@@ -2674,7 +2677,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
             color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
             boxShadow: [
               BoxShadow(
-                  color: Colors.black.withOpacity(0.05),
+                  color: Colors.black.withValues(alpha: 0.05),
                   blurRadius: 8,
                   offset: const Offset(0, -2))
             ],
@@ -2813,7 +2816,7 @@ class PottedFlowerPainter extends CustomPainter {
         ..close();
       canvas.drawPath(
         shinePath,
-        Paint()..color = Colors.white.withOpacity(0.45),
+        Paint()..color = Colors.white.withValues(alpha: 0.45),
       );
     }
 
@@ -2835,8 +2838,8 @@ class PottedFlowerPainter extends CustomPainter {
       potPath,
       Paint()
         ..color = potType == 'glass'
-            ? Colors.white.withOpacity(0.8)
-            : Colors.black.withOpacity(0.15)
+            ? Colors.white.withValues(alpha: 0.8)
+            : Colors.black.withValues(alpha: 0.15)
         ..style = PaintingStyle.stroke
         ..strokeWidth = 1.8,
     );
@@ -2986,7 +2989,7 @@ class PottedFlowerPainter extends CustomPainter {
     canvas.drawCircle(Offset(cx, cy), radius * 0.45, centerPaint);
 
     // Center seed texture dots
-    final dotPaint = Paint()..color = const Color(0xFFFDE68A).withOpacity(0.4);
+    final dotPaint = Paint()..color = const Color(0xFFFDE68A).withValues(alpha: 0.4);
     for (int d = 0; d < 12; d++) {
       final dotAngle = d * (math.pi / 6);
       final dx = cx + math.cos(dotAngle) * (radius * 0.25);
@@ -3013,7 +3016,7 @@ class PottedFlowerPainter extends CustomPainter {
 
     // Overlapping Rose Petal Swirls
     final swirlPaint = Paint()
-      ..color = Colors.white.withOpacity(0.2)
+      ..color = Colors.white.withValues(alpha: 0.2)
       ..style = PaintingStyle.stroke
       ..strokeWidth = 2.0;
 
