@@ -45,8 +45,9 @@ class _AIAssistantPageState extends State<AIAssistantPage>
   // True only when a REAL AI-generated image (Gemini or Stability AI) was
   // produced -- false when generation failed and we're only showing the
   // free Canvas-drawn placeholder (or nothing at all). The flower
-  // description/theme text is gated on this flag so it's never shown next
-  // to a picture that doesn't actually reflect it.
+  // description/theme text AND the Pexels reference photos are both gated
+  // on this flag so nothing is ever shown that doesn't match what's
+  // actually on screen.
   bool _aiImageGenerationSucceeded = false;
 
   // Reservation Submission State
@@ -60,7 +61,10 @@ class _AIAssistantPageState extends State<AIAssistantPage>
 
   // Related flower reference photos fetched from Pexels once we know
   // which flower the AI recommended -- purely supplementary, never blocks
-  // the rest of the flow if it comes back empty.
+  // the rest of the flow if it comes back empty. Fetched concurrently with
+  // image generation (see _analyzeVisualImage), but only ever DISPLAYED
+  // once _aiImageGenerationSucceeded is true -- see the gate in the build
+  // method below.
   List<String> _flowerReferencePhotos = [];
   bool _isLoadingFlowerPhotos = false;
 
@@ -186,8 +190,8 @@ class _AIAssistantPageState extends State<AIAssistantPage>
           if (bytes != null && bytes.isNotEmpty) {
             _aiSynthesizedImageBytes = bytes;
             // Real Gemini or Stability AI output -- safe to show the
-            // flower description text now, since it actually matches
-            // what's on screen.
+            // flower description text AND the Pexels reference photos now,
+            // since they both describe/reflect what's actually on screen.
             _aiImageGenerationSucceeded = true;
           }
           _isSynthesizingAiImage = false;
@@ -371,30 +375,19 @@ class _AIAssistantPageState extends State<AIAssistantPage>
   bool _isGeneratingMatch = false;
   Map<String, dynamic>? _matchResult;
 
-  // Chat Concierge State
-  final TextEditingController _chatController = TextEditingController();
-  final ScrollController _scrollController = ScrollController();
-  bool _isChatLoading = false;
-  final List<Map<String, String>> _messages = [
-    {
-      'role': 'Flora',
-      'content':
-      'Hello! I am Flora, your AI Floral Assistant. I can help you pick the perfect flowers, explain flower meanings (floriography), or give care tips for lasting fresh blooms! How can I assist you today?'
-    }
-  ];
+  // Flora AI Concierge moved to its own page (FloraChatPage), opened from a
+  // floating button on the Shop Category screen -- no longer a tab here.
 
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 3, vsync: this);
+    _tabController = TabController(length: 2, vsync: this);
   }
 
   @override
   void dispose() {
     _tabController.dispose();
     _visualNoteController.dispose();
-    _chatController.dispose();
-    _scrollController.dispose();
     _firstNameController.dispose();
     _middleNameController.dispose();
     _lastNameController.dispose();
@@ -518,15 +511,23 @@ class _AIAssistantPageState extends State<AIAssistantPage>
       });
     }
 
-    // Step 2: now that _selectedFlowerType/_selectedPotType reflect what the
-    // AI actually recommended, generate the real photo edit asynchronously.
+    // Step 2: fire off the real photo edit -- NOT awaited here, so it runs
+    // in the background while Step 3 (Pexels) fetches at the same time.
+    // This is purely a speed optimization. It does NOT mean the Pexels
+    // photos get shown early -- see the _aiImageGenerationSucceeded gate
+    // in the build method, which is the actual thing controlling when
+    // they're allowed to render.
     final userNote = _visualNoteController.text.trim();
+    if (_imageBytes != null) {
+      _generateAiPhotoSynthesis(
+          customPrompt: userNote.isNotEmpty ? userNote : null);
+    }
 
-    _generateAiPhotoSynthesis(
-        customPrompt: userNote.isNotEmpty ? userNote : null);
-
-    // Step 3: fetch real reference photos of the recommended flower concurrently
-    // using Pexels so they show up "as the user generates image".
+    // Step 3: fetch real reference photos of the SAME recommended flower
+    // that Step 2 is asking the AI to paint into the photo. Fetching this
+    // concurrently (rather than waiting for Step 2 to finish first) just
+    // saves the user a few seconds -- the photos stay hidden regardless
+    // of when this finishes, until Step 2 actually succeeds.
     final recommendedList = (result['recommendedFlowers'] as List?) ?? [];
     final flowerQuery = recommendedList.isNotEmpty
         ? recommendedList.first.toString()
@@ -535,7 +536,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     if (mounted) {
       setState(() {
         _isLoadingFlowerPhotos = true;
-        _isAnalyzingImage = false; // Ends initial analysis to unlock results UI
+        _isAnalyzingImage = false; // Unlocks the results UI immediately
       });
     }
 
@@ -670,71 +671,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     }
   }
 
-  String? _getChatFlowerImage(String content) {
-    final lower = content.toLowerCase();
-    if (lower.contains('sunflower') || lower.contains('yellow')) {
-      return 'https://images.unsplash.com/photo-1597848212624-a19eb35e2651?q=80&w=400&auto=format&fit=crop';
-    } else if (lower.contains('rose') ||
-        lower.contains('red') ||
-        lower.contains('romance')) {
-      return 'https://images.unsplash.com/photo-1518709268805-4e9042af9f23?q=80&w=400&auto=format&fit=crop';
-    } else if (lower.contains('tulip')) {
-      return 'https://images.unsplash.com/photo-1520763185298-1b434c919102?q=80&w=400&auto=format&fit=crop';
-    } else if (lower.contains('lily') || lower.contains('white')) {
-      return 'https://images.unsplash.com/photo-1582794543139-8ac9cb0f7b11?q=80&w=400&auto=format&fit=crop';
-    } else if (lower.contains('carnation') ||
-        lower.contains('pink') ||
-        lower.contains('mom') ||
-        lower.contains('mother')) {
-      return 'https://images.unsplash.com/photo-1561181286-d3fee7d55364?q=80&w=400&auto=format&fit=crop';
-    } else if (lower.contains('hydrangea') || lower.contains('blue')) {
-      return 'https://images.unsplash.com/photo-1508610048659-a06b669e3321?q=80&w=400&auto=format&fit=crop';
-    }
-    return null;
-  }
-
-  // Chat Action
-  Future<void> _sendChatMessage([String? predefined]) async {
-    final text = predefined ?? _chatController.text.trim();
-    if (text.isEmpty || _isChatLoading) return;
-
-    if (predefined == null) {
-      _chatController.clear();
-    }
-
-    setState(() {
-      _messages.add({'role': 'User', 'content': text});
-      _isChatLoading = true;
-    });
-
-    _scrollToBottom();
-
-    final response = await GeminiService.chatWithConcierge(
-      userQuery: text,
-      conversationHistory: _messages.take(10).toList(),
-    );
-
-    if (mounted) {
-      setState(() {
-        _messages.add({'role': 'Flora', 'content': response});
-        _isChatLoading = false;
-      });
-      _scrollToBottom();
-    }
-  }
-
-  void _scrollToBottom() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scrollController.hasClients) {
-        _scrollController.animateTo(
-          _scrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 300),
-          curve: Curves.easeOut,
-        );
-      }
-    });
-  }
-
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -788,7 +724,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
           tabs: const [
             Tab(icon: Icon(Icons.palette_outlined), text: 'Visual Stylist'),
             Tab(icon: Icon(Icons.favorite_outline), text: 'Matchmaker'),
-            Tab(icon: Icon(Icons.chat_bubble_outline), text: 'Flora AI'),
           ],
         ),
       ),
@@ -797,7 +732,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
         children: [
           _buildVisualStylistTab(isDark),
           _buildMatchmakerTab(isDark),
-          _buildChatConciergeTab(isDark),
         ],
       ),
     );
@@ -1196,7 +1130,8 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                           // Fallback shown when AI photo generation didn't
                           // succeed -- we don't know for certain the theme
                           // matches an un-generated image, so we say so
-                          // plainly instead of guessing.
+                          // plainly instead of guessing. The Pexels photos
+                          // stay hidden here too, per the gate below.
                           Container(
                             padding: const EdgeInsets.all(12),
                             decoration: BoxDecoration(
@@ -1218,7 +1153,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                                 const SizedBox(width: 8),
                                 Expanded(
                                   child: Text(
-                                    'We couldn\'t generate a styled photo this time, so we\'re holding back the flower description. Check the reference photos below for inspiration, or try analyzing again.',
+                                    'We couldn\'t generate a styled photo this time, so we\'re holding back the flower description and reference photos.',
                                     style: TextStyle(
                                         fontSize: 12.5,
                                         height: 1.4,
@@ -1269,8 +1204,14 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                           ],
                         ),
 
-                        // Related Flower Reference Photos (from Pexels)
-                        if (_isLoadingFlowerPhotos ||
+                        // Related Flower Reference Photos (from Pexels) --
+                        // gated on _aiImageGenerationSucceeded so this only
+                        // ever shows once we KNOW a real image is on screen,
+                        // matching the flower that was actually generated.
+                        // If generation fails, this stays hidden entirely,
+                        // even if the Pexels fetch itself already finished
+                        // in the background.
+                        if (_aiImageGenerationSucceeded &&
                             _flowerReferencePhotos.isNotEmpty) ...[
                           const SizedBox(height: 20),
                           const Divider(),
@@ -1282,56 +1223,42 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                                   color:
                                   isDark ? Colors.white : Colors.black87)),
                           const SizedBox(height: 8),
-                          if (_isLoadingFlowerPhotos)
-                            const Padding(
-                              padding: EdgeInsets.symmetric(vertical: 12),
-                              child: Center(
-                                child: SizedBox(
-                                  width: 18,
-                                  height: 18,
-                                  child: CircularProgressIndicator(
-                                      strokeWidth: 2,
-                                      color: Color(0xFFF59E0B)),
-                                ),
-                              ),
-                            )
-                          else
-                            SizedBox(
-                              height: 90,
-                              child: ListView.builder(
-                                scrollDirection: Axis.horizontal,
-                                itemCount: _flowerReferencePhotos.length,
-                                itemBuilder: (context, index) {
-                                  return Padding(
-                                    padding:
-                                    const EdgeInsets.only(right: 8.0),
-                                    child: ClipRRect(
-                                      borderRadius:
-                                      BorderRadius.circular(10),
-                                      child: Image.network(
-                                        _flowerReferencePhotos[index],
-                                        width: 90,
-                                        height: 90,
-                                        fit: BoxFit.cover,
-                                        errorBuilder: (_, __, ___) =>
-                                        const SizedBox.shrink(),
-                                        loadingBuilder:
-                                            (context, child, progress) {
-                                          if (progress == null) return child;
-                                          return Container(
-                                            width: 90,
-                                            height: 90,
-                                            color: isDark
-                                                ? const Color(0xFF2A2A2A)
-                                                : const Color(0xFFF3F4F6),
-                                          );
-                                        },
-                                      ),
+                          SizedBox(
+                            height: 90,
+                            child: ListView.builder(
+                              scrollDirection: Axis.horizontal,
+                              itemCount: _flowerReferencePhotos.length,
+                              itemBuilder: (context, index) {
+                                return Padding(
+                                  padding:
+                                  const EdgeInsets.only(right: 8.0),
+                                  child: ClipRRect(
+                                    borderRadius:
+                                    BorderRadius.circular(10),
+                                    child: Image.network(
+                                      _flowerReferencePhotos[index],
+                                      width: 90,
+                                      height: 90,
+                                      fit: BoxFit.cover,
+                                      errorBuilder: (_, __, ___) =>
+                                      const SizedBox.shrink(),
+                                      loadingBuilder:
+                                          (context, child, progress) {
+                                        if (progress == null) return child;
+                                        return Container(
+                                          width: 90,
+                                          height: 90,
+                                          color: isDark
+                                              ? const Color(0xFF2A2A2A)
+                                              : const Color(0xFFF3F4F6),
+                                        );
+                                      },
                                     ),
-                                  );
-                                },
-                              ),
+                                  ),
+                                );
+                              },
                             ),
+                          ),
                           Padding(
                             padding: const EdgeInsets.only(top: 4.0),
                             child: Text('Photos via Pexels',
@@ -2489,234 +2416,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
           ),
         ],
       ),
-    );
-  }
-
-  // ---------------------------------------------------------------------------
-  // TAB 3: FLORA AI CONCIERGE CHAT
-  // ---------------------------------------------------------------------------
-  Widget _buildChatConciergeTab(bool isDark) {
-    final suggestedQuestions = [
-      'What flowers represent gratitude & thankfulness?',
-      'How do I make my roses stay fresh for 2 weeks?',
-      'Best flower arrangement for a 1st anniversary?',
-      'Explain the meaning of yellow vs red roses',
-    ];
-
-    return Column(
-      children: [
-        // Concierge Header
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-          color: isDark ? const Color(0xFF1E1E1E) : const Color(0xFFFFF7ED),
-          child: Row(
-            children: [
-              const CircleAvatar(
-                backgroundColor: Color(0xFFF59E0B),
-                child: Icon(Icons.support_agent, color: Colors.white),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('Flora - AI Floriography Specialist',
-                        style: TextStyle(
-                            fontWeight: FontWeight.bold, fontSize: 14)),
-                    Text(
-                        'Ask anything about flower meanings, care tips & bouquet advice!',
-                        style: TextStyle(
-                            fontSize: 11,
-                            color:
-                            isDark ? Colors.grey[400] : Colors.grey[600])),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ),
-
-        // Quick Suggestion Chips
-        SizedBox(
-          height: 44,
-          child: ListView.builder(
-            scrollDirection: Axis.horizontal,
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            itemCount: suggestedQuestions.length,
-            itemBuilder: (context, index) {
-              final q = suggestedQuestions[index];
-              return Padding(
-                padding: const EdgeInsets.only(right: 8.0),
-                child: ActionChip(
-                  label: Text(q, style: const TextStyle(fontSize: 11)),
-                  backgroundColor:
-                  isDark ? const Color(0xFF2A2A2A) : Colors.white,
-                  side: BorderSide(
-                      color: const Color(0xFFF59E0B).withValues(alpha: 0.4)),
-                  onPressed: () => _sendChatMessage(q),
-                ),
-              );
-            },
-          ),
-        ),
-
-        // Messages List
-        Expanded(
-          child: ListView.builder(
-            controller: _scrollController,
-            padding: const EdgeInsets.all(16),
-            itemCount: _messages.length,
-            itemBuilder: (context, index) {
-              final msg = _messages[index];
-              final isUser = msg['role'] == 'User';
-
-              return Align(
-                alignment:
-                isUser ? Alignment.centerRight : Alignment.centerLeft,
-                child: Container(
-                  margin: const EdgeInsets.only(bottom: 12),
-                  padding:
-                  const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                  constraints: BoxConstraints(
-                      maxWidth: MediaQuery.of(context).size.width * 0.78),
-                  decoration: BoxDecoration(
-                    color: isUser
-                        ? const Color(0xFFF59E0B)
-                        : (isDark
-                        ? const Color(0xFF262626)
-                        : const Color(0xFFF3F4F6)),
-                    borderRadius: BorderRadius.only(
-                      topLeft: const Radius.circular(16),
-                      topRight: const Radius.circular(16),
-                      bottomLeft: isUser
-                          ? const Radius.circular(16)
-                          : const Radius.circular(4),
-                      bottomRight: isUser
-                          ? const Radius.circular(4)
-                          : const Radius.circular(16),
-                    ),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        isUser ? 'You' : 'Flora AI',
-                        style: TextStyle(
-                          fontWeight: FontWeight.bold,
-                          fontSize: 11,
-                          color:
-                          isUser ? Colors.white70 : const Color(0xFFF59E0B),
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        msg['content'] ?? '',
-                        style: TextStyle(
-                          fontSize: 14,
-                          color: isUser
-                              ? Colors.white
-                              : (isDark
-                              ? Colors.white
-                              : const Color(0xFF121212)),
-                          height: 1.4,
-                        ),
-                      ),
-                      if (!isUser) ...[
-                        Builder(
-                          builder: (context) {
-                            final chatImg =
-                            _getChatFlowerImage(msg['content'] ?? '');
-                            if (chatImg == null) return const SizedBox.shrink();
-                            return Padding(
-                              padding: const EdgeInsets.only(top: 8.0),
-                              child: ClipRRect(
-                                borderRadius: BorderRadius.circular(10),
-                                child: Image.network(
-                                  chatImg,
-                                  height: 130,
-                                  width: double.infinity,
-                                  fit: BoxFit.cover,
-                                  errorBuilder: (_, __, ___) =>
-                                  const SizedBox.shrink(),
-                                ),
-                              ),
-                            );
-                          },
-                        ),
-                      ],
-                    ],
-                  ),
-                ),
-              );
-            },
-          ),
-        ),
-
-        if (_isChatLoading)
-          const Padding(
-            padding: EdgeInsets.all(8.0),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                SizedBox(
-                    width: 16,
-                    height: 16,
-                    child: CircularProgressIndicator(
-                        strokeWidth: 2, color: Color(0xFFF59E0B))),
-                SizedBox(width: 10),
-                Text('Flora is thinking...',
-                    style: TextStyle(fontSize: 12, color: Colors.grey)),
-              ],
-            ),
-          ),
-
-        // Input Field
-        Container(
-          padding: const EdgeInsets.all(12),
-          decoration: BoxDecoration(
-            color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
-            boxShadow: [
-              BoxShadow(
-                  color: Colors.black.withValues(alpha: 0.05),
-                  blurRadius: 8,
-                  offset: const Offset(0, -2))
-            ],
-          ),
-          child: SafeArea(
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _chatController,
-                    decoration: InputDecoration(
-                      hintText: 'Ask Flora about flower meanings, care...',
-                      filled: true,
-                      fillColor: isDark
-                          ? const Color(0xFF2A2A2A)
-                          : const Color(0xFFF9FAFB),
-                      contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 16, vertical: 12),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(24),
-                        borderSide: BorderSide.none,
-                      ),
-                    ),
-                    onSubmitted: (_) => _sendChatMessage(),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                CircleAvatar(
-                  backgroundColor: const Color(0xFFF59E0B),
-                  child: IconButton(
-                    icon: const Icon(Icons.send, color: Colors.white, size: 20),
-                    onPressed: () => _sendChatMessage(),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ],
     );
   }
 }

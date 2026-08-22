@@ -145,7 +145,6 @@ class GeminiService {
     final lowerFlower = flowerType.toLowerCase();
     final lowerPot = potType.toLowerCase();
 
-    // Target position centered on table / bench / stool surface in the room photo
     final centerX = width * 0.50;
     final centerY = height * 0.50;
     final vaseW = width * 0.42;
@@ -153,9 +152,8 @@ class GeminiService {
     final vaseTop = centerY - vaseH * 0.15;
     final vaseBottom = centerY + vaseH * 0.55;
 
-    // 1. Realistic soft contact shadow on stool/table surface
     final shadowPaint = Paint()
-      ..color = Colors.black.withOpacity(0.5)
+      ..color = Colors.black.withValues(alpha: 0.5)
       ..maskFilter = const ui.MaskFilter.blur(ui.BlurStyle.normal, 22);
     canvas.drawOval(
       Rect.fromCenter(
@@ -166,7 +164,6 @@ class GeminiService {
       shadowPaint,
     );
 
-    // 2. Draw Stems & Lush Foliage rising from vase
     final stemPaint = Paint()
       ..color = const Color(0xFF166534)
       ..strokeWidth = vaseW * 0.04
@@ -174,7 +171,6 @@ class GeminiService {
 
     final leafPaint = Paint()..style = PaintingStyle.fill;
 
-    // Draw background stems
     final stemPath = Path();
     stemPath.moveTo(centerX - vaseW * 0.2, vaseTop + 10);
     stemPath.quadraticBezierTo(centerX - vaseW * 0.4, vaseTop - vaseH * 0.8,
@@ -190,7 +186,6 @@ class GeminiService {
 
     canvas.drawPath(stemPath, stemPaint);
 
-    // Draw Eucalyptus & Monstera leaves
     leafPaint.color = const Color(0xFF15803D);
     canvas.drawOval(
       Rect.fromCenter(
@@ -222,7 +217,6 @@ class GeminiService {
       leafPaint,
     );
 
-    // 3. Draw Pot/Vase
     final potPath = Path();
     potPath.moveTo(centerX - vaseW * 0.35, vaseTop);
     potPath.quadraticBezierTo(
@@ -267,13 +261,11 @@ class GeminiService {
         ],
       );
     } else {
-      // Glass
       potPaint.color = const Color(0x90E0F2FE);
     }
 
     canvas.drawPath(potPath, potPaint);
 
-    // Rim of the pot
     final rimPaint = Paint()
       ..color = lowerPot.contains('gold')
           ? const Color(0xFFFBBF24)
@@ -289,9 +281,8 @@ class GeminiService {
       rimPaint,
     );
 
-    // Highlight on pot side
     final highlightPaint = Paint()
-      ..color = Colors.white.withOpacity(0.4)
+      ..color = Colors.white.withValues(alpha: 0.4)
       ..style = PaintingStyle.stroke
       ..strokeWidth = vaseW * 0.05
       ..maskFilter = const ui.MaskFilter.blur(ui.BlurStyle.normal, 4);
@@ -301,7 +292,6 @@ class GeminiService {
       highlightPaint,
     );
 
-    // 4. Draw Flowers (Sunflowers, Roses, Tulips, Lilies)
     if (lowerFlower.contains('sunflower') ||
         lowerFlower.contains('mirasol') ||
         lowerFlower.contains('yellow')) {
@@ -336,7 +326,6 @@ class GeminiService {
       _drawLily(canvas, Offset(centerX + vaseW * 0.35, vaseTop - vaseH * 1.1),
           vaseW * 0.42);
     } else {
-      // Default lush multi-color bouquet
       _drawRose(canvas, Offset(centerX, vaseTop - vaseH * 1.8), vaseW * 0.45);
       _drawSunflower(canvas,
           Offset(centerX - vaseW * 0.35, vaseTop - vaseH * 1.2), vaseW * 0.42);
@@ -344,8 +333,7 @@ class GeminiService {
           vaseW * 0.38);
     }
 
-    // 5. Baby's breath accent dots
-    final babyBreathPaint = Paint()..color = Colors.white.withOpacity(0.95);
+    final babyBreathPaint = Paint()..color = Colors.white.withValues(alpha: 0.95);
     final offsets = [
       Offset(centerX - vaseW * 0.45, vaseTop - vaseH * 1.5),
       Offset(centerX - vaseW * 0.5, vaseTop - vaseH * 1.1),
@@ -396,19 +384,15 @@ class GeminiService {
   static void _drawRose(Canvas canvas, Offset center, double radius) {
     final petalPaint = Paint()..style = PaintingStyle.fill;
 
-    // Outer petals
     petalPaint.color = const Color(0xFF991B1B);
     canvas.drawCircle(center, radius, petalPaint);
 
-    // Mid petals
     petalPaint.color = const Color(0xFFDC2626);
     canvas.drawCircle(center + const Offset(-2, -2), radius * 0.75, petalPaint);
 
-    // Inner petals
     petalPaint.color = const Color(0xFFEF4444);
     canvas.drawCircle(center + const Offset(2, 2), radius * 0.5, petalPaint);
 
-    // Heart spiral
     petalPaint.color = const Color(0xFFFECDD3);
     canvas.drawCircle(center, radius * 0.25, petalPaint);
   }
@@ -416,7 +400,6 @@ class GeminiService {
   static void _drawTulip(Canvas canvas, Offset center, double radius) {
     final petalPaint = Paint()..style = PaintingStyle.fill;
 
-    // Outer cup
     petalPaint.color = const Color(0xFFBE185D);
     canvas.drawOval(
       Rect.fromCenter(
@@ -424,7 +407,6 @@ class GeminiService {
       petalPaint,
     );
 
-    // Inner highlight
     petalPaint.color = const Color(0xFFF43F5E);
     canvas.drawOval(
       Rect.fromCenter(
@@ -434,7 +416,6 @@ class GeminiService {
       petalPaint,
     );
 
-    // Bright center tip
     petalPaint.color = const Color(0xFFFDA4AF);
     canvas.drawOval(
       Rect.fromCenter(
@@ -469,27 +450,12 @@ class GeminiService {
     canvas.drawCircle(center, radius * 0.12, stamenPaint);
   }
 
-  /// Real Multimodal Image Editing with Gemini Vision + In-painting Synthesis
-  /// Takes the user's uploaded room photo, analyzes its exact room background & furniture placement with Gemini 2.5 Flash,
-  /// and generates an edited picture preserving the room background while in-painting the specified floral vase design.
-  /// Sends the user's uploaded photo + occasion note to Gemini's image model
-  /// (image-to-image editing) and returns the AI-generated result: the model
-  /// analyzes the actual room/venue layout and blends the floral arrangement
-  /// into the real photo.
-  ///
-  /// IMPORTANT: this throws GeminiImageException on any failure instead of
-  /// silently falling back -- the caller decides whether to show the Canvas
-  /// placeholder, but it MUST surface the real error to the user/logs.
-  /// Silent fallbacks are why "nothing generates" is impossible to diagnose.
   static Future<Uint8List> editUserPhotoWithGemini({
     required Uint8List userRoomBytes,
     required String userInstruction,
     required String flowerType,
     required String potType,
   }) async {
-    // gemini-2.5-flash-image was superseded by gemini-3.1-flash-image
-    // ("Nano Banana 2") as Google's current GA image model. If Google ships
-    // another rename, this is the one line that needs to change.
     const modelName = 'gemini-3.1-flash-image';
     final url = Uri.parse(
       'https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$_apiKey',
@@ -542,8 +508,6 @@ class GeminiService {
 
     final data = json.decode(response.body);
 
-    // A 200 with no candidates usually means the safety filter blocked the
-    // request/image -- check promptFeedback so that reason is visible too.
     final promptFeedback = data['promptFeedback'];
     if (promptFeedback != null && promptFeedback['blockReason'] != null) {
       throw GeminiImageException(
@@ -569,26 +533,6 @@ class GeminiService {
         'Response had no image part (model may have replied text-only): ${response.body}');
   }
 
-  /// Stability AI fallback for the same job as editUserPhotoWithGemini():
-  /// takes the uploaded room/venue photo + occasion note and returns an
-  /// image-to-image edit with the floral arrangement added.
-  ///
-  /// Uses Stable Diffusion 3.5 in "image-to-image" mode -- it conditions on
-  /// your uploaded photo (not a blank canvas) and a prompt describing what
-  /// to add, so the room/venue you photographed still comes through in the
-  /// result rather than being replaced by a wholly new AI scene.
-  ///
-  /// `strength` controls how much the AI is allowed to change vs. preserve
-  /// the original photo -- 0.0 = ignore the prompt entirely, 1.0 = ignore
-  /// the photo entirely. Image-to-image mode has no real concept of
-  /// "insert a new object here" the way true inpainting does -- it just
-  /// redraws the photo guided by the prompt, constrained by this value. At
-  /// low strength (e.g. 0.65) the model often plays it safe and barely
-  /// changes the photo, which can look like nothing was added at all. 0.85
-  /// gives it real room to render a visible floral addition, at the cost
-  /// of the room looking somewhat less identical to the original photo.
-  /// Tune this if results drift too far from the source room, or still
-  /// don't show visible flowers.
   static Future<Uint8List> editUserPhotoWithStabilityAI({
     required Uint8List userRoomBytes,
     required String userInstruction,
@@ -606,8 +550,6 @@ class GeminiService {
 
     final request = http.MultipartRequest('POST', uri);
     request.headers['Authorization'] = 'Bearer $_stabilityApiKey';
-    // Accept: image/* returns the raw generated image bytes directly in the
-    // response body -- no base64 decoding needed, unlike the Gemini call above.
     request.headers['Accept'] = 'image/*';
 
     request.fields['mode'] = 'image-to-image';
@@ -636,8 +578,6 @@ class GeminiService {
     print("Stability AI HTTP ${response.statusCode}");
 
     if (response.statusCode != 200) {
-      // Stability returns a JSON error body even when Accept: image/* was
-      // requested, so response.body is readable text here, not binary.
       throw GeminiImageException(
           'Stability AI error (${response.statusCode}): ${response.body}');
     }
@@ -693,7 +633,6 @@ class GeminiService {
     }
   }
 
-  /// Helper to pick a high-resolution floral arrangement photo based on themes & flowers
   static String selectFloralImageUrl(
       {String? vibe, String? flowers, String? theme}) {
     final combined =
@@ -739,7 +678,6 @@ class GeminiService {
     return 'https://images.unsplash.com/photo-1563241527-3004b7be0ffd?q=80&w=800&auto=format&fit=crop';
   }
 
-  /// Helper to pick a clean transparent PNG floral cutout for room photo overlays
   static String selectTransparentOverlayUrl(
       {String? vibe, String? flowers, String? theme}) {
     final combined =
@@ -758,7 +696,6 @@ class GeminiService {
     }
   }
 
-  /// AI Visual Assistant - Analyzes room photo/decor/dress image to match flowers and color palette
   static Future<Map<String, dynamic>> analyzeVisualTheme({
     Uint8List? imageBytes,
     String? occasion,
@@ -864,6 +801,13 @@ class GeminiService {
   }
 
   /// AI Personalization Matchmaker - Generates bouquet ideas, 3D formulas & card notes
+  ///
+  /// TODO (tracked separately, not yet implemented): estimatedPrice below is
+  /// still AI-guessed free text. The plan discussed is to replace this with
+  /// a computed price from a real Dangwa-tier wholesale rate table once
+  /// that pricing service is built -- flagging here so it isn't forgotten,
+  /// but intentionally NOT changed in this pass to avoid breaking the
+  /// existing Matchmaker price display before its replacement exists.
   static Future<Map<String, dynamic>> getPersonalizedMatch({
     required String recipient,
     required String occasion,
@@ -957,16 +901,24 @@ class GeminiService {
     return resultData;
   }
 
-  /// Interactive AI Floral Concierge Chat
+  /// Interactive AI Floral Concierge Chat -- doubles as a real inquiry
+  /// assistant when `inventoryContext` is supplied (live stock, prices,
+  /// branches, categories pulled from Firestore by the caller). Without it,
+  /// Flora falls back to general floriography/care advice only, since she
+  /// has nothing real to check stock against.
   static Future<String> chatWithConcierge({
     required String userQuery,
     List<Map<String, String>> conversationHistory = const [],
+    String? inventoryContext,
   }) async {
     try {
       final model = GenerativeModel(
         model: 'gemini-2.5-flash',
         apiKey: _apiKey,
       );
+
+      final hasLiveData =
+          inventoryContext != null && inventoryContext.trim().isNotEmpty;
 
       final systemPrompt = """
         You are 'Flora', Bloominous' AI Floral Assistant & Floriography Expert in the Philippines.
@@ -975,6 +927,20 @@ class GeminiService {
         - Flower care & longevity advice
         - Bouquet recommendations for specific budgets or occasions
         - Directing them to use the 3D Builder or Visual AI Scanner
+        ${hasLiveData ? "- Real stock/price/branch INQUIRIES using the LIVE DATA below" : ""}
+
+        ${hasLiveData ? """
+        LIVE STORE DATA (use this, and ONLY this, to answer any question about
+        what's in stock, current prices, or which branch has something --
+        never invent a product, price, or stock count that isn't listed here):
+        ---
+        $inventoryContext
+        ---
+        If something the customer asks about is NOT in the list above, say so
+        plainly (e.g. "I don't see that in our current stock -- it may be
+        temporarily unavailable, you can check the Shop page for the latest")
+        rather than guessing or assuming it exists.
+        """ : ""}
 
         Be warm, helpful, elegant, and concise (under 120 words). Answer directly and specifically to the user's question.
       """;
@@ -993,7 +959,6 @@ class GeminiService {
       print("Gemini chatWithConcierge error: $e");
     }
 
-    // Dynamic intelligent responses based on query keywords if API is unreachable or rate limited
     final lower = userQuery.toLowerCase();
 
     if (lower.contains('friend') || lower.contains('kaibigan')) {
@@ -1080,15 +1045,10 @@ class GeminiService {
     };
   }
 
-  /// Searches Pexels for real reference photos of the given flower name
-  /// (e.g. "red roses", "sunflowers"). Returns a list of direct image URLs,
-  /// or an empty list if nothing was found or the call failed -- this is
-  /// a "nice to have" enhancement, so failures here should never block the
-  /// rest of the reservation flow.
   static Future<List<String>> searchFlowerPhotos(String flowerQuery,
       {int perPage = 4}) async {
     if (ApiKeys.pexelsApiKey.isEmpty ||
-        ApiKeys.pexelsApiKey == 'ZsXwWXgTuSlBIXnlLlOJ2QNSX9OmFwzGvrKDvDM2Tfa7vTts88nnkKwx') {
+        ApiKeys.pexelsApiKey == 'PASTE_YOUR_PEXELS_API_KEY_HERE') {
       print("Pexels key not set -- skipping flower photo search.");
       return [];
     }
