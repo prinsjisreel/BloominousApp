@@ -375,6 +375,21 @@ class _AIAssistantPageState extends State<AIAssistantPage>
   bool _isGeneratingMatch = false;
   Map<String, dynamic>? _matchResult;
 
+  // Lets the customer choose between an AI-written card note (using the
+  // Tone dropdown above) or typing their own message entirely -- some
+  // people want a personal touch AI can't replicate. When true, the
+  // custom text below is used verbatim instead of Gemini's cardNote.
+  bool _useCustomCardNote = false;
+  final TextEditingController _customCardNoteController =
+  TextEditingController();
+
+  // Real Pexels photo(s) of the actual flowers in the generated bouquet
+  // formula -- replaces the old hardcoded keyword-to-Unsplash-URL picker
+  // (selectFloralImageUrl), which only ever had a handful of generic
+  // stock photos regardless of what flowers Gemini actually chose.
+  List<String> _matchPhotos = [];
+  bool _isLoadingMatchPhotos = false;
+
   // Flora AI Concierge moved to its own page (FloraChatPage), opened from a
   // floating button on the Shop Category screen -- no longer a tab here.
 
@@ -393,6 +408,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     _lastNameController.dispose();
     _phoneController.dispose();
     _customApiPromptController.dispose();
+    _customCardNoteController.dispose();
     super.dispose();
   }
 
@@ -653,6 +669,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     setState(() {
       _isGeneratingMatch = true;
       _matchResult = null;
+      _matchPhotos = [];
     });
 
     final result = await GeminiService.getPersonalizedMatch(
@@ -663,11 +680,39 @@ class _AIAssistantPageState extends State<AIAssistantPage>
       tone: _selectedTone,
     );
 
+    // If the customer chose to write their own card note, it overrides
+    // whatever Gemini generated -- their words take priority, Gemini's
+    // note is discarded entirely rather than shown alongside it.
+    if (_useCustomCardNote && _customCardNoteController.text.trim().isNotEmpty) {
+      result['cardNote'] = _customCardNoteController.text.trim();
+    }
+
     if (mounted) {
       setState(() {
         _isGeneratingMatch = false;
         _matchResult = result;
       });
+    }
+
+    // Fetch REAL photos of the actual flowers Gemini picked, via Pexels --
+    // done after the result is already shown so the card renders
+    // immediately with its existing fallback image, then upgrades to real
+    // photos once the search completes (non-blocking, same pattern used
+    // in the Visual Stylist tab).
+    final formula = (result['flowerFormula'] as List?) ?? [];
+    final flowerQuery = formula.isNotEmpty
+        ? formula.first['flower']?.toString() ?? ''
+        : '';
+    if (flowerQuery.isNotEmpty) {
+      if (mounted) setState(() => _isLoadingMatchPhotos = true);
+      final photos = await GeminiService.searchFlowerPhotos(flowerQuery,
+          perPage: 4);
+      if (mounted) {
+        setState(() {
+          _matchPhotos = photos;
+          _isLoadingMatchPhotos = false;
+        });
+      }
     }
   }
 
@@ -2075,10 +2120,71 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                 if (val != null) setState(() => _selectedBudget = val);
               }, isDark),
 
-          _buildDropdownSection(
-              '5. Card Message Sentiment', _selectedTone, tones, (val) {
-            if (val != null) setState(() => _selectedTone = val);
-          }, isDark),
+          // 5. Card note: AI-generated (with a tone dropdown) OR the
+          // customer's own words entirely. Some occasions call for
+          // something too personal for AI to write believably.
+          Padding(
+            padding: const EdgeInsets.only(bottom: 6.0),
+            child: Text('5. Card Message',
+                style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 13,
+                    color: isDark ? Colors.white : Colors.black87)),
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              Expanded(
+                child: ChoiceChip(
+                  label: const Text('AI-generated'),
+                  selected: !_useCustomCardNote,
+                  onSelected: (_) =>
+                      setState(() => _useCustomCardNote = false),
+                  selectedColor: const Color(0xFFF59E0B),
+                  labelStyle: TextStyle(
+                      color: !_useCustomCardNote
+                          ? Colors.white
+                          : (isDark ? Colors.white : Colors.black),
+                      fontWeight: FontWeight.w600,
+                      fontSize: 12),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: ChoiceChip(
+                  label: const Text('Write my own'),
+                  selected: _useCustomCardNote,
+                  onSelected: (_) =>
+                      setState(() => _useCustomCardNote = true),
+                  selectedColor: const Color(0xFFF59E0B),
+                  labelStyle: TextStyle(
+                      color: _useCustomCardNote
+                          ? Colors.white
+                          : (isDark ? Colors.white : Colors.black),
+                      fontWeight: FontWeight.w600,
+                      fontSize: 12),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          if (_useCustomCardNote)
+            TextField(
+              controller: _customCardNoteController,
+              maxLines: 3,
+              decoration: InputDecoration(
+                hintText: 'Type your own card message...',
+                filled: true,
+                fillColor: isDark ? const Color(0xFF262626) : Colors.white,
+                border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12)),
+              ),
+            )
+          else
+            _buildDropdownSection('Card Message Sentiment', _selectedTone,
+                tones, (val) {
+                  if (val != null) setState(() => _selectedTone = val);
+                }, isDark),
 
           const SizedBox(height: 16),
 
@@ -2140,21 +2246,39 @@ class _AIAssistantPageState extends State<AIAssistantPage>
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // Bouquet Preview Image
-                  if (_matchResult!['imageUrl'] != null)
+                  // Bouquet Preview Image -- prefers a REAL Pexels photo of
+                  // the actual flowers Gemini chose (_matchPhotos), falling
+                  // back to the old hardcoded keyword-matched Unsplash pick
+                  // only if the Pexels search comes back empty or hasn't
+                  // finished yet.
+                  if (_matchPhotos.isNotEmpty ||
+                      _matchResult!['imageUrl'] != null)
                     ClipRRect(
                       borderRadius:
                       const BorderRadius.vertical(top: Radius.circular(16)),
                       child: Stack(
                         children: [
                           Image.network(
-                            _matchResult!['imageUrl'],
+                            _matchPhotos.isNotEmpty
+                                ? _matchPhotos.first
+                                : _matchResult!['imageUrl'],
                             height: 200,
                             width: double.infinity,
                             fit: BoxFit.cover,
                             errorBuilder: (_, __, ___) =>
                             const SizedBox.shrink(),
                           ),
+                          if (_isLoadingMatchPhotos)
+                            const Positioned(
+                              bottom: 10,
+                              left: 10,
+                              child: SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(
+                                    strokeWidth: 2, color: Colors.white),
+                              ),
+                            ),
                           Positioned(
                             top: 12,
                             right: 12,

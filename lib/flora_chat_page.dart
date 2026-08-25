@@ -11,7 +11,17 @@ import 'inventory_data.dart';
 /// is X?", "what's available at this branch?" -- grounded in what's
 /// genuinely in the database right now, not guesses.
 class FloraChatPage extends StatefulWidget {
-  const FloraChatPage({super.key});
+  // When opened from a product's detail page, this carries that product
+  // so Flora can be primed to answer as if the customer is asking about
+  // it specifically -- e.g. tapping "Ask Flora" while viewing "Red Rose"
+  // means the very first thing Flora says references that product, and
+  // every reply after is grounded with "the customer is currently
+  // looking at X" context, not just the general store catalog. Null when
+  // opened from the general FAB on the Shop Category page (no product
+  // focus, general inquiry mode).
+  final Map<String, dynamic>? focusedProduct;
+
+  const FloraChatPage({super.key, this.focusedProduct});
 
   @override
   State<FloraChatPage> createState() => _FloraChatPageState();
@@ -28,17 +38,46 @@ class _FloraChatPageState extends State<FloraChatPage> {
   String? _inventoryContext;
   bool _isLoadingInventory = true;
 
-  final List<Map<String, String>> _messages = [
-    {
-      'role': 'Flora',
-      'content':
-      'Hello! I am Flora, your AI Floral Assistant. Ask me about flower meanings, care tips, or check what we currently have in stock and its price! How can I help you today?'
-    }
-  ];
+  // Raw (unformatted) inventory items -- kept separately from
+  // _inventoryContext above. That string is for the primary Gemini
+  // prompt; this raw list is what gets passed to chatWithConcierge's
+  // embedding-based semantic fallback, which needs actual structured
+  // fields (name/price/stock/description) to embed and search, not
+  // pre-formatted display text.
+  List<Map<String, dynamic>> _inventoryItems = [];
+
+  late final List<Map<String, String>> _messages;
+
+  // Real Pexels photos attached to each message, kept in lock-step with
+  // _messages by index (empty list = no photos for that message). This
+  // replaces the old _getChatFlowerImage(), which mapped a few keywords
+  // straight to a handful of hardcoded Unsplash URLs -- the SAME photo
+  // every single time "rose" appeared in a reply, regardless of what
+  // Flora actually said. Real search means the photo genuinely reflects
+  // what's being discussed.
+  final List<List<String>> _messagePhotos = [];
 
   @override
   void initState() {
     super.initState();
+
+    final product = widget.focusedProduct;
+    _messages = [
+      {
+        'role': 'Flora',
+        'content': product != null
+            ? 'Hello! I see you\'re looking at ${product['name'] ?? 'this product'} '
+            '(₱${(product['price'] ?? 0).toStringAsFixed(2)}). Ask me anything about '
+            'it -- availability, care tips, whether it suits an occasion -- or '
+            'anything else about our flowers!'
+            : 'Hello! I am Flora, your AI Floral Assistant. Ask me about flower meanings, care tips, or check what we currently have in stock and its price! How can I help you today?'
+      }
+    ];
+    _messagePhotos.add([]); // filled in below if a product photo exists
+
+    if (product != null) {
+      _loadFocusedProductPhoto(product);
+    }
     _loadInventoryContext();
   }
 
@@ -69,14 +108,32 @@ class _FloraChatPageState extends State<FloraChatPage> {
       await InventoryData.inventoryStream(branchId: 'all').first;
       final categories = await InventoryData.globalCategoriesStream().first;
 
+      final buffer = StringBuffer();
+
+      // Product focus note goes FIRST, before the general catalog dump,
+      // so it's the most prominent thing Gemini sees -- this is what
+      // keeps Flora anchored to "Red Rose" even three messages into the
+      // conversation, rather than drifting back to generic answers.
+      final product = widget.focusedProduct;
+      if (product != null) {
+        buffer.writeln(
+            'IMPORTANT CONTEXT: The customer opened this chat directly from '
+                'the product page for "${product['name'] ?? 'a product'}" '
+                '(price: ₱${(product['price'] ?? 0).toStringAsFixed(2)}'
+                '${product['category'] != null ? ", category: ${product['category']}" : ""}'
+                '${product['description'] != null && (product['description'] as String).isNotEmpty ? ", description: ${product['description']}" : ""}). '
+                'Assume their questions are about THIS product unless they '
+                'clearly ask about something else.');
+      }
+
       if (inventory.isEmpty) {
-        _inventoryContext =
-        'No live inventory data is currently available -- answer generally and suggest the customer check the Shop page.';
+        buffer.writeln(
+            'No live inventory data is currently available -- answer generally and suggest the customer check the Shop page.');
+        _inventoryItems = [];
       } else {
         final inStock =
         inventory.where((item) => (item['stock'] ?? 0) > 0).toList();
 
-        final buffer = StringBuffer();
         buffer.writeln('Branches: ${branchNames.values.join(", ")}');
         buffer.writeln('Categories offered: ${categories.join(", ")}');
         buffer.writeln(
@@ -95,15 +152,55 @@ class _FloraChatPageState extends State<FloraChatPage> {
               '...and ${inStock.length - 60} more items not listed here for brevity.');
         }
 
-        _inventoryContext = buffer.toString();
+        // Raw items kept for the semantic fallback -- see field comment
+        // above for why this is separate from the formatted text block.
+        _inventoryItems = inventory;
       }
+
+      _inventoryContext = buffer.toString();
     } catch (e) {
       debugPrint('Error building Flora inventory context: $e');
       _inventoryContext =
       'Live stock data is temporarily unavailable -- answer generally and suggest the customer check the Shop page directly.';
+      _inventoryItems = [];
     } finally {
       if (mounted) setState(() => _isLoadingInventory = false);
     }
+  }
+
+  /// Fetches a real photo of the product the chat opened focused on, so
+  /// the greeting message isn't just text -- shown alongside the "Hello!
+  /// I see you're looking at X" message.
+  Future<void> _loadFocusedProductPhoto(Map<String, dynamic> product) async {
+    final name = product['name']?.toString();
+    if (name == null || name.isEmpty) return;
+    try {
+      final photos = await GeminiService.searchFlowerPhotos(name, perPage: 3);
+      if (mounted && _messagePhotos.isNotEmpty) {
+        setState(() => _messagePhotos[0] = photos);
+      }
+    } catch (e) {
+      debugPrint('Error loading focused product photo: $e');
+    }
+  }
+
+  /// Pulls a plain flower/topic keyword out of Flora's own reply text so
+  /// we know what to search Pexels for -- e.g. if she mentions "roses" in
+  /// her answer, the photo strip shows real roses, not a generic default.
+  /// Returns null (no photo search) if nothing recognizable is mentioned.
+  String? _extractPhotoQuery(String content) {
+    final lower = content.toLowerCase();
+    if (lower.contains('sunflower')) return 'sunflowers';
+    if (lower.contains('rose')) return 'red roses';
+    if (lower.contains('tulip')) return 'tulips';
+    if (lower.contains('lily') || lower.contains('lilies')) {
+      return 'white lilies';
+    }
+    if (lower.contains('carnation')) return 'pink carnations';
+    if (lower.contains('hydrangea')) return 'blue hydrangeas';
+    if (lower.contains('orchid')) return 'orchids';
+    if (lower.contains('gerbera')) return 'gerbera daisies';
+    return null;
   }
 
   Future<void> _sendChatMessage([String? predefined]) async {
@@ -116,6 +213,7 @@ class _FloraChatPageState extends State<FloraChatPage> {
 
     setState(() {
       _messages.add({'role': 'User', 'content': text});
+      _messagePhotos.add([]); // user messages never carry a photo strip
       _isChatLoading = true;
     });
 
@@ -125,11 +223,26 @@ class _FloraChatPageState extends State<FloraChatPage> {
       userQuery: text,
       conversationHistory: _messages.take(10).toList(),
       inventoryContext: _inventoryContext,
+      inventoryItems: _inventoryItems,
     );
+
+    // Real Pexels search based on what Flora's answer actually mentions --
+    // fetched before the setState below so the photo strip appears at the
+    // same time as the text, not popping in a beat later.
+    final query = _extractPhotoQuery(response);
+    List<String> photos = [];
+    if (query != null) {
+      try {
+        photos = await GeminiService.searchFlowerPhotos(query, perPage: 3);
+      } catch (e) {
+        debugPrint('Error fetching Flora reply photos: $e');
+      }
+    }
 
     if (mounted) {
       setState(() {
         _messages.add({'role': 'Flora', 'content': response});
+        _messagePhotos.add(photos);
         _isChatLoading = false;
       });
       _scrollToBottom();
@@ -148,35 +261,20 @@ class _FloraChatPageState extends State<FloraChatPage> {
     });
   }
 
-  String? _getChatFlowerImage(String content) {
-    final lower = content.toLowerCase();
-    if (lower.contains('sunflower') || lower.contains('yellow')) {
-      return 'https://images.unsplash.com/photo-1597848212624-a19eb35e2651?q=80&w=400&auto=format&fit=crop';
-    } else if (lower.contains('rose') ||
-        lower.contains('red') ||
-        lower.contains('romance')) {
-      return 'https://images.unsplash.com/photo-1518709268805-4e9042af9f23?q=80&w=400&auto=format&fit=crop';
-    } else if (lower.contains('tulip')) {
-      return 'https://images.unsplash.com/photo-1520763185298-1b434c919102?q=80&w=400&auto=format&fit=crop';
-    } else if (lower.contains('lily') || lower.contains('white')) {
-      return 'https://images.unsplash.com/photo-1582794543139-8ac9cb0f7b11?q=80&w=400&auto=format&fit=crop';
-    } else if (lower.contains('carnation') ||
-        lower.contains('pink') ||
-        lower.contains('mom') ||
-        lower.contains('mother')) {
-      return 'https://images.unsplash.com/photo-1561181286-d3fee7d55364?q=80&w=400&auto=format&fit=crop';
-    } else if (lower.contains('hydrangea') || lower.contains('blue')) {
-      return 'https://images.unsplash.com/photo-1508610048659-a06b669e3321?q=80&w=400&auto=format&fit=crop';
-    }
-    return null;
-  }
-
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
 
-    final suggestedQuestions = [
+    final product = widget.focusedProduct;
+    final suggestedQuestions = product != null
+        ? [
+      'Tell me more about ${product['name']}',
+      'Is ${product['name']} available right now?',
+      'What occasions suit ${product['name']}?',
+      'How do I keep it fresh?',
+    ]
+        : [
       'What flowers do you have in stock right now?',
       'How much is a bouquet of red roses?',
       'What flowers represent gratitude?',
@@ -196,8 +294,28 @@ class _FloraChatPageState extends State<FloraChatPage> {
               child: Icon(Icons.support_agent, color: Colors.white, size: 18),
             ),
             const SizedBox(width: 10),
-            const Text('Flora AI Concierge',
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text('Flora AI Concierge',
+                      style:
+                      TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                  if (product != null)
+                    Text(
+                      'Asking about: ${product['name']}',
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.normal,
+                          color: isDark
+                              ? Colors.grey[400]
+                              : Colors.grey[600]),
+                    ),
+                ],
+              ),
+            ),
           ],
         ),
         actions: [
@@ -334,29 +452,35 @@ class _FloraChatPageState extends State<FloraChatPage> {
                             height: 1.4,
                           ),
                         ),
-                        if (!isUser) ...[
-                          Builder(
-                            builder: (context) {
-                              final chatImg =
-                              _getChatFlowerImage(msg['content'] ?? '');
-                              if (chatImg == null) {
-                                return const SizedBox.shrink();
-                              }
-                              return Padding(
-                                padding: const EdgeInsets.only(top: 8.0),
-                                child: ClipRRect(
-                                  borderRadius: BorderRadius.circular(10),
-                                  child: Image.network(
-                                    chatImg,
-                                    height: 130,
-                                    width: double.infinity,
-                                    fit: BoxFit.cover,
-                                    errorBuilder: (_, __, ___) =>
-                                    const SizedBox.shrink(),
-                                  ),
-                                ),
-                              );
-                            },
+                        if (!isUser &&
+                            index < _messagePhotos.length &&
+                            _messagePhotos[index].isNotEmpty) ...[
+                          Padding(
+                            padding: const EdgeInsets.only(top: 8.0),
+                            child: SizedBox(
+                              height: 90,
+                              child: ListView.builder(
+                                scrollDirection: Axis.horizontal,
+                                itemCount: _messagePhotos[index].length,
+                                itemBuilder: (context, photoIndex) {
+                                  return Padding(
+                                    padding:
+                                    const EdgeInsets.only(right: 6.0),
+                                    child: ClipRRect(
+                                      borderRadius: BorderRadius.circular(10),
+                                      child: Image.network(
+                                        _messagePhotos[index][photoIndex],
+                                        width: 90,
+                                        height: 90,
+                                        fit: BoxFit.cover,
+                                        errorBuilder: (_, __, ___) =>
+                                        const SizedBox.shrink(),
+                                      ),
+                                    ),
+                                  );
+                                },
+                              ),
+                            ),
                           ),
                         ],
                       ],

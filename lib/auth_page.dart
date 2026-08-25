@@ -3,6 +3,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'dart:math';
 import 'dart:convert';
+import 'dart:async'; // Added for the countdown Timer
 import 'package:http/http.dart' as http;
 import 'package:google_fonts/google_fonts.dart';
 import 'main.dart'; // Idagdag ito para makita ang HomePage
@@ -10,6 +11,7 @@ import 'inventory_data.dart';
 import 'admin_dashboard.dart';
 import 'my_orders_page.dart';
 import 'customer_profile_page.dart';
+import 'device_security_service.dart';
 
 class AuthPage extends StatefulWidget {
   final bool returnAfterLogin;
@@ -27,7 +29,7 @@ class _AuthPageState extends State<AuthPage> {
   final TextEditingController _otpController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
   final TextEditingController _confirmPasswordController =
-      TextEditingController();
+  TextEditingController();
   final TextEditingController _firstNameController = TextEditingController();
   final TextEditingController _middleNameController = TextEditingController();
   final TextEditingController _lastNameController = TextEditingController();
@@ -46,13 +48,60 @@ class _AuthPageState extends State<AuthPage> {
 
   String? _generatedOtp;
 
+  // --- COUNTDOWN STATE ---
+  int _remainingLockoutSeconds = 0;
+  bool _superAdminLocked = false;
+  Timer? _lockoutTimer;
+
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  final DeviceSecurityService _securityService = DeviceSecurityService();
 
   @override
   void initState() {
     super.initState();
     _checkExistingSession();
+    _isRateLimited(); // Initial check on page load to see if they are already locked out
   }
+
+  @override
+  void dispose() {
+    _lockoutTimer?.cancel(); // Cancel timer to prevent memory leaks
+    super.dispose();
+  }
+
+  // --- FRAUD & RATE LIMITING HELPERS ---
+  Future<bool> _isRateLimited() async {
+    final rateLimit = await _securityService.checkRateLimit();
+    if (rateLimit['locked'] == true) {
+      if (mounted) {
+        setState(() {
+          _superAdminLocked = rateLimit['superAdminLock'] == true;
+          _remainingLockoutSeconds = rateLimit['remainingSeconds'] ?? 0;
+        });
+        _startTimer();
+      }
+      return true;
+    }
+    return false;
+  }
+
+  void _startTimer() {
+    _lockoutTimer?.cancel();
+    if (_remainingLockoutSeconds > 0 && !_superAdminLocked) {
+      _lockoutTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+        if (mounted) {
+          setState(() {
+            if (_remainingLockoutSeconds > 0) {
+              _remainingLockoutSeconds--;
+            } else {
+              _lockoutTimer?.cancel();
+            }
+          });
+        }
+      });
+    }
+  }
+  // -------------------------------------
 
   Future<void> _checkExistingSession() async {
     final user = FirebaseAuth.instance.currentUser;
@@ -64,7 +113,7 @@ class _AuthPageState extends State<AuthPage> {
 
       // 1. Try to find the customer document by the CURRENT UID
       final customerDoc =
-          await _firestore.collection('customers').doc(user.uid).get();
+      await _firestore.collection('customers').doc(user.uid).get();
 
       if (customerDoc.exists) {
         // Doc already exists at the correct ID
@@ -105,8 +154,8 @@ class _AuthPageState extends State<AuthPage> {
         final docs = (emailQuery != null && emailQuery.docs.isNotEmpty)
             ? emailQuery.docs
             : (phoneQuery != null && phoneQuery.docs.isNotEmpty)
-                ? phoneQuery.docs
-                : null;
+            ? phoneQuery.docs
+            : null;
 
         if (docs != null && docs.isNotEmpty) {
           final existingDoc = docs.first;
@@ -154,7 +203,7 @@ class _AuthPageState extends State<AuthPage> {
         return AlertDialog(
           backgroundColor: const Color(0xFFFFFDF9),
           shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
           title: Row(
             children: [
               const Icon(Icons.phonelink_setup_rounded,
@@ -187,11 +236,11 @@ class _AuthPageState extends State<AuthPage> {
                 const SizedBox(height: 10),
                 const Text(
                   '1️⃣ Pumunta sa Firebase Console:\n   https://console.firebase.google.com/\n\n'
-                  '2️⃣ Buksan ang iyong Project ➔ Authentication ➔ Sign-in method tab.\n\n'
-                  '3️⃣ I-click ang "Phone" provider.\n\n'
-                  '4️⃣ Sa pinaka-ibaba, i-expand ang "Phone numbers for testing".\n\n'
-                  '5️⃣ Maglagay ng Phone Number (Halimbawa: +639983082080) at Test Code (Halimbawa: 123456).\n\n'
-                  '6️⃣ I-click ang "Save".',
+                      '2️⃣ Buksan ang iyong Project ➔ Authentication ➔ Sign-in method tab.\n\n'
+                      '3️⃣ I-click ang "Phone" provider.\n\n'
+                      '4️⃣ Sa pinaka-ibaba, i-expand ang "Phone numbers for testing".\n\n'
+                      '5️⃣ Maglagay ng Phone Number (Halimbawa: +639983082080) at Test Code (Halimbawa: 123456).\n\n'
+                      '6️⃣ I-click ang "Save".',
                   style: TextStyle(
                       fontSize: 13, color: Color(0xFF444444), height: 1.4),
                 ),
@@ -218,7 +267,7 @@ class _AuthPageState extends State<AuthPage> {
                       Text(
                         'Pagkatapos mong ilagay sa Firebase Console, i-type lang ang iyong test number sa app. Lalabas ang OTP screen at i-enter ang preset code (hal. 123456) para makapasok agad!',
                         style:
-                            TextStyle(fontSize: 12, color: Color(0xFF666666)),
+                        TextStyle(fontSize: 12, color: Color(0xFF666666)),
                       ),
                     ],
                   ),
@@ -246,7 +295,7 @@ class _AuthPageState extends State<AuthPage> {
         return AlertDialog(
           backgroundColor: const Color(0xFFFFFDF9),
           shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
           title: Row(
             children: [
               const Icon(Icons.warning_amber_rounded,
@@ -327,6 +376,8 @@ class _AuthPageState extends State<AuthPage> {
       return;
     }
 
+    if (await _isRateLimited()) return;
+
     // Format the phone number. Prepend +63 if it doesn't start with + and starts with 9 or 09
     String phoneNumber = rawPhone;
     if (!phoneNumber.startsWith('+')) {
@@ -344,7 +395,7 @@ class _AuthPageState extends State<AuthPage> {
     final digitsOnly = phoneNumber.replaceAll(RegExp(r'\D'), '');
     if (phoneNumber.startsWith('+63')) {
       final numberAfter63 =
-          digitsOnly.startsWith('63') ? digitsOnly.substring(2) : digitsOnly;
+      digitsOnly.startsWith('63') ? digitsOnly.substring(2) : digitsOnly;
       if (numberAfter63.length != 10) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -367,19 +418,25 @@ class _AuthPageState extends State<AuthPage> {
         verificationCompleted: (PhoneAuthCredential credential) async {
           try {
             final userCredential =
-                await FirebaseAuth.instance.signInWithCredential(credential);
+            await FirebaseAuth.instance.signInWithCredential(credential);
             final uid = userCredential.user!.uid;
+            await _securityService.resetAttempts();
             await _onPhoneLoginSuccess(uid, phoneNumber);
           } catch (e) {
             setState(() => _isLoading = false);
+            await _securityService.recordFailedAttempt();
+            await _isRateLimited(); // Trigger UI timer update
             if (mounted) {
               ScaffoldMessenger.of(context).showSnackBar(
                   SnackBar(content: Text('Auto-Verification failed: $e')));
             }
           }
         },
-        verificationFailed: (FirebaseAuthException e) {
+        verificationFailed: (FirebaseAuthException e) async {
           setState(() => _isLoading = false);
+          await _securityService.recordFailedAttempt();
+          await _isRateLimited(); // Trigger UI timer update
+
           String message = e.message ?? 'Verification failed';
           final errStr = '${e.message ?? ''} ${e.code}';
           if (errStr.contains('BILLING_NOT_ENABLED') ||
@@ -394,7 +451,7 @@ class _AuthPageState extends State<AuthPage> {
             message = 'The provided phone number is not valid.';
           } else if (e.code == 'too-many-requests') {
             message =
-                'SMS traffic is blocked due to too many requests. Please try again later.';
+            'SMS traffic is blocked due to too many requests. Please try again later.';
           }
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -423,6 +480,8 @@ class _AuthPageState extends State<AuthPage> {
       );
     } catch (e) {
       setState(() => _isLoading = false);
+      await _securityService.recordFailedAttempt();
+      await _isRateLimited(); // Trigger UI timer update
       if (mounted) {
         if (e.toString().contains('BILLING_NOT_ENABLED') ||
             e.toString().toLowerCase().contains('billing')) {
@@ -439,6 +498,8 @@ class _AuthPageState extends State<AuthPage> {
     final enteredOtp = _otpController.text.trim();
     if (enteredOtp.isEmpty || _verificationId == null) return;
 
+    if (await _isRateLimited()) return;
+
     setState(() => _isLoading = true);
 
     try {
@@ -448,7 +509,10 @@ class _AuthPageState extends State<AuthPage> {
       );
 
       final userCredential =
-          await FirebaseAuth.instance.signInWithCredential(credential);
+      await FirebaseAuth.instance.signInWithCredential(credential);
+
+      await _securityService.resetAttempts();
+
       final uid = userCredential.user!.uid;
       final phone =
           userCredential.user!.phoneNumber ?? _phoneController.text.trim();
@@ -456,6 +520,8 @@ class _AuthPageState extends State<AuthPage> {
       await _onPhoneLoginSuccess(uid, phone);
     } catch (e) {
       setState(() => _isLoading = false);
+      await _securityService.recordFailedAttempt();
+      await _isRateLimited(); // Trigger UI timer update
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -470,8 +536,16 @@ class _AuthPageState extends State<AuthPage> {
   Future<void> _onPhoneLoginSuccess(String uid, String phone) async {
     setState(() => _isLoading = true);
     try {
+      // POST-LOGIN DEVICE SECURITY CHECK
+      String deviceHash = await _securityService.getDeviceHash();
+      final deviceBannedSnap = await _firestore.collection('banned_devices').doc(deviceHash).get();
+      if (deviceBannedSnap.exists) {
+        await FirebaseAuth.instance.signOut();
+        throw Exception('This device has been banned due to suspicious activity.');
+      }
+
       final customerDoc =
-          await _firestore.collection('customers').doc(uid).get();
+      await _firestore.collection('customers').doc(uid).get();
       if (customerDoc.exists) {
         await _firestore.collection('users').doc(uid).set({
           'role': 'customer',
@@ -498,7 +572,7 @@ class _AuthPageState extends State<AuthPage> {
         if (fName.isNotEmpty && lName.isNotEmpty) {
           final mName = _middleNameController.text.trim();
           final fullName =
-              '$fName ${mName.isNotEmpty ? '$mName ' : ''}$lName'.trim();
+          '$fName ${mName.isNotEmpty ? '$mName ' : ''}$lName'.trim();
           final email = _emailController.text.trim().toLowerCase();
 
           await _firestore.collection('customers').doc(uid).set({
@@ -737,6 +811,8 @@ class _AuthPageState extends State<AuthPage> {
       return;
     }
 
+    if (await _isRateLimited()) return;
+
     setState(() => _isLoading = true);
     try {
       await FirebaseAuth.instance.sendPasswordResetEmail(email: email);
@@ -749,6 +825,8 @@ class _AuthPageState extends State<AuthPage> {
         );
       }
     } catch (e) {
+      await _securityService.recordFailedAttempt();
+      await _isRateLimited(); // Trigger UI timer update
       if (mounted) {
         ScaffoldMessenger.of(context)
             .showSnackBar(SnackBar(content: Text(e.toString())));
@@ -763,6 +841,8 @@ class _AuthPageState extends State<AuthPage> {
     final password = _passwordController.text.trim();
 
     if (password.isEmpty) return;
+
+    if (await _isRateLimited()) return;
 
     setState(() => _isLoading = true);
 
@@ -786,7 +866,7 @@ class _AuthPageState extends State<AuthPage> {
           final storedPassword = userData['password'];
           if (storedPassword == password) {
             userCredential =
-                await FirebaseAuth.instance.createUserWithEmailAndPassword(
+            await FirebaseAuth.instance.createUserWithEmailAndPassword(
               email: email,
               password: password,
             );
@@ -800,9 +880,19 @@ class _AuthPageState extends State<AuthPage> {
 
       final uid = userCredential.user!.uid;
 
+      // POST-LOGIN DEVICE SECURITY CHECK
+      String deviceHash = await _securityService.getDeviceHash();
+      final deviceBannedSnap = await _firestore.collection('banned_devices').doc(deviceHash).get();
+      if (deviceBannedSnap.exists) {
+        await FirebaseAuth.instance.signOut();
+        throw Exception('This device has been banned due to suspicious activity.');
+      }
+
+      await _securityService.resetAttempts();
+
       // 2. SELF-REPAIR / MIGRATION CHECK
       final customerDoc =
-          await _firestore.collection('customers').doc(uid).get();
+      await _firestore.collection('customers').doc(uid).get();
       if (!customerDoc.exists) {
         final emailQuery = await _firestore
             .collection('customers')
@@ -833,8 +923,8 @@ class _AuthPageState extends State<AuthPage> {
               : 'Enthusiast';
           final fallbackMName = _middleNameController.text.trim();
           final fallbackFullName =
-              '$fallbackFName ${fallbackMName.isNotEmpty ? '$fallbackMName ' : ''}$fallbackLName'
-                  .trim();
+          '$fallbackFName ${fallbackMName.isNotEmpty ? '$fallbackMName ' : ''}$fallbackLName'
+              .trim();
 
           await _firestore.collection('customers').doc(uid).set({
             'firstName': fallbackFName,
@@ -855,10 +945,10 @@ class _AuthPageState extends State<AuthPage> {
 
       // 3. Ensure User Role Sync (Only for non-employees to prevent role downgrading/overwriting)
       final existingUserDoc =
-          await _firestore.collection('users').doc(uid).get();
+      await _firestore.collection('users').doc(uid).get();
       final existingDocData = existingUserDoc.data();
       final existingRole =
-          existingDocData != null ? existingDocData['role'] : null;
+      existingDocData != null ? existingDocData['role'] : null;
       if (existingRole == null || existingRole == 'customer') {
         await _firestore.collection('users').doc(uid).set({
           'role': 'customer',
@@ -882,12 +972,12 @@ class _AuthPageState extends State<AuthPage> {
       }
     } catch (e) {
       setState(() => _isLoading = false);
+      await _securityService.recordFailedAttempt();
+      await _isRateLimited(); // Trigger UI timer update
       ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text(e.toString().replaceAll('Exception: ', ''))));
     }
   }
-
-  // ... (Keep existing EmailJS and OTP generation methods)
 
   // EmailJS Credentials matching dashboard screenshot
   final String _emailJsServiceId = 'service_o3ezmmu';
@@ -974,7 +1064,7 @@ class _AuthPageState extends State<AuthPage> {
                   hintText: 'e.g., 09171234567',
                   hintStyle: const TextStyle(color: Color(0xFF999999)),
                   prefixIcon:
-                      const Icon(Icons.phone_android, color: Color(0xFFF4B400)),
+                  const Icon(Icons.phone_android, color: Color(0xFFF4B400)),
                   enabledBorder: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(12),
                     borderSide: BorderSide(
@@ -983,7 +1073,7 @@ class _AuthPageState extends State<AuthPage> {
                   focusedBorder: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(12),
                     borderSide:
-                        const BorderSide(color: Color(0xFFF4B400), width: 2),
+                    const BorderSide(color: Color(0xFFF4B400), width: 2),
                   ),
                   filled: true,
                   fillColor: Colors.white,
@@ -1104,7 +1194,7 @@ class _AuthPageState extends State<AuthPage> {
         borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
       ),
       backgroundColor:
-          const Color(0xFFFFFDF9), // Beautiful warm/cream background
+      const Color(0xFFFFFDF9), // Beautiful warm/cream background
       builder: (BuildContext context) {
         return Container(
           padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 32),
@@ -1155,9 +1245,9 @@ class _AuthPageState extends State<AuthPage> {
                 icon: Icons.phone_android_outlined,
                 title: 'Send to Phone (SMS)',
                 subtitle:
-                    (registeredPhone != null && registeredPhone.isNotEmpty)
-                        ? registeredPhone
-                        : 'No registered phone number found. Tap to enter.',
+                (registeredPhone != null && registeredPhone.isNotEmpty)
+                    ? registeredPhone
+                    : 'No registered phone number found. Tap to enter.',
                 disabled: false,
                 onTap: () {
                   Navigator.pop(context);
@@ -1254,7 +1344,7 @@ class _AuthPageState extends State<AuthPage> {
         borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
       ),
       backgroundColor:
-          const Color(0xFFFFFDF9), // Beautiful warm/cream background
+      const Color(0xFFFFFDF9), // Beautiful warm/cream background
       builder: (BuildContext context) {
         return Container(
           padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 32),
@@ -1400,12 +1490,14 @@ class _AuthPageState extends State<AuthPage> {
       return;
     }
 
+    if (await _isRateLimited()) return;
+
     setState(() => _isLoading = true);
 
     try {
       // 1. CHECK IF A VALID OTP ALREADY EXISTS
       final existingDoc =
-          await _firestore.collection('customer_otps').doc(email).get();
+      await _firestore.collection('customer_otps').doc(email).get();
 
       if (existingDoc.exists) {
         final data = existingDoc.data() as Map<String, dynamic>;
@@ -1444,7 +1536,7 @@ class _AuthPageState extends State<AuthPage> {
         'email': email,
         'createdAt': FieldValue.serverTimestamp(),
         'expiresAt':
-            DateTime.now().add(const Duration(minutes: 5)).toIso8601String(),
+        DateTime.now().add(const Duration(minutes: 5)).toIso8601String(),
       });
 
       // SEND REAL EMAIL VIA EMAILJS
@@ -1465,6 +1557,8 @@ class _AuthPageState extends State<AuthPage> {
       });
     } catch (e) {
       setState(() => _isLoading = false);
+      await _securityService.recordFailedAttempt();
+      await _isRateLimited(); // Trigger UI timer update
       print("OTP Send Error: $e");
       if (mounted) {
         // Fallback to mock dialog if real sending fails (for testing purposes)
@@ -1523,6 +1617,8 @@ class _AuthPageState extends State<AuthPage> {
 
     if (enteredOtp.isEmpty) return;
 
+    if (await _isRateLimited()) return;
+
     setState(() => _isLoading = true);
 
     try {
@@ -1542,6 +1638,7 @@ class _AuthPageState extends State<AuthPage> {
 
         if (enteredOtp == correctOtp) {
           // OTP Verified!
+          await _securityService.resetAttempts();
           if (_isSigningUp) {
             // If they are signing up, we already have the password, so register them
             await _registerNewUser();
@@ -1561,6 +1658,8 @@ class _AuthPageState extends State<AuthPage> {
       }
     } catch (e) {
       setState(() => _isLoading = false);
+      await _securityService.recordFailedAttempt();
+      await _isRateLimited(); // Trigger UI timer update
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -1652,6 +1751,13 @@ class _AuthPageState extends State<AuthPage> {
     setState(() => _isLoading = true);
 
     try {
+      // OVERALL DEVICE BAN CHECK
+      String deviceHash = await _securityService.getDeviceHash();
+      final deviceBannedSnap = await _firestore.collection('banned_devices').doc(deviceHash).get();
+      if (deviceBannedSnap.exists) {
+        throw Exception('Security Warning: This device has been banned due to suspicious activity. Registration is restricted.');
+      }
+
       if (!_isPhoneAuth) {
         await _checkDeviceAndNetworkSecurity(email);
       }
@@ -1672,7 +1778,7 @@ class _AuthPageState extends State<AuthPage> {
       } else {
         // PROPER REGISTRATION using Firebase Auth
         UserCredential userCredential =
-            await FirebaseAuth.instance.createUserWithEmailAndPassword(
+        await FirebaseAuth.instance.createUserWithEmailAndPassword(
           email: email,
           password: password,
         );
@@ -1684,15 +1790,15 @@ class _AuthPageState extends State<AuthPage> {
       int existingPoints = 0;
       final existingQuery = _isPhoneAuth
           ? await _firestore
-              .collection('customers')
-              .where('phone', isEqualTo: phone)
-              .limit(1)
-              .get()
+          .collection('customers')
+          .where('phone', isEqualTo: phone)
+          .limit(1)
+          .get()
           : await _firestore
-              .collection('customers')
-              .where('email', isEqualTo: email)
-              .limit(1)
-              .get();
+          .collection('customers')
+          .where('email', isEqualTo: email)
+          .limit(1)
+          .get();
 
       if (existingQuery.docs.isNotEmpty) {
         final existingDoc = existingQuery.docs.first;
@@ -1704,7 +1810,7 @@ class _AuthPageState extends State<AuthPage> {
       }
 
       final fullName =
-          '$fName ${mName.isNotEmpty ? '$mName ' : ''}$lName'.trim();
+      '$fName ${mName.isNotEmpty ? '$mName ' : ''}$lName'.trim();
 
       // Create/Update Firestore record
       final customerData = {
@@ -1738,10 +1844,10 @@ class _AuthPageState extends State<AuthPage> {
 
       // Also ensure the 'users' collection has the role for this UID
       final existingUserDoc =
-          await _firestore.collection('users').doc(uid).get();
+      await _firestore.collection('users').doc(uid).get();
       final existingDocData = existingUserDoc.data();
       final existingRole =
-          existingDocData != null ? existingDocData['role'] : null;
+      existingDocData != null ? existingDocData['role'] : null;
       if (existingRole == null || existingRole == 'customer') {
         final userData = {
           'role': 'customer',
@@ -1843,13 +1949,13 @@ class _AuthPageState extends State<AuthPage> {
               Text(
                 _isOtpSent
                     ? (_isPhoneAuth
-                        ? 'Enter the 6-digit SMS code sent to your phone number.'
-                        : 'Enter the 6-digit PIN sent to your email.')
+                    ? 'Enter the 6-digit SMS code sent to your phone number.'
+                    : 'Enter the 6-digit PIN sent to your email.')
                     : _isSettingPassword
-                        ? 'Help us know you better.'
-                        : _isSigningUp
-                            ? 'Begin your floral journey today.'
-                            : 'Sign in to continue your floral journey.',
+                    ? 'Help us know you better.'
+                    : _isSigningUp
+                    ? 'Begin your floral journey today.'
+                    : 'Sign in to continue your floral journey.',
                 style: GoogleFonts.cormorantGaramond(
                   fontSize: 18,
                   color: const Color(0xFF333333),
@@ -1914,6 +2020,38 @@ class _AuthPageState extends State<AuthPage> {
                   ],
                 ),
                 const SizedBox(height: 24),
+
+                // --- LOCKOUT WARNING UI (Positioned on top of the textboxes) ---
+                if (_superAdminLocked || _remainingLockoutSeconds > 0)
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(12),
+                    margin: const EdgeInsets.only(bottom: 16),
+                    decoration: BoxDecoration(
+                      color: Colors.red.withOpacity(0.1),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.red.withOpacity(0.3)),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.lock_clock, color: Colors.redAccent),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            _superAdminLocked
+                                ? 'Account locked. Please coordinate with a Super Admin.'
+                                : 'Too many attempts. Please wait $_remainingLockoutSeconds seconds.',
+                            style: const TextStyle(
+                              color: Colors.redAccent,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 14,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                // ---------------------------------------------------------------
 
                 // NAME (Sign Up only)
                 if (_isSigningUp) ...[
@@ -2038,7 +2176,9 @@ class _AuthPageState extends State<AuthPage> {
 
                 // CONTINUE BUTTON
                 _buildPrimaryButton(
-                  onPressed: _isLoading ? null : _handleContinue,
+                  onPressed: (_isLoading || _superAdminLocked || _remainingLockoutSeconds > 0)
+                      ? null
+                      : _handleContinue,
                   text: _isSigningUp ? 'Sign Up' : 'Continue',
                   isLoading: _isLoading,
                 ),
@@ -2070,6 +2210,38 @@ class _AuthPageState extends State<AuthPage> {
                   ),
                 ),
               ] else if (_isOtpSent) ...[
+                // --- LOCKOUT WARNING UI ---
+                if (_superAdminLocked || _remainingLockoutSeconds > 0)
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(12),
+                    margin: const EdgeInsets.only(bottom: 16),
+                    decoration: BoxDecoration(
+                      color: Colors.red.withOpacity(0.1),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.red.withOpacity(0.3)),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.lock_clock, color: Colors.redAccent),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            _superAdminLocked
+                                ? 'Account locked. Please coordinate with a Super Admin.'
+                                : 'Too many attempts. Please wait $_remainingLockoutSeconds seconds.',
+                            style: const TextStyle(
+                              color: Colors.redAccent,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 14,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                // ---------------------------------------------------------------
+
                 // OTP INPUT
                 _buildTextField(
                   controller: _otpController,
@@ -2083,7 +2255,9 @@ class _AuthPageState extends State<AuthPage> {
 
                 // VERIFY BUTTON
                 _buildPrimaryButton(
-                  onPressed: _isLoading ? null : _verifyOtp,
+                  onPressed: (_isLoading || _superAdminLocked || _remainingLockoutSeconds > 0)
+                      ? null
+                      : _verifyOtp,
                   text: 'Verify PIN',
                   isLoading: _isLoading,
                 ),
@@ -2100,6 +2274,38 @@ class _AuthPageState extends State<AuthPage> {
                   ),
                 ),
               ] else if (_showPasswordField && _isExistingUser) ...[
+                // --- LOCKOUT WARNING UI ---
+                if (_superAdminLocked || _remainingLockoutSeconds > 0)
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(12),
+                    margin: const EdgeInsets.only(bottom: 16),
+                    decoration: BoxDecoration(
+                      color: Colors.red.withOpacity(0.1),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.red.withOpacity(0.3)),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.lock_clock, color: Colors.redAccent),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            _superAdminLocked
+                                ? 'Account locked. Please coordinate with a Super Admin.'
+                                : 'Too many attempts. Please wait $_remainingLockoutSeconds seconds.',
+                            style: const TextStyle(
+                              color: Colors.redAccent,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 14,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                // ---------------------------------------------------------------
+
                 // PASSWORD INPUT
                 _buildTextField(
                   controller: _passwordController,
@@ -2114,7 +2320,9 @@ class _AuthPageState extends State<AuthPage> {
 
                 // SIGN IN BUTTON
                 _buildPrimaryButton(
-                  onPressed: _isLoading ? null : _loginWithPassword,
+                  onPressed: (_isLoading || _superAdminLocked || _remainingLockoutSeconds > 0)
+                      ? null
+                      : _loginWithPassword,
                   text: 'Sign In',
                   isLoading: _isLoading,
                 ),
@@ -2132,15 +2340,7 @@ class _AuthPageState extends State<AuthPage> {
                               decoration: TextDecoration.underline,
                             )),
                       ),
-                      TextButton(
-                        onPressed: _showOtpTargetSelectionSheet,
-                        child: const Text('Login with OTP instead',
-                            style: TextStyle(
-                              color: Color(0xFF666666),
-                              fontSize: 12,
-                              decoration: TextDecoration.underline,
-                            )),
-                      ),
+                      // Removed "Login with OTP instead" button here
                     ],
                   ),
                 ),
@@ -2299,12 +2499,12 @@ class _AuthPageState extends State<AuthPage> {
           prefixIcon: isOtp ? null : Icon(icon, color: const Color(0xFF121212)),
           suffixIcon: isPassword && onToggleVisibility != null
               ? IconButton(
-                  icon: Icon(
-                    obscureText ? Icons.visibility_off : Icons.visibility,
-                    color: Colors.grey,
-                  ),
-                  onPressed: onToggleVisibility,
-                )
+            icon: Icon(
+              obscureText ? Icons.visibility_off : Icons.visibility,
+              color: Colors.grey,
+            ),
+            onPressed: onToggleVisibility,
+          )
               : null,
           counterText: '',
           border: InputBorder.none,
@@ -2313,7 +2513,7 @@ class _AuthPageState extends State<AuthPage> {
             borderSide: const BorderSide(color: Color(0xFFF4B400), width: 2),
           ),
           contentPadding:
-              const EdgeInsets.symmetric(vertical: 20, horizontal: 24),
+          const EdgeInsets.symmetric(vertical: 20, horizontal: 24),
         ),
       ),
     );
@@ -2343,19 +2543,17 @@ class _AuthPageState extends State<AuthPage> {
           backgroundColor: const Color(0xFF121212),
           foregroundColor: const Color(0xFFF4B400),
           shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
           elevation: 0,
         ),
         child: isLoading
             ? const CircularProgressIndicator(color: Color(0xFFF4B400))
             : Text(text,
-                style: const TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 1)),
+            style: const TextStyle(
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+                letterSpacing: 1)),
       ),
     );
   }
 }
-
-// The CustomerProfilePage class and its helpers have been moved to lib/customer_profile_page.dart

@@ -8,6 +8,7 @@ import 'delivery_details_page.dart';
 import 'auth_page.dart';
 import 'ai_assistant_page.dart';
 import 'flora_chat_page.dart';
+import 'product_detail_page.dart';
 
 class ProductCatalogPage extends StatefulWidget {
   const ProductCatalogPage({super.key});
@@ -71,6 +72,22 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
             _branchNames[b['id']] = b['name'] ?? 'Branch';
             _branchDetails[b['id']] = b;
           }
+
+          // Safety net: InventoryData.selectedBranchId defaults to the
+          // hardcoded literal 'main_branch' at declaration time, before
+          // any real branch has ever loaded from Firestore. If your
+          // actual branch documents use different IDs (e.g. "marilao"
+          // rather than literally "main_branch"), every downstream write
+          // that relies on that static field -- placing an order, stock
+          // updates, spoilage reports -- would silently target a branch
+          // document that doesn't exist. Once real branches are known,
+          // snap it to an actual one if it isn't already pointing at a
+          // real branch.
+          final realIds = branches.map((b) => b['id']).toSet();
+          if (branches.isNotEmpty &&
+              !realIds.contains(InventoryData.selectedBranchId)) {
+            InventoryData.selectedBranchId = branches.first['id'];
+          }
         });
       }
     });
@@ -92,6 +109,59 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
   }
 
   Future<void> _detectNearestBranch() async {
+    // On Android, calling Geolocator.getCurrentPosition() without first
+    // checking/requesting permission throws immediately if permission was
+    // never granted -- the old code caught that exception and only logged
+    // it via debugPrint, so from the user's perspective tapping the button
+    // did literally nothing with no explanation. This mirrors the working
+    // permission-check pattern already used in delivery_details_page.dart's
+    // _calculateDeliveryFee(), and now surfaces every failure mode as a
+    // visible snackbar instead of a silent console log.
+    bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+                'Location services are turned off. Please enable them to detect your nearest branch.'),
+            backgroundColor: Color(0xFFDC3545),
+          ),
+        );
+      }
+      return;
+    }
+
+    LocationPermission permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+      if (permission == LocationPermission.denied) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                  'Location permission denied. We need it to find your nearest branch.'),
+              backgroundColor: Color(0xFFDC3545),
+            ),
+          );
+        }
+        return;
+      }
+    }
+
+    if (permission == LocationPermission.deniedForever) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+                'Location permission is permanently denied. Enable it in your phone\'s app settings.'),
+            backgroundColor: Color(0xFFDC3545),
+            duration: Duration(seconds: 4),
+          ),
+        );
+      }
+      return;
+    }
+
     try {
       Position position = await Geolocator.getCurrentPosition(
         desiredAccuracy: LocationAccuracy.high,
@@ -99,6 +169,16 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
 
       // Fetch all branches
       final branches = await InventoryData.getBranches();
+
+      if (branches.isEmpty) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+                content: Text('No branches are currently set up to detect.')),
+          );
+        }
+        return;
+      }
 
       String? nearestId;
       double minDistance = double.infinity;
@@ -118,11 +198,36 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
 
       if (nearestId != null) {
         setState(() {
+          // Both must be set: InventoryData.selectedBranchId (used by
+          // checkout, stock updates, order placement) AND _selectedBranchId
+          // (the local state that actually drives which branch's products
+          // the grid queries and displays via inventoryStream). Previously
+          // only the first was updated -- so "Detect Nearest Branch" would
+          // silently succeed in the background while the visible product
+          // grid kept showing "All Branches" the whole time, completely
+          // unaffected.
           InventoryData.selectedBranchId = nearestId!;
+          _selectedBranchId = nearestId;
         });
+
+        final branchName = _branchNames[nearestId] ?? 'your nearest branch';
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Now viewing $branchName'),
+              backgroundColor: const Color(0xFF10B981),
+              duration: const Duration(seconds: 2),
+            ),
+          );
+        }
       }
     } catch (e) {
       debugPrint('Error detecting location: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not detect your location: $e')),
+        );
+      }
     }
   }
 
@@ -134,23 +239,88 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
   // and the main page's app bar badge always agree on the same state --
   // this is the single source of truth for _cart / _cartItemDetails.
 
-  void _addToCart(Map<String, dynamic> product) {
-    setState(() {
-      String id = product['id'];
-      _cart[id] = (_cart[id] ?? 0) + 1;
-      _cartItemDetails[id] = product;
-    });
+  // Shared login gate -- BOTH cart actions (quick-add from the card AND
+  // Add to Cart / Buy Now from the detail page) route through this so a
+  // guest/anonymous user is never able to add anything without an account.
+  // Matches the exact same AuthPage flow _initiateCheckout already used,
+  // just factored out so it's not duplicated three times.
+  void _requireLogin(VoidCallback onSuccess) {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user != null && !user.isAnonymous) {
+      onSuccess();
+      return;
+    }
 
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('${product['name']} added to cart'),
-        duration: const Duration(seconds: 2),
-        action: SnackBarAction(
-          label: 'VIEW CART',
-          onPressed: _openCartSheet,
+      const SnackBar(
+        content: Text('Please log in first to add items to your cart.'),
+        backgroundColor: Color(0xFFF59E0B),
+        duration: Duration(seconds: 3),
+      ),
+    );
+
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => AuthPage(
+          returnAfterLogin: true,
+          onLoginSuccess: onSuccess,
         ),
       ),
     );
+  }
+
+  void _addToCart(Map<String, dynamic> product) {
+    _requireLogin(() {
+      setState(() {
+        String id = product['id'];
+        _cart[id] = (_cart[id] ?? 0) + 1;
+        _cartItemDetails[id] = product;
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('${product['name']} added to cart'),
+          duration: const Duration(seconds: 2),
+          action: SnackBarAction(
+            label: 'VIEW CART',
+            onPressed: _openCartSheet,
+          ),
+        ),
+      );
+    });
+  }
+
+  // "Buy Now" -- Shopee-style immediate checkout for a single item,
+  // deliberately bypassing the shared _cart map entirely (this is NOT the
+  // same as add-to-cart-then-checkout; whatever's already sitting in the
+  // cart is left untouched). Goes straight to DeliveryDetailsPage with
+  // just this one item.
+  void _buyNow(Map<String, dynamic> product) {
+    _requireLogin(() {
+      final price = (product['price'] ?? 0).toDouble();
+      final cartItems = [
+        {
+          'id': product['id'],
+          'name': product['name'],
+          'price': product['price'],
+          'qty': 1,
+          'image': product['image'],
+          if (product.containsKey('branchId')) 'branchId': product['branchId'],
+        }
+      ];
+
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (context) => DeliveryDetailsPage(
+            cartItems: cartItems,
+            cartTotal: price,
+            occasion: 'Standard Order',
+          ),
+        ),
+      );
+    });
   }
 
   void _changeQuantity(String id, int delta) {
@@ -526,53 +696,32 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
   }
 
   void _initiateCheckout() {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user == null || user.isAnonymous) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Please log in first to proceed with your checkout.'),
-          backgroundColor: Color(0xFFF59E0B),
-          duration: Duration(seconds: 3),
-        ),
-      );
+    _requireLogin(() {
+      List<Map<String, dynamic>> cartItems = [];
+      _cart.forEach((id, qty) {
+        final details = _cartItemDetails[id]!;
+        cartItems.add({
+          'id': id,
+          'name': details['name'],
+          'price': details['price'],
+          'qty': qty,
+          'image': details['image'],
+          if (details.containsKey('branchId'))
+            'branchId': details['branchId'],
+        });
+      });
 
       Navigator.push(
         context,
         MaterialPageRoute(
-          builder: (context) => AuthPage(
-            returnAfterLogin: true,
-            onLoginSuccess: () {
-              _initiateCheckout();
-            },
+          builder: (context) => DeliveryDetailsPage(
+            cartItems: cartItems,
+            cartTotal: _cartTotal,
+            occasion: 'Standard Order',
           ),
         ),
       );
-      return;
-    }
-
-    List<Map<String, dynamic>> cartItems = [];
-    _cart.forEach((id, qty) {
-      final details = _cartItemDetails[id]!;
-      cartItems.add({
-        'id': id,
-        'name': details['name'],
-        'price': details['price'],
-        'qty': qty,
-        'image': details['image'],
-        if (details.containsKey('branchId')) 'branchId': details['branchId'],
-      });
     });
-
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (context) => DeliveryDetailsPage(
-          cartItems: cartItems,
-          cartTotal: _cartTotal,
-          occasion: 'Standard Order',
-        ),
-      ),
-    );
   }
 
   @override
@@ -653,7 +802,17 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
                       stream: InventoryData.getBranchesStream(),
                       builder: (context, snapshot) {
                         final branches = snapshot.data ?? [];
-                        String effectiveValue = _selectedBranchId;
+                        // If the currently selected branch id doesn't match
+                        // any branch actually in the stream (e.g. right after
+                        // a branch was deleted, or a stale value from before
+                        // branches finished loading), fall back to 'all'
+                        // rather than crashing DropdownButton with a value
+                        // that isn't in its items list.
+                        final realIds = branches.map((b) => b['id']).toSet();
+                        String effectiveValue = (_selectedBranchId == 'all' ||
+                            realIds.contains(_selectedBranchId))
+                            ? _selectedBranchId
+                            : 'all';
 
                         return Container(
                           decoration: BoxDecoration(
@@ -717,8 +876,16 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
                               onChanged: (val) {
                                 if (val != null) {
                                   setState(() => _selectedBranchId = val);
-                                  InventoryData.selectedBranchId =
-                                  val == 'all' ? 'main_branch' : val;
+                                  // Real branch ID used directly. For "all",
+                                  // fall back to whichever real branch was
+                                  // loaded first -- never the hardcoded
+                                  // 'main_branch' literal, which may not
+                                  // correspond to an actual document.
+                                  InventoryData.selectedBranchId = val == 'all'
+                                      ? (branches.isNotEmpty
+                                      ? branches.first['id']
+                                      : InventoryData.selectedBranchId)
+                                      : val;
                                 }
                               },
                             ),
@@ -782,8 +949,13 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
 
             // Category Selector -- Shopee-style icon rail (circular icon +
             // label underneath) instead of plain text chips.
+            // Height math: 52 (icon circle) + 4 (gap) + ~15 (label text at
+            // default text scale) + 12 (ListView's own vertical padding,
+            // 6 top + 6 bottom) = ~83px needed. Sized with headroom to 96 so
+            // larger system font-scale settings (accessibility) don't
+            // re-trigger the overflow this was originally fixed for.
             SizedBox(
-              height: 82,
+              height: 96,
               child: StreamBuilder<List<String>>(
                 stream: InventoryData.globalCategoriesStream(),
                 builder: (context, snapshot) {
@@ -799,7 +971,7 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
                   return ListView.builder(
                     scrollDirection: Axis.horizontal,
                     padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                     itemCount: categories.length,
                     itemBuilder: (context, index) {
                       final cat = categories[index];
@@ -897,26 +1069,54 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
                   List<Map<String, dynamic>> products = [];
 
                   if (_selectedBranchId == 'all') {
-                    // Group by Name
+                    // Group by Name. Since "Red Rose" (etc.) exists as a
+                    // SEPARATE Firestore document per branch -- there's no
+                    // single canonical product doc -- this groups them for
+                    // display and has to pick ONE representative image/price
+                    // to show. See bestImageStock below for why that pick
+                    // has to be tracked carefully.
                     Map<String, Map<String, dynamic>> grouped = {};
+                    // Tracks the highest stock seen so far, per product name,
+                    // SEPARATELY from the map itself -- this is the actual
+                    // fix. The old code compared each branch's stock against
+                    // grouped[name]['stock'], but that key was never updated
+                    // after the group was first created (it's just whatever
+                    // got spread in from the FIRST branch processed via
+                    // `...p`). So the comparison was really "is this branch's
+                    // stock more than the FIRST branch's stock", not "more
+                    // than the best one seen so far" -- meaning with 3+
+                    // branches, whichever later branch happened to beat the
+                    // first branch's number would overwrite the image, even
+                    // if an earlier branch in between had a genuinely higher
+                    // stock and the more current/correct product photo. This
+                    // is why the detail page's big hero image could show a
+                    // stale image from some other branch's copy of "Red
+                    // Rose" instead of the one the admin most recently
+                    // updated -- the small thumbnail card masked this for a
+                    // while, but a full-size hero image made it obvious.
+                    Map<String, int> bestImageStock = {};
+
                     for (var p in rawProducts) {
                       String name = p['name'] ?? 'Unnamed';
+                      final pStock = (p['stock'] ?? 0) as int;
                       if (!grouped.containsKey(name)) {
                         grouped[name] = {
                           ...p,
                           'branches': <Map<String, dynamic>>[
                             {'branchId': p['branchId'], 'stock': p['stock']}
                           ],
-                          'total_stock': p['stock'] ?? 0,
+                          'total_stock': pStock,
                         };
+                        bestImageStock[name] = pStock;
                       } else {
                         grouped[name]!['branches'].add(
                             {'branchId': p['branchId'], 'stock': p['stock']});
                         grouped[name]!['total_stock'] =
-                            (grouped[name]!['total_stock'] ?? 0) +
-                                (p['stock'] ?? 0);
-                        // Prefer image from branch with most stock or just use the first one
-                        if ((p['stock'] ?? 0) > (grouped[name]!['stock'] ?? 0)) {
+                            (grouped[name]!['total_stock'] ?? 0) + pStock;
+                        // Now correctly compares against the running best,
+                        // not a stale spread-in field.
+                        if (pStock > (bestImageStock[name] ?? 0)) {
+                          bestImageStock[name] = pStock;
                           grouped[name]!['image'] =
                               p['image'] ?? grouped[name]!['image'];
                         }
@@ -1164,183 +1364,238 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
     final totalStock = product['total_stock'] ?? product['stock'] ?? 0;
     final inStock = totalStock > 0;
 
-    return Container(
-      decoration: BoxDecoration(
-        color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
-        borderRadius: BorderRadius.circular(14),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: isDark ? 0.3 : 0.06),
-            blurRadius: 8,
-            offset: const Offset(0, 2),
+    return GestureDetector(
+      // Whole-card tap opens the detail page. This sits BELOW the floating
+      // quick-add button in the widget tree (added later, in the Stack),
+      // so Flutter's hit-testing gives that button's own InkWell priority
+      // within its bounds -- tapping the button still just adds to cart,
+      // tapping anywhere else on the card opens the detail page.
+      onTap: () {
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => ProductDetailPage(
+              product: product,
+              branchNames: _branchNames,
+              onAddToCart: _addToCart,
+              onBuyNow: _buyNow,
+            ),
           ),
-        ],
-        border: isRecycled
-            ? Border.all(color: Colors.green[200]!, width: 1.5)
-            : null,
-      ),
-      clipBehavior: Clip.antiAlias,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          // Image + overlay badges + quick-add button, all in one square-ish
-          // block -- this is the part that reads most "Shopee": a compact
-          // image tile with a small floating cart button in the corner
-          // instead of a full-width "ADD TO CART" bar underneath.
-          AspectRatio(
-            aspectRatio: 1,
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                ColorFiltered(
-                  colorFilter: inStock
-                      ? const ColorFilter.mode(
-                      Colors.transparent, BlendMode.multiply)
-                      : ColorFilter.mode(
-                      Colors.grey.withValues(alpha: 0.6),
-                      BlendMode.saturation),
-                  child: Image.network(
-                    product['image'] ??
-                        'https://images.unsplash.com/photo-1526047932273-341f2a7631f9',
-                    fit: BoxFit.cover,
-                    width: double.infinity,
-                  ),
-                ),
-                if (!inStock)
-                  Container(color: Colors.black.withValues(alpha: 0.35)),
-                if (!inStock)
-                  const Center(
-                    child: Text(
-                      'OUT OF STOCK',
-                      style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 10,
-                          fontWeight: FontWeight.w900,
-                          letterSpacing: 0.5),
+        );
+      },
+      child: Container(
+        decoration: BoxDecoration(
+          color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
+          borderRadius: BorderRadius.circular(14),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: isDark ? 0.3 : 0.06),
+              blurRadius: 8,
+              offset: const Offset(0, 2),
+            ),
+          ],
+          border: isRecycled
+              ? Border.all(color: Colors.green[200]!, width: 1.5)
+              : null,
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // Image + overlay badges + quick-add button, all in one square-ish
+            // block -- this is the part that reads most "Shopee": a compact
+            // image tile with a small floating cart button in the corner
+            // instead of a full-width "ADD TO CART" bar underneath.
+            AspectRatio(
+              aspectRatio: 1,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  ColorFiltered(
+                    colorFilter: inStock
+                        ? const ColorFilter.mode(
+                        Colors.transparent, BlendMode.multiply)
+                        : ColorFilter.mode(
+                        Colors.grey.withValues(alpha: 0.6),
+                        BlendMode.saturation),
+                    child: Image.network(
+                      // `?? fallback` alone only catches a null image field --
+                      // Firestore can also store an empty string '', which
+                      // slips past `??` and gets handed straight to
+                      // Image.network(''), crashing with "No host specified
+                      // in URI" (exactly what showed up on "Red Rose"). This
+                      // checks for blank too, and errorBuilder below is the
+                      // safety net for any OTHER bad URL (typo, deleted
+                      // image, 404) that isn't simply empty.
+                      (product['image'] as String?)?.isNotEmpty == true
+                          ? product['image']
+                          : 'https://images.unsplash.com/photo-1526047932273-341f2a7631f9',
+                      fit: BoxFit.cover,
+                      width: double.infinity,
+                      errorBuilder: (context, error, stackTrace) => Container(
+                        color: isDark
+                            ? const Color(0xFF2A2A2A)
+                            : const Color(0xFFF3F4F6),
+                        child: Icon(Icons.local_florist_outlined,
+                            size: 32,
+                            color: isDark ? Colors.grey[700] : Colors.grey[400]),
+                      ),
+                      loadingBuilder: (context, child, progress) {
+                        if (progress == null) return child;
+                        return Container(
+                          color: isDark
+                              ? const Color(0xFF2A2A2A)
+                              : const Color(0xFFF3F4F6),
+                        );
+                      },
                     ),
                   ),
-                if (isRecycled)
-                  Positioned(
-                    top: 6,
-                    left: 6,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 6, vertical: 3),
-                      decoration: BoxDecoration(
-                        color: Colors.green[600],
-                        borderRadius: BorderRadius.circular(4),
-                      ),
-                      child: const Text(
-                        'RECYCLED',
+                  if (!inStock)
+                    Container(color: Colors.black.withValues(alpha: 0.35)),
+                  if (!inStock)
+                    const Center(
+                      child: Text(
+                        'OUT OF STOCK',
                         style: TextStyle(
                             color: Colors.white,
-                            fontSize: 7,
-                            fontWeight: FontWeight.w900),
+                            fontSize: 10,
+                            fontWeight: FontWeight.w900,
+                            letterSpacing: 0.5),
                       ),
                     ),
-                  ),
-                if (product['has3D'] == true)
-                  Positioned(
-                    top: 6,
-                    right: 6,
-                    child: GestureDetector(
-                      onTap: () => _openARView(product),
+                  if (isRecycled)
+                    Positioned(
+                      top: 6,
+                      left: 6,
                       child: Container(
-                        padding: const EdgeInsets.all(4),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 6, vertical: 3),
                         decoration: BoxDecoration(
-                            color: Colors.black.withValues(alpha: 0.7),
-                            shape: BoxShape.circle),
-                        child: const Icon(Icons.view_in_ar,
-                            color: Colors.white, size: 14),
+                          color: Colors.green[600],
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: const Text(
+                          'RECYCLED',
+                          style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 7,
+                              fontWeight: FontWeight.w900),
+                        ),
+                      ),
+                    ),
+                  if (product['has3D'] == true)
+                    Positioned(
+                      top: 6,
+                      right: 6,
+                      child: GestureDetector(
+                        onTap: () => _openARView(product),
+                        child: Container(
+                          padding: const EdgeInsets.all(4),
+                          decoration: BoxDecoration(
+                              color: Colors.black.withValues(alpha: 0.7),
+                              shape: BoxShape.circle),
+                          child: const Icon(Icons.view_in_ar,
+                              color: Colors.white, size: 14),
+                        ),
+                      ),
+                    ),
+                  // Floating quick-add button, bottom-right of the image.
+                  // Previously sat at bottom: -14 (deliberately half outside
+                  // the image, overlapping the text below) -- but the card's
+                  // Clip.antiAlias clipped that overlapping half off, leaving
+                  // only a sliver of the icon visible behind the product
+                  // name and making it hard to actually tap. Kept fully
+                  // inside the image bounds now -- still reads as "floating"
+                  // thanks to the shadow/elevation, just doesn't get clipped.
+                  Positioned(
+                    right: 8,
+                    bottom: 8,
+                    child: Material(
+                      color: inStock
+                          ? const Color(0xFF7B79F2)
+                          : Colors.grey[400],
+                      shape: const CircleBorder(),
+                      elevation: 3,
+                      child: InkWell(
+                        customBorder: const CircleBorder(),
+                        onTap: inStock ? () => _addToCart(product) : null,
+                        child: const Padding(
+                          padding: EdgeInsets.all(8),
+                          child: Icon(Icons.add_shopping_cart_rounded,
+                              color: Colors.white, size: 17),
+                        ),
                       ),
                     ),
                   ),
-                // Floating quick-add button, bottom-right of the image --
-                // half-overlapping the image/text boundary, Shopee-style.
-                Positioned(
-                  right: 6,
-                  bottom: -14,
-                  child: Material(
-                    color: inStock
-                        ? const Color(0xFF7B79F2)
-                        : Colors.grey[400],
-                    shape: const CircleBorder(),
-                    elevation: 3,
-                    child: InkWell(
-                      customBorder: const CircleBorder(),
-                      onTap: inStock ? () => _addToCart(product) : null,
-                      child: const Padding(
-                        padding: EdgeInsets.all(7),
-                        child: Icon(Icons.add_shopping_cart_rounded,
-                            color: Colors.white, size: 16),
-                      ),
-                    ),
-                  ),
-                ),
-              ],
+                ],
+              ),
             ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(10, 18, 10, 10),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  product['name'] ?? 'Flower',
-                  style: GoogleFonts.cormorantGaramond(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 15,
-                    color: isRecycled
-                        ? Colors.green[800]
-                        : (isDark ? Colors.white : Colors.black87),
-                  ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                const SizedBox(height: 3),
-                Text(
-                  '₱${(product['price'] ?? 0).toStringAsFixed(2)}',
-                  style: TextStyle(
-                    fontWeight: FontWeight.w900,
-                    color: isRecycled
-                        ? Colors.green[700]
-                        : const Color(0xFFF59E0B),
-                    fontSize: 15,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                // Compact availability line -- one line only, matching
-                // Shopee's terse "X sold / Y left" style instead of a full
-                // per-branch breakdown block taking up card real estate.
-                if (_selectedBranchId == 'all' &&
-                    product.containsKey('branches'))
+            Padding(
+              // Top padding brought back down to 10 -- the extra 18px was
+              // only ever there to leave clearance for the button that used
+              // to overlap into this area. No longer needed now that the
+              // button stays fully on the image.
+              padding: const EdgeInsets.fromLTRB(10, 10, 10, 10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
                   Text(
-                    'Available at ${(product['branches'] as List).where((b) => (b['stock'] ?? 0) > 0).length} branch(es)',
-                    style: TextStyle(
-                        fontSize: 10,
-                        color: isDark ? Colors.grey[500] : Colors.grey[600]),
+                    product['name'] ?? 'Flower',
+                    style: GoogleFonts.cormorantGaramond(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 15,
+                      color: isRecycled
+                          ? Colors.green[800]
+                          : (isDark ? Colors.white : Colors.black87),
+                    ),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                  )
-                else if (_selectedBranchId != 'all')
+                  ),
+                  const SizedBox(height: 3),
                   Text(
-                    inStock
-                        ? '${product['stock'] ?? 0} in stock'
-                        : 'Currently unavailable',
+                    '₱${(product['price'] ?? 0).toStringAsFixed(2)}',
                     style: TextStyle(
-                      fontSize: 10,
-                      fontWeight: FontWeight.w600,
-                      color: !inStock
-                          ? Colors.red
-                          : ((product['stock'] ?? 0) < 10
-                          ? Colors.orange[700]
-                          : Colors.green[600]),
+                      fontWeight: FontWeight.w900,
+                      color: isRecycled
+                          ? Colors.green[700]
+                          : const Color(0xFFF59E0B),
+                      fontSize: 15,
                     ),
                   ),
-              ],
+                  const SizedBox(height: 4),
+                  // Compact availability line -- one line only, matching
+                  // Shopee's terse "X sold / Y left" style instead of a full
+                  // per-branch breakdown block taking up card real estate.
+                  if (_selectedBranchId == 'all' &&
+                      product.containsKey('branches'))
+                    Text(
+                      'Available at ${(product['branches'] as List).where((b) => (b['stock'] ?? 0) > 0).length} branch(es)',
+                      style: TextStyle(
+                          fontSize: 10,
+                          color: isDark ? Colors.grey[500] : Colors.grey[600]),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    )
+                  else if (_selectedBranchId != 'all')
+                    Text(
+                      inStock
+                          ? '${product['stock'] ?? 0} in stock'
+                          : 'Currently unavailable',
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w600,
+                        color: !inStock
+                            ? Colors.red
+                            : ((product['stock'] ?? 0) < 10
+                            ? Colors.orange[700]
+                            : Colors.green[600]),
+                      ),
+                    ),
+                ],
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }

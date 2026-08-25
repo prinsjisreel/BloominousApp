@@ -901,6 +901,261 @@ class GeminiService {
     return resultData;
   }
 
+  // ---------------------------------------------------------------------
+  // Semantic (embedding-based) fallback for Flora's chat
+  // ---------------------------------------------------------------------
+  // Uses gemini-embedding-001 -- a SEPARATE model with its own rate limit
+  // from gemini-2.5-flash (the chat model), so calling this doesn't eat
+  // into the same 5-requests-per-minute / 20-per-day free-tier budget
+  // that was causing Flora's fixed-answer problem. This replaces the old
+  // brittle `.contains('gratitude')`-style keyword matching with real
+  // semantic search: a paraphrased question like "how do I keep them
+  // alive longer" now correctly matches the care-tip answer even without
+  // ever containing the literal word "fresh".
+  //
+  // How it works: each entry in _floraKnowledgeBase gets embedded ONCE
+  // (cached in memory for the app's lifetime). When the live Gemini chat
+  // call fails, the user's question gets embedded too, and we compare it
+  // against every cached knowledge-base entry using cosine similarity --
+  // the math for "how close in meaning are these two pieces of text".
+  // Only a genuinely close match (score > 0.6) gets used; below that, we
+  // fall through to the old generic catch-all response rather than force
+  // a bad match.
+
+  static const List<Map<String, String>> _floraKnowledgeBase = [
+    {
+      'answer':
+      "For a dear friend, Yellow Roses, Sunflowers, and Pink Gerberas are perfect! They represent joy, warmth, loyalty, and true friendship."
+    },
+    {
+      'answer':
+      "For mothers, Pink Carnations and White Stargazer Lilies are the ultimate choice! Pink carnations symbolize a mother's eternal, unselfish love, while lilies bring elegance and sweet fragrance."
+    },
+    {
+      'answer':
+      "For birthdays, a vibrant mix of colorful Tulips, Gerberas, and Sunflowers paired with a cheerful ribbon brings festive energy -- celebration, happiness, and bright years ahead."
+    },
+    {
+      'answer':
+      "Red roses symbolize deep love, passion, and romance, ideal for lovers and anniversaries. Yellow roses represent joy, warmth, and friendship instead."
+    },
+    {
+      'answer':
+      "For anniversaries, classic Red Ecuadorian Roses paired with delicate Baby's Breath or Carnations symbolize young, passionate love and new beginnings together."
+    },
+    {
+      'answer':
+      "Pink Roses, Yellow Tulips, and White Hydrangeas are classic symbols of heartfelt gratitude and appreciation, expressing sincere thanks and admiration."
+    },
+    {
+      'answer':
+      "To say sorry, White Tulips or White Ecuadorian Roses represent sincere apologies, peace, and new beginnings. Pairing them with soft eucalyptus conveys heartfelt regret and goodwill."
+    },
+    {
+      'answer':
+      "For graduation and achievements, Bright Sunflowers and Blue Hydrangeas represent grand success, wisdom, and a bright future ahead."
+    },
+    {
+      'answer':
+      "For budget-friendly options, local Sunflowers with Baby's Breath or a 3-stem Ecuadorian Rose bouquet offer stunning elegance starting at ₱500 - ₱1,000."
+    },
+    {
+      'answer':
+      "To keep flowers fresh for up to 2 weeks: trim 1-2 cm off stems at a 45° angle under running water, change vase water every 2 days, and keep them away from direct sunlight, aircon vents, and ripening fruit."
+    },
+    {
+      'answer':
+      "In Floriography (the language of flowers): Red means deep romance and passion, White means purity and honesty, Pink means grace and admiration, Yellow means friendship and sunshine, Purple means enchantment and royalty."
+    },
+  ];
+
+  static List<List<double>>? _faqEmbeddingsCache;
+
+  /// Calls gemini-embedding-001 for a single piece of text and returns its
+  /// embedding vector, or null on any failure -- callers treat null as
+  /// "embeddings unavailable right now, fall back further" rather than
+  /// crashing the chat.
+  static Future<List<double>?> _embedText(
+      String text, {
+        required String taskType,
+      }) async {
+    try {
+      final url = Uri.parse(
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=$_apiKey',
+      );
+      final response = await http.post(
+        url,
+        headers: {'Content-Type': 'application/json'},
+        body: json.encode({
+          // THIS FIELD WAS MISSING and is required -- every official
+          // Google example for embedContent includes "model" inside the
+          // JSON body itself, even though the model is ALSO already in
+          // the URL path. This is different from generateContent, which
+          // only needs the model in the URL. Without this field, Google
+          // rejects the request outright (likely 400), which is also why
+          // it never showed up as usage on the quota dashboard -- a
+          // rejected malformed request doesn't count the same way a
+          // processed one does.
+          'model': 'models/gemini-embedding-001',
+          'content': {
+            'parts': [
+              {'text': text}
+            ]
+          },
+          'taskType': taskType,
+        }),
+      );
+
+      if (response.statusCode != 200) {
+        print(
+            "Embedding request failed (${response.statusCode}): ${response.body}");
+        return null;
+      }
+
+      final data = json.decode(response.body);
+      final values = (data['embedding']?['values'] as List?)
+          ?.map((v) => (v as num).toDouble())
+          .toList();
+      return values;
+    } catch (e) {
+      print("Error embedding text: $e");
+      return null;
+    }
+  }
+
+  /// Standard cosine similarity -- measures the angle between two
+  /// vectors, ranging from -1 (opposite meaning) to 1 (identical
+  /// meaning). 0 means unrelated. This is THE standard way to compare
+  /// embeddings; there's no simpler "distance" metric that works as well
+  /// for high-dimensional semantic vectors like these.
+  static double _cosineSimilarity(List<double> a, List<double> b) {
+    double dot = 0, normA = 0, normB = 0;
+    final len = a.length < b.length ? a.length : b.length;
+    for (int i = 0; i < len; i++) {
+      dot += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+    if (normA == 0 || normB == 0) return 0;
+    return dot / (math.sqrt(normA) * math.sqrt(normB));
+  }
+
+  /// Embeds every knowledge-base entry ONCE and caches the vectors in
+  /// memory -- this only actually calls the embedding API the first time
+  /// Flora needs semantic fallback in a given app session, not on every
+  /// single message.
+  static Future<List<List<double>>> _getFaqEmbeddings() async {
+    if (_faqEmbeddingsCache != null) return _faqEmbeddingsCache!;
+    final embeddings = <List<double>>[];
+    for (final entry in _floraKnowledgeBase) {
+      final vec = await _embedText(entry['answer']!,
+          taskType: 'RETRIEVAL_DOCUMENT');
+      embeddings.add(vec ?? []);
+    }
+    _faqEmbeddingsCache = embeddings;
+    return embeddings;
+  }
+
+  /// Embeds the user's actual question and finds the closest-matching
+  /// answer by meaning -- searching BOTH the static floriography/care
+  /// knowledge base AND (if provided) the live inventory list, so a
+  /// question about a specific real product ("tell me about Heart
+  /// Pillow") can be answered from real Firestore data via embeddings,
+  /// not just generic flower symbolism. Returns null if embeddings fail
+  /// entirely OR nothing matches closely enough -- either way, the caller
+  /// falls through to the older keyword-based fallback as a final safety
+  /// net.
+  static Future<String?> _semanticFallbackAnswer(
+      String userQuery, {
+        List<Map<String, dynamic>>? inventoryItems,
+      }) async {
+    final queryVec =
+    await _embedText(userQuery, taskType: 'RETRIEVAL_QUERY');
+    if (queryVec == null) {
+      // If you're debugging why Flora gives a generic answer, THIS is the
+      // line to look for -- it means the embedding call itself failed
+      // (see the "Embedding request failed" or "Error embedding text"
+      // print inside _embedText just above this for the actual HTTP
+      // status/error), so semantic matching never even ran.
+      print(
+          "Semantic fallback: could not embed the user's query -- embedding call failed, see error above. Falling through to keyword fallback.");
+      return null;
+    }
+
+    // Candidate pool: static FAQ entries (embeddings cached across the
+    // whole app session, since this text never changes) + live inventory
+    // items (embedded fresh every call, since stock/price genuinely can
+    // change between messages -- caching those would risk quoting a stale
+    // price). Capped at 20 inventory items to keep this fallback fast; if
+    // your catalog regularly exceeds that, consider filtering to the
+    // customer's selected branch before calling this.
+    final faqEmbeddings = await _getFaqEmbeddings();
+    final List<String> candidateAnswers = [
+      for (final entry in _floraKnowledgeBase) entry['answer']!,
+    ];
+    final List<List<double>> candidateEmbeddings = [...faqEmbeddings];
+
+    if (inventoryItems != null && inventoryItems.isNotEmpty) {
+      for (final item in inventoryItems.take(20)) {
+        final name = (item['name'] ?? 'Item').toString();
+        final category = (item['category'] ?? '').toString();
+        final description = (item['description'] ?? '').toString();
+        final price = item['price'] ?? 0;
+        final stock = item['stock'] ?? 0;
+
+        // What gets embedded (searched against) vs. what gets RETURNED
+        // are different things -- the doc text is just "name + category +
+        // description" for matching purposes, but the actual answer is a
+        // templated sentence built from real fields, since we have no
+        // live generateContent call available to write natural prose in
+        // this fallback path.
+        final docText = '$name ($category): $description'.trim();
+        final answer = stock > 0
+            ? "$name is ₱$price, with $stock in stock right now.${description.isNotEmpty ? ' $description' : ''}"
+            : "$name is currently out of stock, but it's usually ₱$price when available.${description.isNotEmpty ? ' $description' : ''}";
+
+        final vec =
+        await _embedText(docText, taskType: 'RETRIEVAL_DOCUMENT');
+        if (vec != null) {
+          candidateAnswers.add(answer);
+          candidateEmbeddings.add(vec);
+        }
+      }
+    }
+
+    print(
+        "Semantic fallback: comparing against ${candidateEmbeddings.length} candidates (${faqEmbeddings.length} FAQ + ${candidateEmbeddings.length - faqEmbeddings.length} inventory items successfully embedded).");
+
+    double bestScore = -1;
+    int bestIndex = -1;
+    for (int i = 0; i < candidateEmbeddings.length; i++) {
+      if (candidateEmbeddings[i].isEmpty) continue;
+      final score = _cosineSimilarity(queryVec, candidateEmbeddings[i]);
+      if (score > bestScore) {
+        bestScore = score;
+        bestIndex = i;
+      }
+    }
+
+    // 0.6 is a deliberately conservative threshold -- better to admit
+    // "I don't have a close match" and fall through than confidently
+    // return a semantically unrelated answer.
+    if (bestIndex != -1 && bestScore > 0.6) {
+      print(
+          "Semantic fallback: MATCHED candidate #$bestIndex with score ${bestScore.toStringAsFixed(3)} (threshold 0.6) -- returning this answer.");
+      return candidateAnswers[bestIndex];
+    }
+
+    // This is the case that was previously completely silent: embeddings
+    // worked fine, but nothing was a close enough match, so this call
+    // correctly falls through. If you see this line with a score that
+    // seems like it SHOULD have matched, the 0.6 threshold may be too
+    // strict for your test phrasing -- that's a tuning knob, not a bug.
+    print(
+        "Semantic fallback: best score was only ${bestScore.toStringAsFixed(3)} (need > 0.6) -- no confident match, falling through to keyword fallback.");
+    return null;
+  }
+
   /// Interactive AI Floral Concierge Chat -- doubles as a real inquiry
   /// assistant when `inventoryContext` is supplied (live stock, prices,
   /// branches, categories pulled from Firestore by the caller). Without it,
@@ -910,6 +1165,11 @@ class GeminiService {
     required String userQuery,
     List<Map<String, String>> conversationHistory = const [],
     String? inventoryContext,
+    // Raw (unformatted) inventory items -- separate from inventoryContext
+    // above, which is a pre-formatted text block for the primary LLM
+    // prompt. This raw list is what the embedding-based semantic fallback
+    // uses to search real products by meaning when the live call fails.
+    List<Map<String, dynamic>>? inventoryItems,
   }) async {
     try {
       final model = GenerativeModel(
@@ -953,61 +1213,139 @@ class GeminiService {
 
       final response = await model.generateContent([Content.text(fullPrompt)]);
       if (response.text != null && response.text!.trim().isNotEmpty) {
+        print("chatWithConcierge: answered by LIVE Gemini (gemini-2.5-flash).");
         return response.text!.trim();
       }
     } catch (e) {
       print("Gemini chatWithConcierge error: $e");
     }
 
+    // NEW: try semantic (embedding-based) matching BEFORE falling all the
+    // way back to keyword matching. Uses gemini-embedding-001, which has
+    // its own separate rate limit -- so this still works even when the
+    // chat model's quota is fully exhausted, which is exactly the
+    // scenario that was making Flora's answers feel "fixed" in the first
+    // place.
+    try {
+      final semanticAnswer = await _semanticFallbackAnswer(
+        userQuery,
+        inventoryItems: inventoryItems,
+      );
+      if (semanticAnswer != null) {
+        print("chatWithConcierge: answered by SEMANTIC/embedding fallback.");
+        return semanticAnswer;
+      }
+    } catch (e) {
+      print("Semantic fallback error: $e");
+    }
+
+    print(
+        "chatWithConcierge: falling through to the KEYWORD fallback (last resort) -- both live Gemini and semantic search were unavailable or found no match.");
+
+    // Fallback only fires if the real Gemini call above threw AND the
+    // semantic match above found nothing close enough -- but it used to
+    // return exactly ONE fixed string per keyword category, so
+    // asking "what flowers represent gratitude" twice in a row (or any
+    // two people asking the same category of question) got byte-for-byte
+    // identical text forever, which reads as obviously canned/robotic.
+    // Each category below is now a pool of 2-3 real variations, and
+    // `Random` picks one per call -- still a fallback (not live AI), but
+    // no longer a fixed script.
+    final rand = math.Random();
+    String pick(List<String> options) => options[rand.nextInt(options.length)];
+
     final lower = userQuery.toLowerCase();
 
     if (lower.contains('friend') || lower.contains('kaibigan')) {
-      return "For a dear friend, Yellow Roses, Sunflowers, and Pink Gerberas are perfect! They represent joy, warmth, loyalty, and true friendship. A bright 'Sunny Friendship' bouquet will surely make their day!";
+      return pick([
+        "For a dear friend, Yellow Roses, Sunflowers, and Pink Gerberas are perfect! They represent joy, warmth, loyalty, and true friendship. A bright 'Sunny Friendship' bouquet will surely make their day!",
+        "Friendship calls for cheerful colors -- Sunflowers and Yellow Tulips are a lovely, warm choice that says 'thinking of you' without romantic undertones.",
+        "For a close friend, try mixing Gerberas with a few Sunflowers -- playful, colorful, and it captures that easygoing warmth perfectly.",
+      ]);
     } else if (lower.contains('mom') ||
         lower.contains('mother') ||
         lower.contains('nanay') ||
         lower.contains('mama')) {
-      return "For mothers, Pink Carnations and White Stargazer Lilies are the ultimate choice! Pink carnations symbolize a mother's eternal, unselfish love, while lilies bring elegance and sweet fragrance to her home.";
+      return pick([
+        "For mothers, Pink Carnations and White Stargazer Lilies are the ultimate choice! Pink carnations symbolize a mother's eternal, unselfish love, while lilies bring elegance and sweet fragrance to her home.",
+        "Mothers tend to love a classic pairing -- soft Pink Carnations with a few White Lilies for fragrance and a touch of elegance.",
+        "For your mom, consider warm pastel tones -- Carnations pair beautifully with Baby's Breath for something gentle and heartfelt.",
+      ]);
     } else if (lower.contains('birthday') || lower.contains('kaarawan')) {
-      return "For birthdays, a vibrant mix of colorful Tulips, Gerberas, and Sunflowers paired with a cheerful ribbon brings festive energy! It symbolizes celebration, happiness, and bright years ahead.";
+      return pick([
+        "For birthdays, a vibrant mix of colorful Tulips, Gerberas, and Sunflowers paired with a cheerful ribbon brings festive energy! It symbolizes celebration, happiness, and bright years ahead.",
+        "Birthdays call for something lively -- Sunflowers and mixed Gerberas in bright colors capture that celebratory mood well.",
+        "For a festive birthday bouquet, try Tulips in mixed colors -- playful, colorful, and never feels too formal.",
+      ]);
     } else if (lower.contains('yellow') && lower.contains('red')) {
-      return "Red roses symbolize deep love, passion, and romance, making them ideal for lovers and anniversaries. Yellow roses, on the other hand, represent joy, warmth, and friendship! Sending yellow roses is a wonderful way to celebrate a best friend or bring cheer.";
+      return pick([
+        "Red roses symbolize deep love, passion, and romance, making them ideal for lovers and anniversaries. Yellow roses, on the other hand, represent joy, warmth, and friendship! Sending yellow roses is a wonderful way to celebrate a best friend or bring cheer.",
+        "Red and yellow roses carry very different messages -- red leans romantic and passionate, yellow leans toward friendship and warmth. Worth picking based on who you're sending to!",
+      ]);
     } else if (lower.contains('1st anniversary') ||
         lower.contains('anniversary') ||
         lower.contains('monthsary')) {
-      return "For anniversaries, classic Red Ecuadorian Roses paired with delicate Gypsophila (Baby's Breath) or Carnations (the traditional 1st-year flower) symbolize young, passionate love and new beginnings together!";
+      return pick([
+        "For anniversaries, classic Red Ecuadorian Roses paired with delicate Gypsophila (Baby's Breath) or Carnations (the traditional 1st-year flower) symbolize young, passionate love and new beginnings together!",
+        "Anniversaries suit deep Red Roses well -- pairing them with soft Baby's Breath keeps it romantic without being overly formal.",
+      ]);
     } else if (lower.contains('gratitude') || lower.contains('thank')) {
-      return "Pink Roses, Yellow Tulips, and White Hydrangeas are classic symbols of heartfelt gratitude and appreciation. They express sincere thanks and admiration!";
+      return pick([
+        "Pink Roses, Yellow Tulips, and White Hydrangeas are classic symbols of heartfelt gratitude and appreciation. They express sincere thanks and admiration!",
+        "For gratitude, Pink Roses paired with a few Yellow Tulips strike a warm, sincere tone without feeling romantic.",
+        "White Hydrangeas alone make a quietly elegant 'thank you' gift -- understated but heartfelt.",
+      ]);
     } else if (lower.contains('sorry') ||
         lower.contains('apology') ||
         lower.contains('patawad')) {
-      return "To say sorry, White Tulips or White Ecuadorian Roses represent sincere apologies, peace, and new beginnings. Pairing them with soft eucalyptus conveys heartfelt regret and goodwill.";
+      return pick([
+        "To say sorry, White Tulips or White Ecuadorian Roses represent sincere apologies, peace, and new beginnings. Pairing them with soft eucalyptus conveys heartfelt regret and goodwill.",
+        "White flowers tend to read as sincere rather than romantic -- White Tulips with a touch of eucalyptus greenery is a gentle way to apologize.",
+      ]);
     } else if (lower.contains('grad') ||
         lower.contains('congrat') ||
         lower.contains('success')) {
-      return "For graduation and achievements, Bright Sunflowers and Blue Hydrangeas represent grand success, wisdom, and a bright future ahead!";
+      return pick([
+        "For graduation and achievements, Bright Sunflowers and Blue Hydrangeas represent grand success, wisdom, and a bright future ahead!",
+        "Graduations call for something bold -- Sunflowers alone make a striking, celebratory statement.",
+      ]);
     } else if (lower.contains('budget') ||
         lower.contains('cheap') ||
         lower.contains('mura') ||
         lower.contains('price')) {
-      return "For budget-friendly options, local Sunflowers with Baby's Breath (Gypsophila) or a 3-stem Ecuadorian Rose bouquet offer stunning elegance starting at ₱500 - ₱1,000!";
+      return pick([
+        "For budget-friendly options, local Sunflowers with Baby's Breath (Gypsophila) or a 3-stem Ecuadorian Rose bouquet offer stunning elegance starting at ₱500 - ₱1,000!",
+        "On a tighter budget, a small 3-5 stem bouquet of Sunflowers or Carnations paired with greenery still looks intentional and full.",
+      ]);
     } else if (lower.contains('fresh') ||
         lower.contains('2 weeks') ||
         lower.contains('care') ||
         lower.contains('long')) {
-      return "To keep your flowers fresh for up to 2 weeks:\n1. Trim 1-2 cm off stems at a 45° angle under running water.\n2. Change vase water every 2 days.\n3. Keep away from direct sunlight, aircon vents, and ripening fruits.";
+      return pick([
+        "To keep your flowers fresh for up to 2 weeks:\n1. Trim 1-2 cm off stems at a 45° angle under running water.\n2. Change vase water every 2 days.\n3. Keep away from direct sunlight, aircon vents, and ripening fruits.",
+        "For longer-lasting blooms: re-cut stems at an angle every few days, keep the vase water clean, and avoid placing them near fruit bowls -- ripening fruit releases ethylene gas that speeds up wilting.",
+      ]);
     } else if (lower.contains('meaning') ||
         lower.contains('rose') ||
         lower.contains('floriography')) {
-      return "In Floriography (the language of flowers):\n• Red = Deep Romance & Passion\n• White = Purity & Honesty\n• Pink = Grace & Admiration\n• Yellow = Friendship & Sunshine\n• Purple = Enchantment & Royalty";
+      return pick([
+        "In Floriography (the language of flowers):\n• Red = Deep Romance & Passion\n• White = Purity & Honesty\n• Pink = Grace & Admiration\n• Yellow = Friendship & Sunshine\n• Purple = Enchantment & Royalty",
+        "Flower color carries real meaning in Floriography -- red for passion, white for honesty, pink for admiration, yellow for friendship, and purple for enchantment.",
+      ]);
     } else if (lower.contains('recommend') ||
         lower.contains('suggest') ||
         lower.contains('help') ||
         lower.contains('best')) {
-      return "I would love to recommend the best flowers! For romance, choose Ecuadorian Red Roses. For a friend, go with Sunflowers or Yellow Tulips. For a mother, Pink Carnations or White Lilies are wonderful! Who is the lucky recipient?";
+      return pick([
+        "I would love to recommend the best flowers! For romance, choose Ecuadorian Red Roses. For a friend, go with Sunflowers or Yellow Tulips. For a mother, Pink Carnations or White Lilies are wonderful! Who is the lucky recipient?",
+        "Happy to help pick something great -- who's it for, and what's the occasion? That usually narrows it down fast.",
+      ]);
     }
 
-    return "For '$userQuery', I recommend a bouquet featuring fresh Ecuadorian Roses, Sunflowers, and Eucalyptus. You can also use our 'Matchmaker' tab or 'Visual Stylist' above to get personalized 3D bouquet formulas!";
+    return pick([
+      "For '$userQuery', I recommend a bouquet featuring fresh Ecuadorian Roses, Sunflowers, and Eucalyptus. You can also use our 'Matchmaker' tab or 'Visual Stylist' above to get personalized 3D bouquet formulas!",
+      "That's a great question -- for something tailored to '$userQuery', try our 'Matchmaker' tab for a personalized bouquet formula, or ask me something more specific and I'll do my best!",
+    ]);
   }
 
   static Map<String, dynamic> _parseResponse(String text) {

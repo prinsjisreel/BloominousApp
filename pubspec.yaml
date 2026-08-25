@@ -36,11 +36,14 @@ dependencies:
   path: ^1.9.1
   pdf: ^3.11.1
   printing: ^5.12.0
+  shared_preferences: ^2.2.2
+  uuid: ^4.3.3
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^3.0.1
+
 
 dependency_overrides:
   build_runner: 2.4.9

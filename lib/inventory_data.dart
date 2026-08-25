@@ -43,6 +43,13 @@ class InventoryData {
     return _db.collection('freshness_analysis');
   }
 
+  // Product ratings/reviews live in one root-level collection (not nested
+  // under a branch) since a product review is about the item itself, not
+  // tied to which branch fulfilled a particular order.
+  static CollectionReference _productRatingsCollection() {
+    return _db.collection('product_ratings');
+  }
+
   // --- Stream Methods ---
 
   static Stream<List<Map<String, dynamic>>> inventoryStream(
@@ -56,16 +63,16 @@ class InventoryData {
       return _db.collectionGroup('inventory').snapshots().map((snapshot) {
         final docs = snapshot.docs
             .map((doc) {
-              final data = doc.data() as Map<String, dynamic>;
-              final pathParts = doc.reference.path.split('/');
-              final branchDocId =
-                  pathParts.length >= 2 ? pathParts[1] : 'unknown';
-              return {
-                ...data,
-                'id': doc.id,
-                'branchId': data['branchId'] ?? branchDocId,
-              };
-            })
+          final data = doc.data() as Map<String, dynamic>;
+          final pathParts = doc.reference.path.split('/');
+          final branchDocId =
+          pathParts.length >= 2 ? pathParts[1] : 'unknown';
+          return {
+            ...data,
+            'id': doc.id,
+            'branchId': data['branchId'] ?? branchDocId,
+          };
+        })
             .where((d) => d['isDeleted'] != true && d['status'] != 'archived')
             .toList();
 
@@ -89,13 +96,13 @@ class InventoryData {
         .map((snapshot) {
       final docs = snapshot.docs
           .map((doc) {
-            final data = doc.data() as Map<String, dynamic>;
-            return {
-              ...data,
-              'id': doc.id,
-              'branchId': bid,
-            };
-          })
+        final data = doc.data() as Map<String, dynamic>;
+        return {
+          ...data,
+          'id': doc.id,
+          'branchId': bid,
+        };
+      })
           .where((d) => d['isDeleted'] != true && d['status'] != 'archived')
           .toList();
 
@@ -227,15 +234,15 @@ class InventoryData {
         .where('stock', isLessThanOrEqualTo: threshold)
         .snapshots()
         .map((snapshot) => snapshot.docs
-            .map((doc) {
-              final data = doc.data() as Map<String, dynamic>;
-              return {
-                ...data,
-                'id': doc.id,
-              };
-            })
-            .where((d) => d['isDeleted'] != true && d['status'] != 'archived')
-            .toList());
+        .map((doc) {
+      final data = doc.data() as Map<String, dynamic>;
+      return {
+        ...data,
+        'id': doc.id,
+      };
+    })
+        .where((d) => d['isDeleted'] != true && d['status'] != 'archived')
+        .toList());
   }
 
   static Stream<List<Map<String, dynamic>>> spoilageStream() {
@@ -290,9 +297,9 @@ class InventoryData {
   static Stream<Map<String, dynamic>?> getCustomerLoyaltyDocStream(
       String customerId) {
     return _db.collection('customers').doc(customerId).snapshots().map((doc) =>
-        doc.exists
-            ? {...doc.data() as Map<String, dynamic>, 'id': doc.id}
-            : null);
+    doc.exists
+        ? {...doc.data() as Map<String, dynamic>, 'id': doc.id}
+        : null);
   }
 
   static Stream<List<Map<String, dynamic>>> getCustomerLoyaltyStream(
@@ -302,8 +309,8 @@ class InventoryData {
         .where('customerId', isEqualTo: customerId)
         .snapshots()
         .map((snap) => snap.docs
-            .map((doc) => {...doc.data() as Map<String, dynamic>, 'id': doc.id})
-            .toList());
+        .map((doc) => {...doc.data() as Map<String, dynamic>, 'id': doc.id})
+        .toList());
   }
 
   static Stream<List<Map<String, dynamic>>> tripoHistoryStream() {
@@ -332,6 +339,82 @@ class InventoryData {
     });
   }
 
+  // --- Product Ratings / Reviews ---
+  //
+  // A customer can only rate a product after it's actually been delivered
+  // to them -- see hasUserReceivedProduct() below, which is the gate the
+  // UI checks before showing a "Rate this product" button at all. This
+  // mirrors how Shopee/Lazada only unlock reviews post-delivery, so
+  // ratings reflect real purchases rather than anyone who happens to view
+  // the product page.
+
+  static Stream<List<Map<String, dynamic>>> getProductRatingsStream(
+      String productId) {
+    return _productRatingsCollection()
+        .where('productId', isEqualTo: productId)
+        .snapshots()
+        .map((snap) => snap.docs
+        .map((doc) => {...doc.data() as Map<String, dynamic>, 'id': doc.id})
+        .toList());
+  }
+
+  static Future<bool> hasUserAlreadyRated({
+    required String productId,
+    required String userId,
+  }) async {
+    final snap = await _productRatingsCollection()
+        .where('productId', isEqualTo: productId)
+        .where('userId', isEqualTo: userId)
+        .limit(1)
+        .get();
+    return snap.docs.isNotEmpty;
+  }
+
+  /// Checks whether this user has at least one DELIVERED order containing
+  /// this product. Done client-side (fetch the user's orders once, filter
+  /// in memory) rather than a compound Firestore query, since `items` is
+  /// stored as an array of maps -- Firestore can't query "does this array
+  /// contain a map with this specific id field" directly without an
+  /// exact-match arrayContains, which the full item map (price, qty, etc.)
+  /// would never reliably match against.
+  static Future<bool> hasUserReceivedProduct({
+    required String userId,
+    required String productId,
+  }) async {
+    try {
+      final orders = await getUserOrdersStream(userId: userId).first;
+      for (final order in orders) {
+        final status = (order['status'] ?? '').toString().toLowerCase();
+        if (status != 'delivered') continue;
+        final items = (order['items'] as List?) ?? [];
+        for (final item in items) {
+          if (item is Map && item['id'] == productId) return true;
+        }
+      }
+      return false;
+    } catch (e) {
+      debugPrint('Error checking hasUserReceivedProduct: $e');
+      return false;
+    }
+  }
+
+  static Future<void> submitProductRating({
+    required String productId,
+    required String userId,
+    required String userName,
+    required int rating,
+    String? review,
+  }) async {
+    await _productRatingsCollection().add({
+      'productId': productId,
+      'userId': userId,
+      'userName': userName,
+      'rating': rating,
+      'review': (review ?? '').trim().isEmpty ? null : review!.trim(),
+      'createdAt': FieldValue.serverTimestamp(),
+    });
+  }
+
   // --- Action Methods ---
 
   static Future<String> placeOrder(Map<String, dynamic> orderData) async {
@@ -348,15 +431,15 @@ class InventoryData {
   }
 
   static Future<void> updateDeliveryStatus(
-    String orderId,
-    String status, {
-    String? deliveryNotes,
-    String? proofOfDeliveryPhoto,
-    double? deliveredLat,
-    double? deliveredLng,
-    String? driverName,
-    String? recipientName,
-  }) async {
+      String orderId,
+      String status, {
+        String? deliveryNotes,
+        String? proofOfDeliveryPhoto,
+        double? deliveredLat,
+        double? deliveredLng,
+        String? driverName,
+        String? recipientName,
+      }) async {
     final bool isDelivered = status.toLowerCase() == 'delivered';
     final Map<String, dynamic> updateData = {
       'status': isDelivered ? 'delivered' : status,
@@ -490,7 +573,7 @@ class InventoryData {
 
       if (recycledQuery.docs.isNotEmpty) {
         final docData =
-            recycledQuery.docs.first.data() as Map<String, dynamic>?;
+        recycledQuery.docs.first.data() as Map<String, dynamic>?;
         if (docData != null) {
           currentLeftovers = docData['leftoverFlowers'] ?? 0;
         }
@@ -519,7 +602,7 @@ class InventoryData {
           'category': 'Bouquets',
           'description': description,
           'image':
-              'https://images.unsplash.com/photo-1582794543139-8ac9cb0f7b11?q=80&w=200&auto=format&fit=crop',
+          'https://images.unsplash.com/photo-1582794543139-8ac9cb0f7b11?q=80&w=200&auto=format&fit=crop',
           'branchId': bid,
           'createdAt': FieldValue.serverTimestamp(),
           'updatedAt': FieldValue.serverTimestamp(),
@@ -530,20 +613,20 @@ class InventoryData {
     // 4. Add Notification
     final notifRef = _db.collection('notifications').doc();
     final notifTitle =
-        isSalvaged ? 'Bouquet Created from Salvage' : 'Spoilage Reported';
+    isSalvaged ? 'Bouquet Created from Salvage' : 'Spoilage Reported';
 
     String notifMsg = '';
     if (isSalvaged) {
       if (newBouquets > 0) {
         notifMsg =
-            '[$bid] $quantity pcs of ${flowerName ?? 'Flowers'} salvaged. Built $newBouquets Recycled Bouquet(s) (leftover: $newLeftovers flower(s)).';
+        '[$bid] $quantity pcs of ${flowerName ?? 'Flowers'} salvaged. Built $newBouquets Recycled Bouquet(s) (leftover: $newLeftovers flower(s)).';
       } else {
         notifMsg =
-            '[$bid] $quantity pcs of ${flowerName ?? 'Flowers'} salvaged to pool (leftover: $newLeftovers flower(s)). Needs 4 flowers for 1 bouquet.';
+        '[$bid] $quantity pcs of ${flowerName ?? 'Flowers'} salvaged to pool (leftover: $newLeftovers flower(s)). Needs 4 flowers for 1 bouquet.';
       }
     } else {
       notifMsg =
-          '[$bid] $quantity pcs of ${flowerName ?? 'Flowers'} reported as spoiled ($reason).';
+      '[$bid] $quantity pcs of ${flowerName ?? 'Flowers'} reported as spoiled ($reason).';
     }
 
     batch.set(notifRef, {
@@ -604,7 +687,7 @@ class InventoryData {
 
     final productDoc = invSnap.docs.first;
     final stockToRecycle =
-        quantity > 0 ? quantity : (productDoc.get('stock') ?? 0);
+    quantity > 0 ? quantity : (productDoc.get('stock') ?? 0);
 
     if (stockToRecycle <= 0) throw Exception('No stock available to recycle.');
 
@@ -634,9 +717,9 @@ class InventoryData {
     return query.snapshots().map((snap) {
       final docs = snap.docs
           .map((doc) => {
-                ...doc.data() as Map<String, dynamic>,
-                'id': doc.id,
-              })
+        ...doc.data() as Map<String, dynamic>,
+        'id': doc.id,
+      })
           .toList();
 
       docs.sort((a, b) {
@@ -884,9 +967,9 @@ class InventoryData {
         if (bId == selectedBranchId) continue; // Already searched
 
         final branchInventory =
-            _db.collection('branches').doc(bId).collection('inventory');
+        _db.collection('branches').doc(bId).collection('inventory');
         var bSnap =
-            await branchInventory.where('code', isEqualTo: code).limit(1).get();
+        await branchInventory.where('code', isEqualTo: code).limit(1).get();
         if (bSnap.docs.isEmpty) {
           bSnap = await branchInventory
               .where('sku', isEqualTo: code)
@@ -993,7 +1076,7 @@ class InventoryData {
           'price': 100.0,
           'stock': 50,
           'image':
-              'https://images.unsplash.com/photo-1548512406-8159fe4eb372?q=80&w=200&auto=format&fit=crop',
+          'https://images.unsplash.com/photo-1548512406-8159fe4eb372?q=80&w=200&auto=format&fit=crop',
           'category': 'Flowers',
           'description': 'A classic deep red rose.',
           'branchId': bid,
@@ -1003,7 +1086,7 @@ class InventoryData {
           'price': 450.0,
           'stock': 20,
           'image':
-              'https://images.unsplash.com/photo-1514451913147-97213062635b?q=80&w=200&auto=format&fit=crop',
+          'https://images.unsplash.com/photo-1514451913147-97213062635b?q=80&w=200&auto=format&fit=crop',
           'category': 'Gifts',
           'description': 'Premium selection.',
           'branchId': bid,
@@ -1013,7 +1096,7 @@ class InventoryData {
           'price': 250.0,
           'stock': 30,
           'image':
-              'https://images.unsplash.com/photo-1559440666-4aa49195b090?q=80&w=200&auto=format&fit=crop',
+          'https://images.unsplash.com/photo-1559440666-4aa49195b090?q=80&w=200&auto=format&fit=crop',
           'category': 'Stuffed Toys',
           'description': 'Soft and cuddly.',
           'branchId': bid,
@@ -1060,11 +1143,11 @@ class InventoryData {
   static Future<void> _checkExpiredRecycledBouquets(String bid) async {
     try {
       final invCol =
-          _db.collection('branches').doc(bid).collection('inventory');
+      _db.collection('branches').doc(bid).collection('inventory');
 
       // 1. Double check and cleanup of stale 'Recycled Flowers'
       final flowersSnap =
-          await invCol.where('name', isEqualTo: 'Recycled Flowers').get();
+      await invCol.where('name', isEqualTo: 'Recycled Flowers').get();
       if (flowersSnap.docs.isNotEmpty) {
         final batchDel = _db.batch();
         for (var doc in flowersSnap.docs) {
@@ -1076,7 +1159,7 @@ class InventoryData {
 
       // 2. Scan and handle Recycled Bouquet expiration (2 days)
       final snap =
-          await invCol.where('name', isEqualTo: 'Recycled Bouquet').get();
+      await invCol.where('name', isEqualTo: 'Recycled Bouquet').get();
       if (snap.docs.isEmpty) return;
 
       final doc = snap.docs.first;
@@ -1108,7 +1191,7 @@ class InventoryData {
 
         // Add Spoilage/Loss Record
         final spoilRef =
-            _db.collection('branches').doc(bid).collection('spoilage').doc();
+        _db.collection('branches').doc(bid).collection('spoilage').doc();
         batch.set(spoilRef, {
           'productId': doc.id,
           'product_id': doc.id,
@@ -1127,7 +1210,7 @@ class InventoryData {
         batch.set(notifRef, {
           'title': 'Recycled Bouquet Expired',
           'message':
-              '[$bid] $stock pcs of Recycled Bouquet expired after 2 days and moved to spoilage.',
+          '[$bid] $stock pcs of Recycled Bouquet expired after 2 days and moved to spoilage.',
           'type': 'warning',
           'branchId': bid,
           'created_at': FieldValue.serverTimestamp(),

@@ -1,0 +1,9 @@
+{
+  "model": "models/gemini-embedding-001",
+  "content": {
+    "parts": [
+      {"text": "Do you have red roses in stock?"}
+    ]
+  },
+  "taskType": "RETRIEVAL_QUERY"
+}
