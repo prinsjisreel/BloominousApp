@@ -12,6 +12,7 @@ import 'admin_dashboard.dart';
 import 'my_orders_page.dart';
 import 'customer_profile_page.dart';
 import 'device_security_service.dart';
+import 'registration_risk_service.dart';
 
 class AuthPage extends StatefulWidget {
   final bool returnAfterLogin;
@@ -55,6 +56,7 @@ class _AuthPageState extends State<AuthPage> {
 
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final DeviceSecurityService _securityService = DeviceSecurityService();
+  final RegistrationRiskService _registrationRiskService = RegistrationRiskService();
 
   @override
   void initState() {
@@ -1696,6 +1698,16 @@ class _AuthPageState extends State<AuthPage> {
           'Disposable / temporary email addresses are restricted. Please use a valid active email.');
     }
 
+    // Mirrors register.php's blocked_emails check — runs first, same as
+    // web, since it's the cheapest possible check (single doc read, no
+    // collection scan).
+    final blocklistSnap =
+    await _firestore.collection('blocked_emails').doc(email).get();
+    if (blocklistSnap.exists) {
+      throw Exception(
+          'Security Restriction: This email address is permanently blacklisted due to automated fraud threshold failures.');
+    }
+
     final domain = email.contains('@') ? email.split('@')[1].toLowerCase() : '';
     final bannedSnap = await _firestore.collection('banned_devices').get();
     for (var doc in bannedSnap.docs) {
@@ -1758,8 +1770,22 @@ class _AuthPageState extends State<AuthPage> {
         throw Exception('Security Warning: This device has been banned due to suspicious activity. Registration is restricted.');
       }
 
+      RegistrationRiskResult? riskResult;
+
       if (!_isPhoneAuth) {
         await _checkDeviceAndNetworkSecurity(email);
+
+        // Server-side pre-signup risk check (see check_email_risk_mobile.php)
+        // — same 6-layer pipeline as the web app's registration form,
+        // reached via App Check instead of Turnstile. This is a UX-tier
+        // convenience check only, not the real enforcement boundary —
+        // register.php's own account creation is client-side too, so this
+        // matches web's actual security posture rather than exceeding it.
+        riskResult = await _registrationRiskService.checkEmail(email);
+        if (riskResult.blocked) {
+          throw Exception(riskResult.reason ??
+              'This email could not be verified. Please try a different email or contact support.');
+        }
       }
 
       String uid;
@@ -1825,6 +1851,10 @@ class _AuthPageState extends State<AuthPage> {
         'createdAt': FieldValue.serverTimestamp(),
         'created_at': FieldValue.serverTimestamp(),
         'lastLogin': FieldValue.serverTimestamp(),
+        // Matches register.php's field exactly — feeds set_session.php's
+        // device-recognition gate and fraud_analytics.php's device-ban
+        // tooling on the web side, once an account is later flagged.
+        'deviceHashes': [deviceHash],
       };
 
       if (_isPhoneAuth) {
@@ -1869,6 +1899,12 @@ class _AuthPageState extends State<AuthPage> {
 
       if (!_isPhoneAuth) {
         await _firestore.collection('customer_otps').doc(email).delete();
+
+        // Mirrors register.php: only bothers calling out to the server
+        // if the pre-check actually flagged something with a real score.
+        if (riskResult != null && riskResult.flagged && riskResult.scoreBump > 0) {
+          await _registrationRiskService.recordScore(riskResult.scoreBump);
+        }
       }
 
       if (mounted) {

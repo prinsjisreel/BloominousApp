@@ -1,104 +1,68 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter_animate/flutter_animate.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
 import 'inventory_data.dart';
 import 'payment_service.dart';
 import 'order_success_page.dart';
 import 'google_maps_service.dart';
-
-// --- Location Hierarchy Data ---
-const Map<String, Map<String, Map<String, List<String>>>> locationHierarchy = {
-  "National Capital Region (NCR)": {
-    "Metro Manila": {
-      "Quezon City": [
-        "Bagong Pag-asa",
-        "Diliman",
-        "Socorro",
-        "Katipunan",
-        "Loyola Heights"
-      ],
-      "Manila": ["Malate", "Ermita", "Binondo", "Sampaloc", "Intramuros"],
-      "Makati": ["Bel-Air", "Poblacion", "San Lorenzo", "Urdaneta"],
-      "Taguig": ["Fort Bonifacio", "Pinagsama", "Western Bicutan"],
-      "Pasig": ["San Antonio", "Kapitolyo", "Ugong", "Oranbo"]
-    }
-  },
-  "Central Luzon (Region III)": {
-    "Bulacan": {
-      "Meycauayan": ["Lias", "Saluysoy", "Pandayan", "Banga", "Calvario"],
-      "Malolos": ["Guinhawa", "Mojon", "Bulihan", "San Pablo", "Catmon"],
-      "Marilao": ["Abangan Sur", "Loma de Gato", "Ibayo", "Lias"]
-    },
-    "Pampanga": {
-      "Angeles": ["Balibago", "Malabanias", "Anunas", "Pulung Maragul"]
-    }
-  },
-  "CALABARZON (Region IV-A)": {
-    "Cavite": {
-      "Bacoor": ["Ligas I", "Ligas II", "Mambog I", "Molino I", "Molino II"],
-      "Imus": ["Anabu I", "Anabu II", "Bayan Luma", "Toclong"],
-      "Tagaytay": ["Mendez Crossing", "Sungkai", "Silang Junction", "Iruhin"]
-    },
-    "Laguna": {
-      "Santa Rosa": ["Balibago", "Don Jose", "Macabling", "Tagapo"],
-      "Calamba": ["Parian", "Halang", "Real", "Barandal"]
-    }
-  },
-  "CAR (Cordillera)": {
-    "Benguet": {
-      "Baguio": ["Camp 7", "Bakakeng", "Irisan", "Gibraltar", "Magsaysay"]
-    }
-  },
-  "Central Visayas (Region VII)": {
-    "Cebu": {
-      "Cebu City": ["Lahug", "Banilad", "Mabolo", "Capitol Site", "Guadalupe"],
-      "Mandaue": ["Bakilid", "Subangdaku", "Centro", "Cabancalan"]
-    }
-  }
-};
+import 'order_submission_service.dart';
+import 'psgc_service.dart';
 
 const Map<String, String> postalCodes = {
   "Meycauayan": "3020",
   "Malolos": "3000",
   "Marilao": "3019",
-  "Bacoor": "4102",
-  "Imus": "4103",
-  "Tagaytay": "4120",
-  "Baguio": "2600",
+  "Bacoor City": "4102",
+  "Imus City": "4103",
+  "Tagaytay City": "4120",
+  "Baguio City": "2600",
   "Cebu City": "6000",
-  "Mandaue": "6014",
+  "Mandaue City": "6014",
   "Quezon City": "1100",
   "Manila": "1000",
-  "Makati": "1200",
-  "Taguig": "1630",
-  "Pasig": "1600",
-  "Angeles": "2009",
-  "Santa Rosa": "4026",
-  "Calamba": "4027"
+  "Makati City": "1200",
+  "Taguig City": "1630",
+  "Pasig City": "1600",
+  "Angeles City": "2009",
+  "Santa Rosa City": "4026",
+  "Calamba City": "4027"
 };
 
 const Map<String, Map<String, double>> cityCoordinates = {
   "Meycauayan": {"lat": 14.7410, "lng": 120.9634},
   "Malolos": {"lat": 14.8510, "lng": 120.8162},
   "Marilao": {"lat": 14.7584, "lng": 120.9575},
-  "Bacoor": {"lat": 14.4613, "lng": 120.9622},
-  "Imus": {"lat": 14.4294, "lng": 120.9367},
-  "Tagaytay": {"lat": 14.1153, "lng": 120.9621},
-  "Baguio": {"lat": 16.4164, "lng": 120.5930},
+  "Bacoor City": {"lat": 14.4613, "lng": 120.9622},
+  "Imus City": {"lat": 14.4294, "lng": 120.9367},
+  "Tagaytay City": {"lat": 14.1153, "lng": 120.9621},
+  "Baguio City": {"lat": 16.4164, "lng": 120.5930},
   "Cebu City": {"lat": 10.3157, "lng": 123.8854},
-  "Mandaue": {"lat": 10.3446, "lng": 123.9390},
+  "Mandaue City": {"lat": 10.3446, "lng": 123.9390},
   "Quezon City": {"lat": 14.6760, "lng": 121.0437},
   "Manila": {"lat": 14.5995, "lng": 120.9842},
-  "Makati": {"lat": 14.5547, "lng": 121.0244},
-  "Taguig": {"lat": 14.5176, "lng": 121.0509},
-  "Pasig": {"lat": 14.5764, "lng": 121.0851},
-  "Angeles": {"lat": 15.1441, "lng": 120.5887},
-  "Santa Rosa": {"lat": 14.3121, "lng": 121.0933},
-  "Calamba": {"lat": 14.2128, "lng": 121.1649}
+  "Makati City": {"lat": 14.5547, "lng": 121.0244},
+  "Taguig City": {"lat": 14.5176, "lng": 121.0509},
+  "Pasig City": {"lat": 14.5764, "lng": 121.0851},
+  "Angeles City": {"lat": 15.1441, "lng": 120.5887},
+  "Santa Rosa City": {"lat": 14.3121, "lng": 121.0933},
+  "Calamba City": {"lat": 14.2128, "lng": 121.1649}
 };
+
+class AddressSuggestion {
+  final String displayName;
+  final double lat;
+  final double lng;
+  const AddressSuggestion({required this.displayName, required this.lat, required this.lng});
+}
 
 class DeliveryDetailsPage extends StatefulWidget {
   final List<Map<String, dynamic>> cartItems;
@@ -122,18 +86,36 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
   final phoneController = TextEditingController();
   final notesController = TextEditingController();
 
-  // Custom Location Fields
-  String? selectedRegion;
-  String? selectedProvince;
-  String? selectedCity;
-  String? selectedBarangay;
+  final OrderSubmissionService _orderSubmissionService = OrderSubmissionService();
+
   final streetController = TextEditingController();
   final postalCodeController = TextEditingController();
+
+  List<PsgcItem> _regions = [];
+  List<PsgcItem> _provinces = [];
+  List<PsgcItem> _cities = [];
+  List<PsgcItem> _barangays = [];
+
+  bool _isMetroManilaSelected = false;
+  bool _isLoadingRegions = false;
+  bool _isLoadingProvinces = false;
+  bool _isLoadingCities = false;
+  bool _isLoadingBarangays = false;
+
+  String? selectedRegionCode;
+  String? selectedRegionName;
+  String? selectedProvinceCode;
+  String? selectedProvinceName;
+  String? selectedCityCode;
+  String? selectedCityName;
+  String? selectedBarangayName;
 
   bool sendAsGift = false;
   bool isLoading = false;
   bool isCodRestricted = false;
   String restrictionReason = "";
+
+  String selectedPaymentMethod = 'gcash';
 
   double subtotal = 0.0;
   double deliveryFee = 0.0;
@@ -141,61 +123,40 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
   String nearestBranchName = "";
   bool isCalculatingFee = false;
   bool isUsingRealRoadDistance = false;
+  bool isAutoFillingAddress = false;
 
-  // Constants for fee calculation
-  static const double baseFee = 50.0;
-  static const double feePerKm = 15.0; // ₱15 per km
+  double? _customerLat;
+  double? _customerLng;
+  double? _branchLat;
+  double? _branchLng;
+
+  double? _recipientLat;
+  double? _recipientLng;
+
+  List<AddressSuggestion> _streetSuggestions = [];
+  bool _isSearchingStreet = false;
+  Timer? _streetSearchDebounce;
+
+  static const double feePerKm = 1.0;
+
+  static const Map<String, String> _nominatimHeaders = {
+    'User-Agent': 'BloominousApp/1.0 (contact: support@bloominous.example)',
+  };
 
   @override
   void initState() {
     super.initState();
     subtotal = widget.cartTotal;
-    streetController.addListener(_updateFullAddress);
+    streetController.addListener(_onStreetTextChanged);
     postalCodeController.addListener(_updateFullAddress);
     _checkUserFraudStatus();
-  }
-
-  Future<void> _checkUserFraudStatus() async {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user != null) {
-      try {
-        final doc = await FirebaseFirestore.instance
-            .collection('users')
-            .doc(user.uid)
-            .get();
-        if (doc.exists && doc.data() != null) {
-          final data = doc.data()!;
-          final bool isRestricted = data['isRestricted'] ?? false;
-          final bool isBanned = data['isBanned'] ?? false;
-          final int score = (data['fraudScore'] ?? 0) as int;
-
-          if (isBanned || score >= 90) {
-            if (mounted) {
-              setState(() {
-                isCodRestricted = true;
-                restrictionReason =
-                    "Account flagged for severe fraud. Cash on Delivery is disabled.";
-              });
-            }
-          } else if (isRestricted || (score >= 50 && score <= 86)) {
-            if (mounted) {
-              setState(() {
-                isCodRestricted = true;
-                restrictionReason =
-                    "Cash-on-Delivery (COD) disabled due to account restriction (50-86% risk rating).";
-              });
-            }
-          }
-        }
-      } catch (e) {
-        debugPrint('Error checking fraud status: $e');
-      }
-    }
+    _loadRegions();
   }
 
   @override
   void dispose() {
-    streetController.removeListener(_updateFullAddress);
+    _streetSearchDebounce?.cancel();
+    streetController.removeListener(_onStreetTextChanged);
     postalCodeController.removeListener(_updateFullAddress);
     streetController.dispose();
     postalCodeController.dispose();
@@ -206,12 +167,168 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
     super.dispose();
   }
 
+  Future<void> _loadRegions() async {
+    setState(() => _isLoadingRegions = true);
+    try {
+      final regions = await PsgcService.getRegions();
+      if (mounted) setState(() => _regions = regions);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not load regions: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isLoadingRegions = false);
+    }
+  }
+
+  Future<void> _onRegionSelected(PsgcItem region) async {
+    setState(() {
+      selectedRegionCode = region.code;
+      selectedRegionName = region.name;
+      selectedProvinceCode = null;
+      selectedProvinceName = null;
+      selectedCityCode = null;
+      selectedCityName = null;
+      selectedBarangayName = null;
+      _provinces = [];
+      _cities = [];
+      _barangays = [];
+      _isMetroManilaSelected = false;
+      _isLoadingProvinces = true;
+      _updateFullAddress();
+    });
+
+    try {
+      final result = await PsgcService.getProvincesOrCities(region.code);
+      if (!mounted) return;
+      setState(() {
+        _isMetroManilaSelected = result.isMetroManila;
+        if (result.isMetroManila) {
+          _cities = result.items;
+          selectedProvinceName = 'Metro Manila';
+        } else {
+          _provinces = result.items;
+        }
+      });
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not load provinces: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isLoadingProvinces = false);
+    }
+  }
+
+  Future<void> _onProvinceSelected(PsgcItem province) async {
+    setState(() {
+      selectedProvinceCode = province.code;
+      selectedProvinceName = province.name;
+      selectedCityCode = null;
+      selectedCityName = null;
+      selectedBarangayName = null;
+      _cities = [];
+      _barangays = [];
+      _isLoadingCities = true;
+      _updateFullAddress();
+    });
+
+    try {
+      final cities = await PsgcService.getCities(province.code);
+      if (mounted) setState(() => _cities = cities);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not load cities: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isLoadingCities = false);
+    }
+  }
+
+  Future<void> _onCitySelected(PsgcItem city) async {
+    setState(() {
+      selectedCityCode = city.code;
+      selectedCityName = city.name;
+      selectedBarangayName = null;
+      _barangays = [];
+      _isLoadingBarangays = true;
+
+      if (postalCodes.containsKey(city.name)) {
+        postalCodeController.text = postalCodes[city.name]!;
+      } else {
+        postalCodeController.clear();
+      }
+      _updateFullAddress();
+    });
+
+    if (!sendAsGift) _calculateDeliveryFeeFromGps();
+
+    try {
+      final barangays = await PsgcService.getBarangays(city.code);
+      if (mounted) setState(() => _barangays = barangays);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not load barangays: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isLoadingBarangays = false);
+    }
+  }
+
+  Future<void> _checkUserFraudStatus() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user != null) {
+      try {
+        final doc = await FirebaseFirestore.instance
+            .collection('customers')
+            .doc(user.uid)
+            .get();
+        if (doc.exists && doc.data() != null) {
+          final data = doc.data()!;
+          final bool isRestricted = data['isRestricted'] ?? false;
+          final bool isBanned = (data['status'] ?? '') == 'blocked';
+          final int score = (data['fraudScore'] ?? 0) as int;
+
+          bool restrictCod = false;
+          String reason = "";
+
+          if (isBanned || score >= 90) {
+            restrictCod = true;
+            reason = "Account flagged for severe fraud. Cash on Delivery is disabled.";
+          } else if (isRestricted || (score >= 50 && score <= 86)) {
+            restrictCod = true;
+            reason = "Cash-on-Delivery (COD) disabled due to account restriction (50-86% risk rating).";
+          }
+
+          if (mounted && restrictCod) {
+            setState(() {
+              isCodRestricted = true;
+              restrictionReason = reason;
+              if (selectedPaymentMethod == 'cod') {
+                selectedPaymentMethod = 'gcash';
+              }
+            });
+          }
+        }
+      } catch (e) {
+        debugPrint('Error checking fraud status: $e');
+      }
+    }
+  }
+
   void _updateFullAddress() {
     final street = streetController.text.trim();
-    final barangay = selectedBarangay ?? '';
-    final city = selectedCity ?? '';
-    final province = selectedProvince ?? '';
-    final region = selectedRegion ?? '';
+    final barangay = selectedBarangayName ?? '';
+    final city = selectedCityName ?? '';
+    final province = selectedProvinceName ?? '';
+    final region = selectedRegionName ?? '';
     final postal = postalCodeController.text.trim();
 
     List<String> parts = [];
@@ -225,50 +342,225 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
     addressController.text = parts.join(', ');
   }
 
-  Future<void> _calculateDeliveryFee() async {
-    setState(() => isCalculatingFee = true);
+  Future<void> _handleGetCurrentLocation() async {
+    setState(() => isAutoFillingAddress = true);
     try {
-      double? destLat;
-      double? destLng;
-
-      // 1. Try GPS first
-      try {
-        LocationPermission permission = await Geolocator.checkPermission();
-        if (permission == LocationPermission.denied) {
-          permission = await Geolocator.requestPermission();
-        }
-        if (permission != LocationPermission.denied &&
-            permission != LocationPermission.deniedForever) {
-          Position position = await Geolocator.getCurrentPosition(
-            desiredAccuracy: LocationAccuracy.medium,
-            timeLimit: const Duration(seconds: 5),
-          );
-          destLat = position.latitude;
-          destLng = position.longitude;
-        }
-      } catch (gpsError) {
-        debugPrint(
-            'GPS skipped/failed, falling back to selected city coordinate: $gpsError');
+      LocationPermission permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        throw 'Location permission was denied. Please enable it in your device settings.';
       }
 
-      // 2. Fallback to city coordinates if GPS failed or wasn't allowed
-      if (destLat == null &&
-          selectedCity != null &&
-          cityCoordinates.containsKey(selectedCity)) {
-        destLat = cityCoordinates[selectedCity]!['lat'];
-        destLng = cityCoordinates[selectedCity]!['lng'];
+      final position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+        timeLimit: const Duration(seconds: 8),
+      );
+
+      setState(() {
+        _customerLat = position.latitude;
+        _customerLng = position.longitude;
+      });
+
+      if (sendAsGift) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                  'Your location has been recorded for verification. Please search and select the RECIPIENT\'s address below.'),
+              duration: Duration(seconds: 4),
+            ),
+          );
+        }
+        return;
+      }
+
+      final address = await _reverseGeocode(position.latitude, position.longitude);
+      if (address != null) {
+        await _applyReverseGeocodedAddress(address);
+      }
+
+      await _calculateDeliveryFeeFromGps();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not determine location: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => isAutoFillingAddress = false);
+    }
+  }
+
+  Future<Map<String, dynamic>?> _reverseGeocode(double lat, double lng) async {
+    try {
+      final uri = Uri.parse(
+          'https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=$lat&lon=$lng&addressdetails=1');
+      final res = await http
+          .get(uri, headers: _nominatimHeaders)
+          .timeout(const Duration(seconds: 8));
+      if (res.statusCode != 200) return null;
+      return jsonDecode(res.body) as Map<String, dynamic>;
+    } catch (e) {
+      debugPrint('Reverse geocode failed: $e');
+      return null;
+    }
+  }
+
+  Future<void> _applyReverseGeocodedAddress(Map<String, dynamic> geocoded) async {
+    final addr = geocoded['address'] as Map<String, dynamic>? ?? {};
+
+    final road = addr['road'] as String?;
+    final houseNumber = addr['house_number'] as String?;
+    final postcode = addr['postcode'] as String?;
+    final cityGuess = (addr['city'] ?? addr['town'] ?? addr['municipality']) as String?;
+    final provinceGuess = addr['state'] as String?;
+
+    setState(() {
+      if (road != null) {
+        streetController.text = houseNumber != null ? '$houseNumber $road' : road;
+      }
+      if (postcode != null && postcode.isNotEmpty) {
+        postalCodeController.text = postcode;
+      }
+    });
+
+    if (provinceGuess == null && cityGuess == null) {
+      _updateFullAddress();
+      return;
+    }
+
+    for (final region in _regions) {
+      final regionMatches = provinceGuess != null &&
+          region.name.toLowerCase().contains('metro manila') &&
+          (cityGuess?.toLowerCase().contains('manila') ?? false);
+      if (regionMatches ||
+          (provinceGuess != null &&
+              region.name.toLowerCase().contains(provinceGuess.toLowerCase()))) {
+        await _onRegionSelected(region);
+        break;
+      }
+    }
+
+    if (cityGuess != null && _cities.isNotEmpty) {
+      PsgcItem? matchedCity;
+      for (final city in _cities) {
+        final normalizedCityName = city.name.toLowerCase().replaceAll(' city', '');
+        if (normalizedCityName.contains(cityGuess.toLowerCase()) ||
+            cityGuess.toLowerCase().contains(normalizedCityName)) {
+          matchedCity = city;
+          break;
+        }
+      }
+      if (matchedCity != null) {
+        await _onCitySelected(matchedCity);
+      } else if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+              content: Text(
+                  'Detected your general area — please confirm City and Barangay manually.')),
+        );
+      }
+    }
+
+    _updateFullAddress();
+  }
+
+  void _onStreetTextChanged() {
+    _updateFullAddress();
+    _streetSearchDebounce?.cancel();
+    final query = streetController.text.trim();
+    if (query.length < 4) {
+      setState(() => _streetSuggestions = []);
+      return;
+    }
+    _streetSearchDebounce = Timer(const Duration(milliseconds: 600), () {
+      _searchStreetSuggestions(query);
+    });
+  }
+
+  Future<void> _searchStreetSuggestions(String query) async {
+    setState(() => _isSearchingStreet = true);
+    try {
+      final cityContext = selectedCityName != null ? ', $selectedCityName' : '';
+      final uri = Uri.parse(
+          'https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=0&limit=5&countrycodes=ph&q=${Uri.encodeComponent('$query$cityContext, Philippines')}');
+      final res = await http
+          .get(uri, headers: _nominatimHeaders)
+          .timeout(const Duration(seconds: 8));
+      if (res.statusCode != 200 || !mounted) return;
+
+      final data = jsonDecode(res.body) as List;
+      setState(() {
+        _streetSuggestions = data
+            .map((e) => AddressSuggestion(
+          displayName: e['display_name'] as String,
+          lat: double.parse(e['lat'] as String),
+          lng: double.parse(e['lon'] as String),
+        ))
+            .toList();
+      });
+    } catch (e) {
+      debugPrint('Address search failed: $e');
+    } finally {
+      if (mounted) setState(() => _isSearchingStreet = false);
+    }
+  }
+
+  Future<void> _onStreetSuggestionSelected(AddressSuggestion suggestion) async {
+    setState(() {
+      streetController.text = suggestion.displayName.split(',').first;
+      _streetSuggestions = [];
+    });
+    _updateFullAddress();
+
+    if (sendAsGift) {
+      setState(() {
+        _recipientLat = suggestion.lat;
+        _recipientLng = suggestion.lng;
+      });
+      await _calculateDeliveryFeeForDestination(suggestion.lat, suggestion.lng);
+    }
+  }
+
+  Future<void> _calculateDeliveryFeeFromGps() async {
+    setState(() => isCalculatingFee = true);
+    try {
+      double? destLat = _customerLat;
+      double? destLng = _customerLng;
+
+      if (destLat == null || destLng == null) {
+        if (selectedCityName != null && cityCoordinates.containsKey(selectedCityName)) {
+          destLat = cityCoordinates[selectedCityName]!['lat'];
+          destLng = cityCoordinates[selectedCityName]!['lng'];
+        }
       }
 
       if (destLat == null || destLng == null) {
-        throw 'Please select your delivery city first or grant GPS permission to determine delivery fee.';
+        throw 'Please tap "Get Current Location" or select your city to determine delivery fee.';
       }
 
-      // 3. Fetch all branches to find the nearest one
+      await _calculateDeliveryFeeForDestination(destLat, destLng, isSenderLocation: true);
+    } catch (e) {
+      debugPrint('Error calculating fee: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not determine location: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => isCalculatingFee = false);
+    }
+  }
+
+  Future<void> _calculateDeliveryFeeForDestination(double destLat, double destLng,
+      {bool isSenderLocation = false}) async {
+    setState(() => isCalculatingFee = true);
+    try {
       final branchesList = await InventoryData.getBranchesStream().first;
-
-      if (branchesList.isEmpty) {
-        throw 'No branches found to calculate delivery';
-      }
+      if (branchesList.isEmpty) throw 'No branches found to calculate delivery';
 
       double minDistance = double.infinity;
       String closestBranchId = "";
@@ -279,10 +571,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
       for (var branch in branchesList) {
         double bLat = branch['latitude']?.toDouble() ?? 14.7573;
         double bLng = branch['longitude']?.toDouble() ?? 120.9439;
-
-        double distance =
-            Geolocator.distanceBetween(bLat, bLng, destLat, destLng);
-
+        double distance = Geolocator.distanceBetween(bLat, bLng, destLat, destLng);
         if (distance < minDistance) {
           minDistance = distance;
           closestBranchId = branch['id'] ?? "";
@@ -295,7 +584,6 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
       double finalDistanceKm = 0.0;
       bool usedRoutesApi = false;
 
-      // Try Google Maps Routes API for precise Road Distance
       try {
         if (branchLat != null && branchLng != null) {
           final routeData = await GoogleMapsService.calculateRoute(
@@ -306,12 +594,9 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
           );
           finalDistanceKm = routeData['distanceKm'];
           usedRoutesApi = true;
-          debugPrint('Using Routes API: $finalDistanceKm km');
         }
       } catch (routesError) {
-        debugPrint('Routes API skipped or failed: $routesError');
         double straightLineKm = minDistance / 1000;
-
         if (straightLineKm < 3) {
           finalDistanceKm = straightLineKm * 1.3;
         } else if (straightLineKm < 15) {
@@ -325,27 +610,29 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
         nearestBranchName = closestBranchName;
         distanceKm = finalDistanceKm;
         isUsingRealRoadDistance = usedRoutesApi;
-
-        // Formula: Base Fee + (Km * FeePerKm)
-        deliveryFee = baseFee + (distanceKm * feePerKm);
-
+        _branchLat = branchLat;
+        _branchLng = branchLng;
+        if (isSenderLocation) {
+          _customerLat = destLat;
+          _customerLng = destLng;
+        } else {
+          _recipientLat = destLat;
+          _recipientLng = destLng;
+        }
+        deliveryFee = distanceKm * feePerKm;
         InventoryData.selectedBranchId = closestBranchId;
       });
-    } catch (e) {
-      debugPrint('Error calculating fee: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not determine location: $e')),
-      );
-      setState(() {
-        deliveryFee = 120.0; // Fallback fee
-        nearestBranchName = "Default Branch";
-      });
     } finally {
-      setState(() => isCalculatingFee = false);
+      if (mounted) setState(() => isCalculatingFee = false);
     }
   }
 
   double get total => subtotal + deliveryFee;
+
+  String _formatFee(double amount) {
+    if (amount == 0) return '0';
+    return amount.toStringAsFixed(2);
+  }
 
   Future<void> _processCheckout(String method) async {
     _updateFullAddress();
@@ -354,71 +641,69 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
         phoneController.text.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-            content: Text(
-                'Please fill in all recipient, contact and location choices.')),
+            content: Text('Please fill in all recipient, contact and location choices.')),
       );
       return;
+    }
+
+    if (sendAsGift && (_recipientLat == null || _recipientLng == null)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text(
+                'Please search and select the recipient\'s exact delivery address using the suggestions below the street field.')),
+      );
+      return;
+    }
+
+    if (method == 'cod') {
+      if (sendAsGift) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+              content: Text('Cash on Delivery isn\'t available for gift orders. Please choose GCash or Maya.')),
+        );
+        return;
+      }
+      if (isCodRestricted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(restrictionReason.isNotEmpty
+                ? restrictionReason
+                : 'Cash-on-Delivery is disabled for your account due to fraud risk rating.'),
+          ),
+        );
+        return;
+      }
     }
 
     setState(() => isLoading = true);
     final user = FirebaseAuth.instance.currentUser;
 
     try {
-      // Simulate real-time security telemetry: if gift checked, flag fraud validation
-      if (sendAsGift && user != null) {
-        try {
-          await FirebaseFirestore.instance
-              .collection('users')
-              .doc(user.uid)
-              .set({
-            'fraudScore': 85,
-            'isFraud': true,
-            'censoredName':
-                recipientController.text.replaceAll(RegExp(r'.'), '*'),
-          }, SetOptions(merge: true));
-          debugPrint(
-              "Real-time telemetry: gift order detected, updated customer safety metrics on active node.");
-        } catch (e) {
-          debugPrint("Failed to set security telemetry: $e");
-        }
-      }
+      final branchId = InventoryData.selectedBranchId ?? 'main_branch';
 
-      final Map<String, dynamic> orderPayload = {
-        'userId': user?.uid,
-        'recipientName': recipientController.text,
-        'deliveryAddress': addressController.text,
-        'recipientPhone': phoneController.text,
-        'notes': notesController.text,
-        'items': widget.cartItems,
-        'totalAmount': total,
-        'deliveryFee': deliveryFee,
-        'occasion': widget.occasion,
-        'is_gift': sendAsGift,
-        'isGift': sendAsGift,
-        'type': 'MOBILE',
-        'orderType': 'MOBILE_CATALOG',
-      };
-
-      if (method == 'cod' && isCodRestricted) {
-        throw restrictionReason.isNotEmpty
-            ? restrictionReason
-            : 'Cash-on-Delivery is disabled for your account due to fraud risk rating.';
-      }
-
-      if (method == 'paymongo') {
+      if (method == 'gcash' || method == 'maya') {
         final checkoutUrl = await PaymentService.createCheckoutSession(
           amount: total,
           description: '${widget.occasion} - Flower Delivery',
           customerEmail: user?.email ?? 'customer@example.com',
           customerName: user?.displayName ?? recipientController.text,
+          restrictToPaymentMethod: method == 'maya' ? 'paymaya' : 'gcash',
         );
 
-        orderPayload['paymentMethod'] = 'paymongo';
-        orderPayload['paymentStatus'] = 'awaiting_payment';
-        orderPayload['status'] = 'Processing';
-        orderPayload['checkoutUrl'] = checkoutUrl;
-
-        await InventoryData.placeOrder(orderPayload);
+        await _orderSubmissionService.submitOrder(
+          name: recipientController.text,
+          phone: phoneController.text,
+          address: addressController.text,
+          items: widget.cartItems,
+          subtotal: subtotal,
+          shippingFee: deliveryFee,
+          paymentMethod: method,
+          branchId: branchId,
+          email: user?.email,
+          isGift: sendAsGift,
+          customerLat: _customerLat,
+          customerLng: _customerLng,
+        );
 
         final url = Uri.parse(checkoutUrl);
         if (await canLaunchUrl(url)) {
@@ -427,12 +712,22 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
           throw 'Could not launch payment portal';
         }
       } else {
-        // COD
-        orderPayload['paymentMethod'] = 'cod';
-        orderPayload['paymentStatus'] = 'unpaid';
-        orderPayload['status'] = 'Order Placed';
+        final result = await _orderSubmissionService.submitOrder(
+          name: recipientController.text,
+          phone: phoneController.text,
+          address: addressController.text,
+          items: widget.cartItems,
+          subtotal: subtotal,
+          shippingFee: deliveryFee,
+          paymentMethod: 'cod',
+          branchId: branchId,
+          email: user?.email,
+          isGift: sendAsGift,
+          customerLat: _customerLat,
+          customerLng: _customerLng,
+        );
 
-        await InventoryData.placeOrder(orderPayload);
+        debugPrint('Order placed: ${result.invoiceId} (${result.orderId})');
 
         if (mounted) {
           Navigator.push(
@@ -441,12 +736,23 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
           );
         }
       }
+    } on OrderSubmissionException catch (e) {
+      String message = e.message;
+      if (e.code == 'RESTRICTED') {
+        message =
+        '$message\n\nPhone verification is required to lift this restriction — this flow isn\'t available in the app yet. Please contact support.';
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(message), backgroundColor: Colors.redAccent),
+        );
+      }
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Checkout failed: $e')),
       );
     } finally {
-      setState(() => isLoading = false);
+      if (mounted) setState(() => isLoading = false);
     }
   }
 
@@ -454,18 +760,6 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
-
-    // Get lists for nested location selectors
-    List<String> regions = locationHierarchy.keys.toList();
-    List<String> provinces = selectedRegion != null
-        ? locationHierarchy[selectedRegion]!.keys.toList()
-        : [];
-    List<String> cities = selectedProvince != null
-        ? locationHierarchy[selectedRegion]![selectedProvince]!.keys.toList()
-        : [];
-    List<String> barangays = selectedCity != null
-        ? locationHierarchy[selectedRegion]![selectedProvince]![selectedCity]!
-        : [];
 
     return Scaffold(
       appBar: AppBar(
@@ -482,172 +776,222 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            _buildSectionHeader('Recipient Information'),
-            const SizedBox(height: 16),
-            TextField(
-              controller: recipientController,
-              decoration:
-                  _inputDecoration('Recipient Name', Icons.person_outline),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: phoneController,
-              decoration: _inputDecoration(
-                  'Phone Number', Icons.phone_android_outlined),
-              keyboardType: TextInputType.phone,
-            ),
-
-            const SizedBox(height: 24),
-            _buildSectionHeader('Delivery Location (Hierarchical)'),
-            const SizedBox(height: 16),
-
-            // Region Selector
-            DropdownButtonFormField<String>(
-              value: selectedRegion,
-              decoration: _inputDecoration('Select Region', Icons.map_outlined),
-              items: regions
-                  .map((r) => DropdownMenuItem(value: r, child: Text(r)))
-                  .toList(),
-              onChanged: (val) {
-                setState(() {
-                  selectedRegion = val;
-                  selectedProvince = null;
-                  selectedCity = null;
-                  selectedBarangay = null;
-                  _updateFullAddress();
-                });
-              },
-            ),
-            const SizedBox(height: 12),
-
-            // Province Selector
-            DropdownButtonFormField<String>(
-              value: selectedProvince,
-              decoration:
-                  _inputDecoration('Select Province', Icons.explore_outlined),
-              items: provinces
-                  .map((p) => DropdownMenuItem(value: p, child: Text(p)))
-                  .toList(),
-              onChanged: selectedRegion == null
-                  ? null
-                  : (val) {
-                      setState(() {
-                        selectedProvince = val;
-                        selectedCity = null;
-                        selectedBarangay = null;
-                        _updateFullAddress();
-                      });
-                    },
-            ),
-            const SizedBox(height: 12),
-
-            // City/Municipality Selector
-            DropdownButtonFormField<String>(
-              value: selectedCity,
-              decoration: _inputDecoration(
-                  'Select City/Municipality', Icons.location_city_outlined),
-              items: cities
-                  .map((c) => DropdownMenuItem(value: c, child: Text(c)))
-                  .toList(),
-              onChanged: selectedProvince == null
-                  ? null
-                  : (val) {
-                      setState(() {
-                        selectedCity = val;
-                        selectedBarangay = null;
-
-                        // Auto-fill postal code
-                        if (val != null && postalCodes.containsKey(val)) {
-                          postalCodeController.text = postalCodes[val]!;
-                        } else {
-                          postalCodeController.clear();
-                        }
-
-                        _updateFullAddress();
-
-                        // Auto recalculate delivery fee based on city coords
-                        _calculateDeliveryFee();
-                      });
-                    },
-            ),
-            const SizedBox(height: 12),
-
-            // Barangay Selector
-            DropdownButtonFormField<String>(
-              value: selectedBarangay,
-              decoration:
-                  _inputDecoration('Select Barangay', Icons.home_work_outlined),
-              items: barangays
-                  .map((b) => DropdownMenuItem(value: b, child: Text(b)))
-                  .toList(),
-              onChanged: selectedCity == null
-                  ? null
-                  : (val) {
-                      setState(() {
-                        selectedBarangay = val;
-                        _updateFullAddress();
-                      });
-                    },
-            ),
-            const SizedBox(height: 12),
-
-            // Postal Code Field
-            TextField(
-              controller: postalCodeController,
-              decoration: _inputDecoration(
-                  'Postal Code', Icons.local_post_office_outlined),
-              keyboardType: TextInputType.number,
-            ),
-            const SizedBox(height: 12),
-
-            // Street / Detailed Address Field (Manual Typing)
-            TextField(
-              controller: streetController,
-              decoration: _inputDecoration(
-                  'Street Name, Building, House No.', Icons.edit_road_outlined),
-              maxLines: 2,
-            ),
-
-            const SizedBox(height: 16),
-            // Full Assembled Address Card View
-            if (addressController.text.isNotEmpty)
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: const Color(0xFFFFFDF7),
-                  borderRadius: BorderRadius.circular(16),
-                  border: Border.all(
-                      color: const Color(0xFFF4B400).withOpacity(0.2)),
+            _sectionCard(
+              context,
+              title: 'Recipient Information',
+              children: [
+                _polishedField(
+                  context: context,
+                  controller: recipientController,
+                  label: 'Recipient Name',
+                  icon: Icons.person_outline,
                 ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'DELIVERY SUMMARY LABEL',
-                      style: TextStyle(
-                          fontSize: 9,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.grey,
-                          letterSpacing: 1),
-                    ),
-                    const SizedBox(height: 6),
-                    Text(
-                      addressController.text,
-                      style: const TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w600,
-                          height: 1.4),
-                    ),
-                  ],
+                const SizedBox(height: 14),
+                _polishedField(
+                  context: context,
+                  controller: phoneController,
+                  label: 'Phone Number',
+                  icon: Icons.phone_android_outlined,
+                  keyboardType: TextInputType.phone,
                 ),
-              ),
+              ],
+            ),
+
+            const SizedBox(height: 20),
+
+            _sectionCard(
+              context,
+              title: 'Gift Checkout',
+              children: [
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: Text(
+                    "Send this order as a gift",
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 14,
+                      color: isDark ? Colors.white : Colors.black87,
+                    ),
+                  ),
+                  subtitle: Text(
+                    sendAsGift
+                        ? "You'll need to search and confirm the recipient's exact address below. Cash on Delivery is unavailable for gifts."
+                        : "Recipient contact details will be kept secure.",
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: isDark ? Colors.grey[400] : Colors.grey[600],
+                    ),
+                  ),
+                  value: sendAsGift,
+                  activeColor: const Color(0xFFF4B400),
+                  onChanged: (val) {
+                    setState(() {
+                      sendAsGift = val;
+                      _recipientLat = null;
+                      _recipientLng = null;
+                      distanceKm = 0;
+                      deliveryFee = 0;
+                      nearestBranchName = '';
+                      if (val && selectedPaymentMethod == 'cod') {
+                        selectedPaymentMethod = 'gcash';
+                      }
+                    });
+                  },
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 20),
+
+            _sectionCard(
+              context,
+              title: 'Delivery Location',
+              children: [
+                _psgcDropdown<PsgcItem>(
+                  context: context,
+                  label: 'Select Region',
+                  icon: Icons.map_outlined,
+                  value: selectedRegionCode,
+                  items: _regions,
+                  isLoading: _isLoadingRegions,
+                  onChanged: (item) => item != null ? _onRegionSelected(item) : null,
+                ),
+                const SizedBox(height: 14),
+                if (!_isMetroManilaSelected) ...[
+                  _psgcDropdown<PsgcItem>(
+                    context: context,
+                    label: 'Select Province',
+                    icon: Icons.explore_outlined,
+                    value: selectedProvinceCode,
+                    items: _provinces,
+                    isLoading: _isLoadingProvinces,
+                    enabled: selectedRegionCode != null,
+                    onChanged: (item) => item != null ? _onProvinceSelected(item) : null,
+                  ),
+                  const SizedBox(height: 14),
+                ],
+                _psgcDropdown<PsgcItem>(
+                  context: context,
+                  label: 'Select City/Municipality',
+                  icon: Icons.location_city_outlined,
+                  value: selectedCityCode,
+                  items: _cities,
+                  isLoading: _isLoadingCities,
+                  enabled: _cities.isNotEmpty,
+                  onChanged: (item) => item != null ? _onCitySelected(item) : null,
+                ),
+                const SizedBox(height: 14),
+                _psgcDropdown<PsgcItem>(
+                  context: context,
+                  label: 'Select Barangay',
+                  icon: Icons.home_work_outlined,
+                  value: selectedBarangayName,
+                  items: _barangays,
+                  isLoading: _isLoadingBarangays,
+                  enabled: selectedCityCode != null,
+                  useNameAsValue: true,
+                  onChanged: (item) {
+                    if (item == null) return;
+                    setState(() {
+                      selectedBarangayName = item.name;
+                      _updateFullAddress();
+                    });
+                  },
+                ),
+                const SizedBox(height: 14),
+                _polishedField(
+                  context: context,
+                  controller: postalCodeController,
+                  label: 'Postal Code',
+                  icon: Icons.local_post_office_outlined,
+                  keyboardType: TextInputType.number,
+                ),
+                const SizedBox(height: 14),
+                _polishedField(
+                  context: context,
+                  controller: streetController,
+                  label: sendAsGift
+                      ? 'Search recipient\'s Street / Building / House No.'
+                      : 'Street Name, Building, House No.',
+                  icon: Icons.edit_road_outlined,
+                  maxLines: 2,
+                  suffixIcon: _isSearchingStreet
+                      ? const Padding(
+                    padding: EdgeInsets.all(14),
+                    child: SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2)),
+                  )
+                      : null,
+                ),
+                if (_streetSuggestions.isNotEmpty)
+                  Container(
+                    margin: const EdgeInsets.only(top: 8),
+                    decoration: BoxDecoration(
+                      color: isDark ? const Color(0xFF262626) : Colors.white,
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(
+                          color: isDark
+                              ? Colors.white.withOpacity(0.1)
+                              : Colors.grey.withOpacity(0.2)),
+                      boxShadow: [
+                        BoxShadow(
+                            color: Colors.black.withOpacity(isDark ? 0.2 : 0.06),
+                            blurRadius: 10,
+                            offset: const Offset(0, 4)),
+                      ],
+                    ),
+                    child: Column(
+                      children: _streetSuggestions
+                          .map((s) => ListTile(
+                        dense: true,
+                        leading: const Icon(Icons.location_on_outlined,
+                            color: Color(0xFFF4B400), size: 20),
+                        title: Text(s.displayName,
+                            style: TextStyle(
+                                fontSize: 12,
+                                color: isDark ? Colors.white : Colors.black87),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis),
+                        onTap: () => _onStreetSuggestionSelected(s),
+                      ))
+                          .toList(),
+                    ),
+                  ),
+                if (sendAsGift && _recipientLat != null)
+                  Container(
+                    margin: const EdgeInsets.only(top: 10),
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: Colors.green.withOpacity(isDark ? 0.15 : 0.08),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: const Row(
+                      children: [
+                        Icon(Icons.check_circle, color: Colors.green, size: 16),
+                        SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Recipient address confirmed for delivery.',
+                            style: TextStyle(fontSize: 11, color: Colors.green),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+              ],
+            ),
 
             const SizedBox(height: 16),
+            _buildLocationMap(context),
+            const SizedBox(height: 12),
+
             if (nearestBranchName.isNotEmpty)
               Container(
                 padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(
-                  color: Colors.blue.withOpacity(0.05),
+                  color: Colors.blue.withOpacity(isDark ? 0.12 : 0.05),
                   borderRadius: BorderRadius.circular(12),
                   border: Border.all(color: Colors.blue.withOpacity(0.2)),
                 ),
@@ -659,23 +1003,22 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(
-                            'Nearest Branch: $nearestBranchName',
-                            style: const TextStyle(
-                                fontWeight: FontWeight.bold, fontSize: 13),
-                          ),
+                          Text('Nearest Branch: $nearestBranchName',
+                              style: TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 13,
+                                  color: isDark ? Colors.white : Colors.black87)),
                           Text(
                             isUsingRealRoadDistance
                                 ? 'Google Maps Road Distance: ${distanceKm.toStringAsFixed(1)} KM'
                                 : 'Est. Road Distance: ${distanceKm.toStringAsFixed(1)} KM',
                             style: TextStyle(
-                                color: isUsingRealRoadDistance
-                                    ? Colors.green[700]
-                                    : Colors.grey[600],
-                                fontSize: 12,
-                                fontWeight: isUsingRealRoadDistance
-                                    ? FontWeight.bold
-                                    : FontWeight.normal),
+                              color: isUsingRealRoadDistance
+                                  ? Colors.green[isDark ? 300 : 700]
+                                  : (isDark ? Colors.grey[400] : Colors.grey[600]),
+                              fontSize: 12,
+                              fontWeight: isUsingRealRoadDistance ? FontWeight.bold : FontWeight.normal,
+                            ),
                           ),
                         ],
                       ),
@@ -683,146 +1026,362 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
                   ],
                 ),
               ),
+
             const SizedBox(height: 8),
-            TextButton.icon(
-              onPressed: isCalculatingFee ? null : _calculateDeliveryFee,
-              icon: isCalculatingFee
-                  ? const SizedBox(
-                      width: 16,
-                      height: 16,
-                      child: CircularProgressIndicator(strokeWidth: 2))
-                  : const Icon(Icons.my_location),
-              label: Text(distanceKm > 0
-                  ? 'Recalculate Fee'
-                  : 'Get Current Location for Delivery Fee'),
-            ),
-
-            const SizedBox(height: 24),
-            _buildSectionHeader('Gift Checkout Details'),
-            const SizedBox(height: 8),
-
-            Card(
-              elevation: 0,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(16),
-                side: BorderSide(color: Colors.grey.withOpacity(0.2)),
+            if (!sendAsGift)
+              TextButton.icon(
+                onPressed: isCalculatingFee || isAutoFillingAddress
+                    ? null
+                    : _handleGetCurrentLocation,
+                icon: (isCalculatingFee || isAutoFillingAddress)
+                    ? const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.my_location),
+                label: const Text('Get Current Location'),
               ),
-              child: SwitchListTile(
-                title: const Text(
-                  "Send this order as a gift",
-                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
-                ),
-                subtitle: const Text(
-                  "Recipient contact details will be kept secure. Custom security checks will be triggered.",
-                  style: TextStyle(fontSize: 11),
-                ),
-                value: sendAsGift,
-                activeColor: const Color(0xFFF4B400),
-                onChanged: (val) {
-                  setState(() {
-                    sendAsGift = val;
-                  });
-                },
-              ),
-            ),
 
-            const SizedBox(height: 24),
-            _buildSectionHeader('Order Notes'),
             const SizedBox(height: 12),
-            TextField(
-              controller: notesController,
-              decoration: _inputDecoration(
-                  'Specific instructions (Optional)', Icons.notes),
-              maxLines: 3,
-            ),
-            const SizedBox(height: 32),
-            _buildOrderSummary(),
-            const SizedBox(height: 32),
-            if (isLoading)
-              const Center(
-                  child: CircularProgressIndicator(color: Color(0xFFF4B400)))
-            else ...[
-              ElevatedButton(
-                onPressed: () => _processCheckout('paymongo'),
-                style: _actionButtonStyle(Colors.blue[700]!),
-                child: const Text('PAY WITH GCASH / MAYA'),
-              ),
-              const SizedBox(height: 12),
-              OutlinedButton(
-                onPressed:
-                    isCodRestricted ? null : () => _processCheckout('cod'),
-                style: _outlinedButtonStyle(),
-                child: Text(isCodRestricted
-                    ? 'COD RESTRICTED (RISK LEVEL 50-86%)'
-                    : 'CASH ON DELIVERY'),
-              ),
-              if (isCodRestricted)
-                Padding(
-                  padding: const EdgeInsets.only(top: 8.0),
-                  child: Text(
-                    restrictionReason,
-                    style: const TextStyle(
-                        fontSize: 11,
-                        color: Colors.red,
-                        fontWeight: FontWeight.bold),
-                    textAlign: TextAlign.center,
-                  ),
+
+            _sectionCard(
+              context,
+              title: 'Order Notes',
+              children: [
+                _polishedField(
+                  context: context,
+                  controller: notesController,
+                  label: 'Specific instructions (Optional)',
+                  icon: Icons.notes,
+                  maxLines: 3,
                 ),
-            ],
+              ],
+            ),
+
+            const SizedBox(height: 20),
+
+            _sectionCard(
+              context,
+              title: 'Payment Method',
+              children: [
+                DropdownButtonFormField<String>(
+                  value: selectedPaymentMethod,
+                  dropdownColor: isDark ? const Color(0xFF262626) : Colors.white,
+                  style: TextStyle(color: isDark ? Colors.white : Colors.black87, fontSize: 14),
+                  decoration: _fieldDecoration(context, 'Select Payment Method', Icons.payment_outlined),
+                  items: [
+                    const DropdownMenuItem(value: 'gcash', child: Text('GCash')),
+                    const DropdownMenuItem(value: 'maya', child: Text('Maya')),
+                    DropdownMenuItem(
+                      value: 'cod',
+                      enabled: !isCodRestricted && !sendAsGift,
+                      child: Text(
+                        sendAsGift
+                            ? 'Cash on Delivery (unavailable for gifts)'
+                            : isCodRestricted
+                            ? 'Cash on Delivery (Restricted)'
+                            : 'Cash on Delivery',
+                        style: TextStyle(
+                          color: (isCodRestricted || sendAsGift) ? Colors.grey : null,
+                        ),
+                      ),
+                    ),
+                  ],
+                  onChanged: (val) {
+                    if (val == null) return;
+                    if (val == 'cod' && (isCodRestricted || sendAsGift)) return;
+                    setState(() => selectedPaymentMethod = val);
+                  },
+                ),
+                if (isCodRestricted && !sendAsGift)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8.0),
+                    child: Text(
+                      restrictionReason,
+                      style: const TextStyle(fontSize: 11, color: Colors.red, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+              ],
+            ),
+
+            const SizedBox(height: 24),
+            _buildOrderSummary(context),
+            const SizedBox(height: 28),
+
+            if (isLoading)
+              const Center(child: CircularProgressIndicator(color: Color(0xFFF4B400)))
+            else
+              SizedBox(
+                height: 58,
+                child: ElevatedButton(
+                  onPressed: () => _processCheckout(selectedPaymentMethod),
+                  style: _actionButtonStyle(const Color(0xFFF4B400)),
+                  child: const Text('PLACE ORDER',
+                      style: TextStyle(fontWeight: FontWeight.w800, letterSpacing: 1)),
+                ),
+              ),
+          ],
+        ),
+      )
+          .animate()
+          .fadeIn(duration: 400.ms, curve: Curves.easeOut)
+          .slideX(begin: -0.15, end: 0, duration: 400.ms, curve: Curves.easeOut),
+    );
+  }
+
+  Widget _sectionCard(BuildContext context, {required String title, required List<Widget> children}) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(
+            color: isDark ? Colors.white.withOpacity(0.08) : Colors.grey.withOpacity(0.12)),
+        boxShadow: [
+          BoxShadow(
+              color: Colors.black.withOpacity(isDark ? 0.3 : 0.03),
+              blurRadius: 14,
+              offset: const Offset(0, 6)),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text(
+            title.toUpperCase(),
+            style: TextStyle(
+                fontWeight: FontWeight.bold,
+                letterSpacing: 1.3,
+                fontSize: 11,
+                color: isDark ? Colors.grey[400] : Colors.grey),
+          ),
+          const SizedBox(height: 14),
+          ...children,
+        ],
+      ),
+    );
+  }
+
+  Widget _polishedField({
+    required BuildContext context,
+    required TextEditingController controller,
+    required String label,
+    required IconData icon,
+    TextInputType keyboardType = TextInputType.text,
+    int maxLines = 1,
+    Widget? suffixIcon,
+  }) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    return TextField(
+      controller: controller,
+      keyboardType: keyboardType,
+      maxLines: maxLines,
+      style: TextStyle(color: isDark ? Colors.white : Colors.black87),
+      decoration: _fieldDecoration(context, label, icon).copyWith(suffixIcon: suffixIcon),
+    );
+  }
+
+  InputDecoration _fieldDecoration(BuildContext context, String label, IconData icon) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    return InputDecoration(
+      labelText: label,
+      labelStyle: TextStyle(color: isDark ? Colors.grey[500] : Colors.grey[600], fontSize: 13),
+      prefixIcon: Icon(icon, color: const Color(0xFFF4B400), size: 20),
+      filled: true,
+      fillColor: isDark ? const Color(0xFF2A2A2A) : const Color(0xFFF8F8F6),
+      border: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(16),
+        borderSide: BorderSide.none,
+      ),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(16),
+        borderSide: BorderSide.none,
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(16),
+        borderSide: const BorderSide(color: Color(0xFFF4B400), width: 1.5),
+      ),
+      contentPadding: const EdgeInsets.symmetric(vertical: 18, horizontal: 18),
+    );
+  }
+
+  Widget _psgcDropdown<T extends PsgcItem>({
+    required BuildContext context,
+    required String label,
+    required IconData icon,
+    required String? value,
+    required List<T> items,
+    required bool isLoading,
+    required void Function(T?) onChanged,
+    bool enabled = true,
+    bool useNameAsValue = false,
+  }) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    return DropdownButtonFormField<String>(
+      value: value,
+      isExpanded: true,
+      dropdownColor: isDark ? const Color(0xFF262626) : Colors.white,
+      style: TextStyle(color: isDark ? Colors.white : Colors.black87, fontSize: 14),
+      decoration: _fieldDecoration(context, label, icon).copyWith(
+        suffixIcon: isLoading
+            ? const Padding(
+          padding: EdgeInsets.all(14),
+          child: SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+        )
+            : null,
+      ),
+      items: items
+          .map((item) => DropdownMenuItem<String>(
+        value: useNameAsValue ? item.name : item.code,
+        child: Text(item.name, overflow: TextOverflow.ellipsis),
+      ))
+          .toList(),
+      onChanged: (enabled && !isLoading)
+          ? (selectedValue) {
+        final match = items.firstWhere(
+              (item) => (useNameAsValue ? item.name : item.code) == selectedValue,
+        );
+        onChanged(match as T);
+      }
+          : null,
+    );
+  }
+
+  Widget _buildLocationMap(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final destLat = sendAsGift ? _recipientLat : _customerLat;
+    final destLng = sendAsGift ? _recipientLng : _customerLng;
+    final hasCoordinates = destLat != null && destLng != null && _branchLat != null && _branchLng != null;
+
+    if (!hasCoordinates) {
+      return Container(
+        height: 200,
+        width: double.infinity,
+        decoration: BoxDecoration(
+          color: isDark ? Colors.white.withOpacity(0.04) : Colors.grey.withOpacity(0.06),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+              color: isDark ? Colors.white.withOpacity(0.08) : Colors.grey.withOpacity(0.15)),
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.map_outlined, size: 36, color: const Color(0xFFF4B400).withOpacity(0.6)),
+            const SizedBox(height: 8),
+            Text(
+              sendAsGift
+                  ? 'Search and select the recipient\'s address to see the route'
+                  : 'Your delivery route will appear here',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                  fontSize: 12,
+                  color: isDark ? Colors.grey[500] : Colors.grey[500],
+                  fontWeight: FontWeight.w600),
+            ),
+          ],
+        ),
+      );
+    }
+
+    final destinationPoint = LatLng(destLat, destLng);
+    final branchPoint = LatLng(_branchLat!, _branchLng!);
+    final bounds = LatLngBounds.fromPoints([destinationPoint, branchPoint]);
+
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(20),
+      child: SizedBox(
+        height: 200,
+        child: Stack(
+          children: [
+            FlutterMap(
+              options: MapOptions(
+                initialCameraFit: CameraFit.bounds(bounds: bounds, padding: const EdgeInsets.all(48)),
+                interactionOptions:
+                const InteractionOptions(flags: InteractiveFlag.pinchZoom | InteractiveFlag.drag),
+              ),
+              children: [
+                TileLayer(
+                  urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                  userAgentPackageName: 'com.bloominous.app',
+                ),
+                PolylineLayer(
+                  polylines: [
+                    Polyline(points: [destinationPoint, branchPoint], color: const Color(0xFFF4B400), strokeWidth: 3),
+                  ],
+                ),
+                MarkerLayer(
+                  markers: [
+                    Marker(
+                      point: destinationPoint,
+                      width: 40,
+                      height: 40,
+                      child: _mapPin(
+                          sendAsGift ? Icons.card_giftcard_rounded : Icons.person_pin_circle_rounded,
+                          const Color(0xFF121212)),
+                    ),
+                    Marker(
+                      point: branchPoint,
+                      width: 40,
+                      height: 40,
+                      child: _mapPin(Icons.storefront_rounded, const Color(0xFFF4B400)),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+            Positioned(
+              right: 6,
+              bottom: 4,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(color: Colors.white.withOpacity(0.8), borderRadius: BorderRadius.circular(4)),
+                child: const Text('© OpenStreetMap contributors', style: TextStyle(fontSize: 8, color: Colors.black54)),
+              ),
+            ),
           ],
         ),
       ),
     );
   }
 
-  InputDecoration _inputDecoration(String label, IconData icon) {
-    return InputDecoration(
-      labelText: label,
-      prefixIcon: Icon(icon, color: const Color(0xFF121212), size: 20),
-      border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-      filled: true,
-      fillColor: Colors.grey.withOpacity(0.03),
-      contentPadding: const EdgeInsets.symmetric(vertical: 18, horizontal: 20),
+  Widget _mapPin(IconData icon, Color color) {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        shape: BoxShape.circle,
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.2), blurRadius: 6, offset: const Offset(0, 2))],
+      ),
+      padding: const EdgeInsets.all(6),
+      child: Icon(icon, color: color, size: 20),
     );
   }
 
-  Widget _buildSectionHeader(String title) {
-    return Text(
-      title.toUpperCase(),
-      style: const TextStyle(
-          fontWeight: FontWeight.bold,
-          letterSpacing: 1.5,
-          fontSize: 11,
-          color: Colors.grey),
-    );
-  }
-
-  Widget _buildOrderSummary() {
+  Widget _buildOrderSummary(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
     return Container(
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
-        color: Colors.grey.withOpacity(0.05),
-        borderRadius: BorderRadius.circular(16),
-      ),
+          color: isDark ? Colors.white.withOpacity(0.04) : Colors.grey.withOpacity(0.05),
+          borderRadius: BorderRadius.circular(18)),
       child: Column(
         children: [
-          _summaryRow('Subtotal', subtotal),
+          _summaryRow(context, 'Subtotal', subtotal.toStringAsFixed(2)),
           _summaryRow(
-              distanceKm > 0
-                  ? 'Delivery Fee (${distanceKm.toStringAsFixed(1)}km)'
-                  : 'Delivery Fee',
-              deliveryFee),
-          const Divider(height: 24),
+            context,
+            distanceKm > 0 ? 'Delivery Fee (${distanceKm.toStringAsFixed(1)}km × ₱1)' : 'Delivery Fee',
+            _formatFee(deliveryFee),
+          ),
+          Divider(height: 24, color: isDark ? Colors.white.withOpacity(0.1) : null),
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              const Text('TOTAL',
-                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+              Text('TOTAL',
+                  style: TextStyle(
+                      fontWeight: FontWeight.bold, fontSize: 18, color: isDark ? Colors.white : Colors.black)),
               Text('₱${total.toStringAsFixed(2)}',
-                  style: const TextStyle(
-                      fontWeight: FontWeight.bold,
-                      fontSize: 18,
-                      color: Colors.green)),
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: Colors.green)),
             ],
           ),
         ],
@@ -830,14 +1389,15 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
     );
   }
 
-  Widget _summaryRow(String label, double amount) {
+  Widget _summaryRow(BuildContext context, String label, String formattedAmount) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Text(label, style: const TextStyle(color: Colors.grey)),
-          Text('₱${amount.toStringAsFixed(2)}'),
+          Text(label, style: TextStyle(color: isDark ? Colors.grey[400] : Colors.grey)),
+          Text('₱$formattedAmount', style: TextStyle(color: isDark ? Colors.white : Colors.black87)),
         ],
       ),
     );
@@ -846,18 +1406,9 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
   ButtonStyle _actionButtonStyle(Color color) {
     return ElevatedButton.styleFrom(
       backgroundColor: color,
-      foregroundColor: Colors.white,
-      padding: const EdgeInsets.symmetric(vertical: 16),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      foregroundColor: const Color(0xFF121212),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       elevation: 0,
-    );
-  }
-
-  ButtonStyle _outlinedButtonStyle() {
-    return OutlinedButton.styleFrom(
-      padding: const EdgeInsets.symmetric(vertical: 16),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      side: const BorderSide(color: Colors.black12),
     );
   }
 }

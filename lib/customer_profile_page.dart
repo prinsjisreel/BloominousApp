@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'inventory_data.dart';
 import 'my_orders_page.dart';
+import 'order_tracking_page.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 
@@ -33,19 +34,16 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
     if (mounted) setState(() => _isRecovering = true);
 
     try {
-      // 1. Check if the current doc exists in customers
       final doc =
-          await firestore.collection('customers').doc(widget.customerId).get();
+      await firestore.collection('customers').doc(widget.customerId).get();
       bool foundSomething = false;
       int recoveredPoints = 0;
 
-      // 2. Search for old records by email (both exact and lowercase variants)
       final emailLower = widget.email.toLowerCase();
       final emailOriginal = widget.email.trim();
       final List<String> searchEmails = {emailLower, emailOriginal}.toList();
 
       for (final email in searchEmails) {
-        // Check customers collection
         final customerQuery = await firestore
             .collection('customers')
             .where('email', isEqualTo: email)
@@ -60,7 +58,6 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
           }
         }
 
-        // Check legacy loyalty_points collection
         final loyaltyQuery = await firestore
             .collection('loyalty_points')
             .where('email', isEqualTo: email)
@@ -79,7 +76,6 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
         }
       }
 
-      // 3. Update or Create current document
       if (doc.exists) {
         if (foundSomething && recoveredPoints > 0) {
           await firestore
@@ -91,7 +87,6 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
           });
         }
       } else {
-        // Create new doc if it didn't exist
         await firestore.collection('customers').doc(widget.customerId).set({
           'name': 'Floral Enthusiast',
           'email': widget.email,
@@ -100,15 +95,14 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
           'lastLogin': FieldValue.serverTimestamp(),
           'lastRecovery': FieldValue.serverTimestamp(),
         }, SetOptions(merge: true));
-        foundSomething =
-            true; // Mark as found because we created a new doc to fix the error UI
+        foundSomething = true;
       }
 
       if (mounted) {
         String msg = foundSomething
             ? (recoveredPoints > 0
-                ? 'Success! $recoveredPoints points synchronized.'
-                : 'Account synchronized successfully.')
+            ? 'Success! $recoveredPoints points synchronized.'
+            : 'Account synchronized successfully.')
             : 'Your account is already up to date.';
 
         ScaffoldMessenger.of(context).showSnackBar(
@@ -166,7 +160,6 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
           return CustomScrollView(
             physics: const BouncingScrollPhysics(),
             slivers: [
-              // Modern Header with "Hello"
               SliverAppBar(
                 expandedHeight: 140.0,
                 floating: false,
@@ -182,9 +175,7 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
                   IconButton(
                     icon: Icon(Icons.settings_outlined,
                         color: isDark ? Colors.white : Colors.black, size: 24),
-                    onPressed: () {
-                      // Settings action
-                    },
+                    onPressed: () {},
                   ),
                 ],
                 flexibleSpace: FlexibleSpaceBar(
@@ -265,7 +256,6 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
                           ),
                         ),
                       ],
-                      // Premium Membership Card
                       Container(
                         width: double.infinity,
                         padding: const EdgeInsets.all(32),
@@ -375,7 +365,10 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
 
                       const SizedBox(height: 32),
 
-                      // Details Section
+                      _buildOrderTrackingRow(context, widget.customerId),
+
+                      const SizedBox(height: 32),
+
                       _buildOptionTile(
                         context,
                         icon: Icons.phone_outlined,
@@ -388,14 +381,14 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
                           icon: Icons.shopping_bag_outlined,
                           label: 'Order History',
                           value: 'View your previous bouquets', onTap: () {
-                        Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                            builder: (context) => MyOrdersPage(
-                                userId: widget.customerId, email: widget.email),
-                          ),
-                        );
-                      }),
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (context) => MyOrdersPage(
+                                    userId: widget.customerId, email: widget.email),
+                              ),
+                            );
+                          }),
                       const SizedBox(height: 16),
                       _buildOptionTile(
                         context,
@@ -407,7 +400,6 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
 
                       const SizedBox(height: 48),
 
-                      // Sign Out
                       TextButton.icon(
                         onPressed: () async {
                           await FirebaseAuth.instance.signOut();
@@ -440,11 +432,183 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
     );
   }
 
+  Widget _buildOrderTrackingRow(BuildContext context, String customerId) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    return StreamBuilder<QuerySnapshot>(
+      stream: FirebaseFirestore.instance
+          .collection('orders')
+          .where('user_id', isEqualTo: customerId)
+          .snapshots(),
+      builder: (context, snapshot) {
+        int toPay = 0, toShip = 0, toDeliver = 0, toRate = 0;
+
+        if (snapshot.hasData) {
+          for (final doc in snapshot.data!.docs) {
+            final data = doc.data() as Map<String, dynamic>;
+            final status = (data['status'] ?? '').toString().toLowerCase();
+            final paymentStatus =
+            (data['paymentStatus'] ?? '').toString().toLowerCase();
+            final paymentMethod = (data['payment_method'] ??
+                data['paymentMethod'] ??
+                '')
+                .toString()
+                .toLowerCase();
+
+            if (status == 'cancelled') continue;
+
+            final items = (data['items'] as List?) ?? [];
+            final itemCount = items.fold<int>(0, (sum, item) {
+              if (item is! Map) return sum + 1;
+              final qty = item['qty'] ?? item['quantity'] ?? 1;
+              final parsedQty = (qty is num) ? qty.toInt() : 1;
+              return sum + parsedQty;
+            });
+
+            if (status == 'delivered' || status == 'completed') {
+              toRate += itemCount;
+            } else if (status == 'shipped' || status == 'out_for_delivery') {
+              toDeliver += itemCount;
+            } else {
+              final isOnlinePayment =
+              ['gcash', 'maya', 'paymaya', 'paymongo'].contains(paymentMethod);
+              final paymentUnresolved = paymentStatus.contains('pending') ||
+                  paymentStatus.contains('awaiting');
+              if (isOnlinePayment && paymentUnresolved) {
+                toPay += itemCount;
+              } else {
+                toShip += itemCount;
+              }
+            }
+          }
+        }
+
+        return Container(
+          padding: const EdgeInsets.symmetric(vertical: 16),
+          decoration: BoxDecoration(
+            color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(
+              color: isDark
+                  ? Colors.white.withOpacity(0.05)
+                  : Colors.black.withOpacity(0.05),
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Text(
+                      'MY ORDERS',
+                      style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w900,
+                          letterSpacing: 1.0,
+                          color: Colors.grey),
+                    ),
+                    GestureDetector(
+                      onTap: () => Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) =>
+                              OrderTrackingPage(customerId: customerId),
+                        ),
+                      ),
+                      child: const Text('View All',
+                          style: TextStyle(
+                              fontSize: 11,
+                              color: Color(0xFFF4B400),
+                              fontWeight: FontWeight.bold)),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                      child: _trackingIcon(context, customerId,
+                          Icons.payments_outlined, 'To Pay', toPay, 0)),
+                  Expanded(
+                      child: _trackingIcon(context, customerId,
+                          Icons.inventory_2_outlined, 'To Ship', toShip, 1)),
+                  Expanded(
+                      child: _trackingIcon(
+                          context,
+                          customerId,
+                          Icons.local_shipping_outlined,
+                          'To Deliver',
+                          toDeliver,
+                          2)),
+                  Expanded(
+                      child: _trackingIcon(context, customerId,
+                          Icons.star_border_rounded, 'To Rate', toRate, 3)),
+                ],
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _trackingIcon(BuildContext context, String customerId, IconData icon,
+      String label, int count, int tabIndex) {
+    return InkWell(
+      onTap: () => Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => OrderTrackingPage(
+              customerId: customerId, initialTabIndex: tabIndex),
+        ),
+      ),
+      child: Column(
+        children: [
+          Stack(
+            clipBehavior: Clip.none,
+            children: [
+              // Gold accent instead of a light/dark toggle — reads
+              // clearly against both a white card and a near-black one,
+              // rather than depending on guessing the exact background
+              // shade correctly.
+              Icon(icon, size: 26, color: const Color(0xFFF4B400)),
+              if (count > 0)
+                Positioned(
+                  right: -6,
+                  top: -6,
+                  child: Container(
+                    padding: const EdgeInsets.all(3),
+                    decoration: const BoxDecoration(
+                        color: Colors.red, shape: BoxShape.circle),
+                    constraints:
+                    const BoxConstraints(minWidth: 16, minHeight: 16),
+                    child: Text('$count',
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 9,
+                            fontWeight: FontWeight.bold)),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(label,
+              style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w600)),
+        ],
+      ),
+    );
+  }
+
   Widget _buildOptionTile(BuildContext context,
       {required IconData icon,
-      required String label,
-      required String value,
-      required VoidCallback onTap}) {
+        required String label,
+        required String value,
+        required VoidCallback onTap}) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
 
     return InkWell(
@@ -686,7 +850,7 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
               decoration: BoxDecoration(
                 color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
                 borderRadius:
-                    const BorderRadius.vertical(top: Radius.circular(28)),
+                const BorderRadius.vertical(top: Radius.circular(28)),
               ),
               padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
               child: Column(
@@ -774,7 +938,7 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
                                   decoration: BoxDecoration(
                                     color: canRedeem
                                         ? const Color(0xFFF59E0B)
-                                            .withOpacity(0.1)
+                                        .withOpacity(0.1)
                                         : Colors.grey.withOpacity(0.1),
                                     shape: BoxShape.circle,
                                   ),
@@ -788,7 +952,7 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
                                 Expanded(
                                   child: Column(
                                     crossAxisAlignment:
-                                        CrossAxisAlignment.start,
+                                    CrossAxisAlignment.start,
                                     children: [
                                       Text(
                                         name,
@@ -826,37 +990,34 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
                                   onPressed: !canRedeem
                                       ? null
                                       : () async {
-                                          // Perform Points Deduction in Firestore
-                                          await FirebaseFirestore.instance
-                                              .collection('customers')
-                                              .doc(widget.customerId)
-                                              .update({
-                                            'points':
-                                                FieldValue.increment(-cost)
-                                          });
+                                    await FirebaseFirestore.instance
+                                        .collection('customers')
+                                        .doc(widget.customerId)
+                                        .update({
+                                      'points':
+                                      FieldValue.increment(-cost)
+                                    });
 
-                                          // Create redemption record
-                                          final code =
-                                              'BLOOM-${name.split(" ").last.toUpperCase()}-${DateTime.now().millisecondsSinceEpoch.toString().substring(8)}';
-                                          await FirebaseFirestore.instance
-                                              .collection('redemptions')
-                                              .add({
-                                            'customerId': widget.customerId,
-                                            'rewardName': name,
-                                            'costPoints': cost,
-                                            'redeemedAt':
-                                                FieldValue.serverTimestamp(),
-                                            'code': code,
-                                            'status': 'active',
-                                          });
+                                    final code =
+                                        'BLOOM-${name.split(" ").last.toUpperCase()}-${DateTime.now().millisecondsSinceEpoch.toString().substring(8)}';
+                                    await FirebaseFirestore.instance
+                                        .collection('redemptions')
+                                        .add({
+                                      'customerId': widget.customerId,
+                                      'rewardName': name,
+                                      'costPoints': cost,
+                                      'redeemedAt':
+                                      FieldValue.serverTimestamp(),
+                                      'code': code,
+                                      'status': 'active',
+                                    });
 
-                                          if (context.mounted) {
-                                            Navigator.pop(context);
-                                            // Show success dialog
-                                            _showRedemptionSuccessDialog(
-                                                context, name, code);
-                                          }
-                                        },
+                                    if (context.mounted) {
+                                      Navigator.pop(context);
+                                      _showRedemptionSuccessDialog(
+                                          context, name, code);
+                                    }
+                                  },
                                   style: ElevatedButton.styleFrom(
                                     backgroundColor: const Color(0xFFF59E0B),
                                     disabledBackgroundColor: Colors.grey[300],
@@ -864,7 +1025,7 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
                                         horizontal: 16, vertical: 8),
                                     shape: RoundedRectangleBorder(
                                         borderRadius:
-                                            BorderRadius.circular(12)),
+                                        BorderRadius.circular(12)),
                                     elevation: 0,
                                   ),
                                   child: Text(
@@ -901,7 +1062,7 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
       builder: (context) {
         return AlertDialog(
           shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
           title: const Row(
             children: [
               Icon(Icons.check_circle_outline, color: Colors.green, size: 28),
@@ -920,7 +1081,7 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
               Text(
                 rewardName,
                 style:
-                    const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 20),
@@ -976,4 +1137,4 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
       },
     );
   }
-}
+} cvbnm./1

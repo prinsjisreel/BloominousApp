@@ -20,23 +20,16 @@ class ProductCatalogPage extends StatefulWidget {
 class _ProductCatalogPageState extends State<ProductCatalogPage>
     with SingleTickerProviderStateMixin {
   String _selectedCategory = 'All';
-  String _selectedBranchId =
-      'all'; // Default to all branches to show content immediately
-  final Map<String, int> _cart = {}; // productId -> quantity
+  String _selectedBranchId = 'all';
+  final Map<String, int> _cart = {};
   final Map<String, Map<String, dynamic>> _cartItemDetails = {};
-  final Map<String, String> _branchNames = {}; // branchId -> name
-  final Map<String, Map<String, dynamic>> _branchDetails =
-  {}; // branchId -> full doc
+  final Map<String, String> _branchNames = {};
+  final Map<String, Map<String, dynamic>> _branchDetails = {};
   Position? _currentPosition;
 
-  // Live search filter over the currently loaded product names -- purely
-  // client-side text matching, no new data source needed.
   final TextEditingController _searchController = TextEditingController();
   String _searchQuery = '';
 
-  // Whole-page fade-in, played once when this screen first appears --
-  // gives the catalog a soft "arriving" feel instead of popping in
-  // instantly. Runs independently of the per-card stagger animation below.
   late final AnimationController _pageFadeController;
   late final Animation<double> _pageFadeAnimation;
 
@@ -72,17 +65,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
             _branchNames[b['id']] = b['name'] ?? 'Branch';
             _branchDetails[b['id']] = b;
           }
-
-          // Safety net: InventoryData.selectedBranchId defaults to the
-          // hardcoded literal 'main_branch' at declaration time, before
-          // any real branch has ever loaded from Firestore. If your
-          // actual branch documents use different IDs (e.g. "marilao"
-          // rather than literally "main_branch"), every downstream write
-          // that relies on that static field -- placing an order, stock
-          // updates, spoilage reports -- would silently target a branch
-          // document that doesn't exist. Once real branches are known,
-          // snap it to an actual one if it isn't already pointing at a
-          // real branch.
           final realIds = branches.map((b) => b['id']).toSet();
           if (branches.isNotEmpty &&
               !realIds.contains(InventoryData.selectedBranchId)) {
@@ -109,14 +91,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
   }
 
   Future<void> _detectNearestBranch() async {
-    // On Android, calling Geolocator.getCurrentPosition() without first
-    // checking/requesting permission throws immediately if permission was
-    // never granted -- the old code caught that exception and only logged
-    // it via debugPrint, so from the user's perspective tapping the button
-    // did literally nothing with no explanation. This mirrors the working
-    // permission-check pattern already used in delivery_details_page.dart's
-    // _calculateDeliveryFee(), and now surfaces every failure mode as a
-    // visible snackbar instead of a silent console log.
     bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
       if (mounted) {
@@ -167,7 +141,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
         desiredAccuracy: LocationAccuracy.high,
       );
 
-      // Fetch all branches
       final branches = await InventoryData.getBranches();
 
       if (branches.isEmpty) {
@@ -198,14 +171,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
 
       if (nearestId != null) {
         setState(() {
-          // Both must be set: InventoryData.selectedBranchId (used by
-          // checkout, stock updates, order placement) AND _selectedBranchId
-          // (the local state that actually drives which branch's products
-          // the grid queries and displays via inventoryStream). Previously
-          // only the first was updated -- so "Detect Nearest Branch" would
-          // silently succeed in the background while the visible product
-          // grid kept showing "All Branches" the whole time, completely
-          // unaffected.
           InventoryData.selectedBranchId = nearestId!;
           _selectedBranchId = nearestId;
         });
@@ -231,19 +196,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
     }
   }
 
-  // ---------------------------------------------------------------------
-  // CART LOGIC
-  // ---------------------------------------------------------------------
-  // All cart mutations funnel through these three helpers so the cart
-  // sheet (which is a *separate* widget tree via showModalBottomSheet)
-  // and the main page's app bar badge always agree on the same state --
-  // this is the single source of truth for _cart / _cartItemDetails.
-
-  // Shared login gate -- BOTH cart actions (quick-add from the card AND
-  // Add to Cart / Buy Now from the detail page) route through this so a
-  // guest/anonymous user is never able to add anything without an account.
-  // Matches the exact same AuthPage flow _initiateCheckout already used,
-  // just factored out so it's not duplicated three times.
   void _requireLogin(VoidCallback onSuccess) {
     final user = FirebaseAuth.instance.currentUser;
     if (user != null && !user.isAnonymous) {
@@ -277,25 +229,13 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
         _cart[id] = (_cart[id] ?? 0) + 1;
         _cartItemDetails[id] = product;
       });
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('${product['name']} added to cart'),
-          duration: const Duration(seconds: 2),
-          action: SnackBarAction(
-            label: 'VIEW CART',
-            onPressed: _openCartSheet,
-          ),
-        ),
-      );
+      // No snackbar here anymore — the persistent mini-cart bar at the
+      // bottom of the screen already shows "N items in cart / View Cart"
+      // the instant _cartItemCount goes above 0, so a snackbar saying
+      // the same thing a moment later was pure duplication.
     });
   }
 
-  // "Buy Now" -- Shopee-style immediate checkout for a single item,
-  // deliberately bypassing the shared _cart map entirely (this is NOT the
-  // same as add-to-cart-then-checkout; whatever's already sitting in the
-  // cart is left untouched). Goes straight to DeliveryDetailsPage with
-  // just this one item.
   void _buyNow(Map<String, dynamic> product) {
     _requireLogin(() {
       final price = (product['price'] ?? 0).toDouble();
@@ -362,9 +302,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
     return _cart.values.fold(0, (sum, qty) => sum + qty);
   }
 
-  // Opens the full itemized cart as a draggable bottom sheet. Always
-  // opens -- even with an empty cart -- so tapping the cart icon never
-  // does nothing (the old behavior when the cart was empty).
   void _openCartSheet() {
     showModalBottomSheet(
       context: context,
@@ -377,11 +314,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
           maxChildSize: 0.92,
           expand: false,
           builder: (context, scrollController) {
-            // StatefulBuilder gives the sheet its own setState (setModalState)
-            // so +/- taps repaint instantly without waiting for the parent
-            // page to rebuild. We still call the parent's setState too (via
-            // the wrapper methods above already doing that), which keeps the
-            // app bar's cart badge in sync once the sheet closes.
             return StatefulBuilder(
               builder: (context, setModalState) {
                 final theme = Theme.of(context);
@@ -543,7 +475,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
                                       ],
                                     ),
                                   ),
-                                  // Quantity stepper
                                   Container(
                                     decoration: BoxDecoration(
                                       border: Border.all(
@@ -755,8 +686,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
               IconButton(
                 icon: const Icon(Icons.shopping_cart_outlined),
                 tooltip: 'View Cart',
-                // Always opens the cart sheet -- even with 0 items -- so
-                // tapping this icon is never a dead end for the user.
                 onPressed: _openCartSheet,
               ),
               if (_cartItemCount > 0)
@@ -789,10 +718,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
         opacity: _pageFadeAnimation,
         child: Column(
           children: [
-            // Compact store row: branch dropdown + inline "locate me" button
-            // share one line instead of a full-width dropdown followed by a
-            // full-width button -- closer to how Shopee keeps its top filter
-            // area low-height so more products are visible above the fold.
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
               child: Row(
@@ -802,12 +727,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
                       stream: InventoryData.getBranchesStream(),
                       builder: (context, snapshot) {
                         final branches = snapshot.data ?? [];
-                        // If the currently selected branch id doesn't match
-                        // any branch actually in the stream (e.g. right after
-                        // a branch was deleted, or a stale value from before
-                        // branches finished loading), fall back to 'all'
-                        // rather than crashing DropdownButton with a value
-                        // that isn't in its items list.
                         final realIds = branches.map((b) => b['id']).toSet();
                         String effectiveValue = (_selectedBranchId == 'all' ||
                             realIds.contains(_selectedBranchId))
@@ -876,11 +795,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
                               onChanged: (val) {
                                 if (val != null) {
                                   setState(() => _selectedBranchId = val);
-                                  // Real branch ID used directly. For "all",
-                                  // fall back to whichever real branch was
-                                  // loaded first -- never the hardcoded
-                                  // 'main_branch' literal, which may not
-                                  // correspond to an actual document.
                                   InventoryData.selectedBranchId = val == 'all'
                                       ? (branches.isNotEmpty
                                       ? branches.first['id']
@@ -911,8 +825,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
               ),
             ),
 
-            // Search bar -- Shopee-style pill search field, filters the
-            // currently loaded product list by name as the user types.
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 10, 16, 4),
               child: TextField(
@@ -947,13 +859,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
               ),
             ),
 
-            // Category Selector -- Shopee-style icon rail (circular icon +
-            // label underneath) instead of plain text chips.
-            // Height math: 52 (icon circle) + 4 (gap) + ~15 (label text at
-            // default text scale) + 12 (ListView's own vertical padding,
-            // 6 top + 6 bottom) = ~83px needed. Sized with headroom to 96 so
-            // larger system font-scale settings (accessibility) don't
-            // re-trigger the overflow this was originally fixed for.
             SizedBox(
               height: 96,
               child: StreamBuilder<List<String>>(
@@ -1044,7 +949,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
               ),
             ),
 
-            // Product Grid
             Expanded(
               child: StreamBuilder<List<Map<String, dynamic>>>(
                 key: ValueKey('$_selectedBranchId-$_selectedCategory'),
@@ -1069,31 +973,7 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
                   List<Map<String, dynamic>> products = [];
 
                   if (_selectedBranchId == 'all') {
-                    // Group by Name. Since "Red Rose" (etc.) exists as a
-                    // SEPARATE Firestore document per branch -- there's no
-                    // single canonical product doc -- this groups them for
-                    // display and has to pick ONE representative image/price
-                    // to show. See bestImageStock below for why that pick
-                    // has to be tracked carefully.
                     Map<String, Map<String, dynamic>> grouped = {};
-                    // Tracks the highest stock seen so far, per product name,
-                    // SEPARATELY from the map itself -- this is the actual
-                    // fix. The old code compared each branch's stock against
-                    // grouped[name]['stock'], but that key was never updated
-                    // after the group was first created (it's just whatever
-                    // got spread in from the FIRST branch processed via
-                    // `...p`). So the comparison was really "is this branch's
-                    // stock more than the FIRST branch's stock", not "more
-                    // than the best one seen so far" -- meaning with 3+
-                    // branches, whichever later branch happened to beat the
-                    // first branch's number would overwrite the image, even
-                    // if an earlier branch in between had a genuinely higher
-                    // stock and the more current/correct product photo. This
-                    // is why the detail page's big hero image could show a
-                    // stale image from some other branch's copy of "Red
-                    // Rose" instead of the one the admin most recently
-                    // updated -- the small thumbnail card masked this for a
-                    // while, but a full-size hero image made it obvious.
                     Map<String, int> bestImageStock = {};
 
                     for (var p in rawProducts) {
@@ -1113,8 +993,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
                             {'branchId': p['branchId'], 'stock': p['stock']});
                         grouped[name]!['total_stock'] =
                             (grouped[name]!['total_stock'] ?? 0) + pStock;
-                        // Now correctly compares against the running best,
-                        // not a stale spread-in field.
                         if (pStock > (bestImageStock[name] ?? 0)) {
                           bestImageStock[name] = pStock;
                           grouped[name]!['image'] =
@@ -1127,8 +1005,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
                     products = rawProducts;
                   }
 
-                  // Client-side name search filter, applied after grouping so
-                  // "all branches" mode searches the deduplicated list.
                   if (_searchQuery.isNotEmpty) {
                     final q = _searchQuery.toLowerCase();
                     products = products
@@ -1161,19 +1037,20 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
                   }
 
                   return GridView.builder(
-                    padding: const EdgeInsets.all(16),
+                    padding: EdgeInsets.fromLTRB(
+                      16,
+                      16,
+                      16,
+                      16 + 76 + (_cartItemCount > 0 ? 80 : 0),
+                    ),
                     gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
                       crossAxisCount: 2,
-                      childAspectRatio:
-                      0.6, // Slightly shorter now that cards are more compact
+                      childAspectRatio: 0.6,
                       crossAxisSpacing: 14,
                       mainAxisSpacing: 14,
                     ),
                     itemCount: products.length,
                     itemBuilder: (context, index) => _FadeSlideIn(
-                      // Staggers each card's entrance by 40ms per index --
-                      // capped so a huge grid doesn't leave the last cards
-                      // waiting seconds to appear.
                       delay: Duration(
                           milliseconds: (index * 40).clamp(0, 400)),
                       child: _buildProductCard(products[index]),
@@ -1185,28 +1062,29 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
           ],
         ),
       ),
-      // Persistent mini cart bar -- a lightweight, always-visible summary
-      // (standard pattern in food/flower delivery apps). Tapping ANYWHERE
-      // on it opens the full itemized cart sheet above; it never jumps
-      // straight to checkout, so the user always gets a chance to review
-      // items first.
       bottomSheet: _cartItemCount > 0
-          ? InkWell(
-        onTap: _openCartSheet,
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
-          decoration: BoxDecoration(
-            color: isDark ? Colors.grey[900] : Colors.white,
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withValues(alpha: 0.1),
-                blurRadius: 10,
-                offset: const Offset(0, -5),
+          ? Padding(
+        padding: EdgeInsets.only(bottom: MediaQuery.of(context).padding.bottom),
+        child: InkWell(
+          onTap: _openCartSheet,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+            decoration: BoxDecoration(
+              color: isDark ? Colors.grey[900] : Colors.white,
+              border: Border(
+                top: BorderSide(
+                  color: isDark ? Colors.grey[800]! : Colors.grey[200]!,
+                  width: 1,
+                ),
               ),
-            ],
-          ),
-          child: SafeArea(
-            top: false,
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: isDark ? 0.4 : 0.1),
+                  blurRadius: 14,
+                  offset: const Offset(0, -6),
+                ),
+              ],
+            ),
             child: Row(
               children: [
                 Container(
@@ -1252,16 +1130,13 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
         ),
       )
           : null,
-      // Flora AI now lives here (bottom-right, floating) instead of being a
-      // tab inside AI Assistant -- always one tap away from Shop Category,
-      // where customers actually need real inquiry answers (stock, price).
       floatingActionButtonLocation: FloatingActionButtonLocation.endFloat,
       floatingActionButton: Padding(
-        // Lifts the FAB clear of the persistent cart bar (~72px tall) plus
-        // safe-area inset, so the two never overlap when both are visible.
+        // Reduced from 72 — just enough clearance to clear the cart bar's
+        // own height without leaving a visible gap floating above it.
         padding: EdgeInsets.only(
           bottom: _cartItemCount > 0
-              ? 72 + MediaQuery.of(context).padding.bottom
+              ? 58 + MediaQuery.of(context).padding.bottom
               : 0,
         ),
         child: FloatingActionButton.extended(
@@ -1299,8 +1174,7 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
               ClipRRect(
                 borderRadius: BorderRadius.circular(24),
                 child: ModelViewer(
-                  src:
-                  'assets/models/Rose.glb', // Mapping everything to Rose for now as a demo
+                  src: 'assets/models/Rose.glb',
                   alt: product['name'],
                   ar: true,
                   autoRotate: true,
@@ -1365,11 +1239,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
     final inStock = totalStock > 0;
 
     return GestureDetector(
-      // Whole-card tap opens the detail page. This sits BELOW the floating
-      // quick-add button in the widget tree (added later, in the Stack),
-      // so Flutter's hit-testing gives that button's own InkWell priority
-      // within its bounds -- tapping the button still just adds to cart,
-      // tapping anywhere else on the card opens the detail page.
       onTap: () {
         Navigator.push(
           context,
@@ -1402,10 +1271,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // Image + overlay badges + quick-add button, all in one square-ish
-            // block -- this is the part that reads most "Shopee": a compact
-            // image tile with a small floating cart button in the corner
-            // instead of a full-width "ADD TO CART" bar underneath.
             AspectRatio(
               aspectRatio: 1,
               child: Stack(
@@ -1419,14 +1284,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
                         Colors.grey.withValues(alpha: 0.6),
                         BlendMode.saturation),
                     child: Image.network(
-                      // `?? fallback` alone only catches a null image field --
-                      // Firestore can also store an empty string '', which
-                      // slips past `??` and gets handed straight to
-                      // Image.network(''), crashing with "No host specified
-                      // in URI" (exactly what showed up on "Red Rose"). This
-                      // checks for blank too, and errorBuilder below is the
-                      // safety net for any OTHER bad URL (typo, deleted
-                      // image, 404) that isn't simply empty.
                       (product['image'] as String?)?.isNotEmpty == true
                           ? product['image']
                           : 'https://images.unsplash.com/photo-1526047932273-341f2a7631f9',
@@ -1499,14 +1356,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
                         ),
                       ),
                     ),
-                  // Floating quick-add button, bottom-right of the image.
-                  // Previously sat at bottom: -14 (deliberately half outside
-                  // the image, overlapping the text below) -- but the card's
-                  // Clip.antiAlias clipped that overlapping half off, leaving
-                  // only a sliver of the icon visible behind the product
-                  // name and making it hard to actually tap. Kept fully
-                  // inside the image bounds now -- still reads as "floating"
-                  // thanks to the shadow/elevation, just doesn't get clipped.
                   Positioned(
                     right: 8,
                     bottom: 8,
@@ -1531,10 +1380,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
               ),
             ),
             Padding(
-              // Top padding brought back down to 10 -- the extra 18px was
-              // only ever there to leave clearance for the button that used
-              // to overlap into this area. No longer needed now that the
-              // button stays fully on the image.
               padding: const EdgeInsets.fromLTRB(10, 10, 10, 10),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -1563,9 +1408,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
                     ),
                   ),
                   const SizedBox(height: 4),
-                  // Compact availability line -- one line only, matching
-                  // Shopee's terse "X sold / Y left" style instead of a full
-                  // per-branch breakdown block taking up card real estate.
                   if (_selectedBranchId == 'all' &&
                       product.containsKey('branches'))
                     Text(
@@ -1601,10 +1443,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
   }
 }
 
-/// Small helper that fades + gently slides a child upward into place after
-/// an optional delay. Used to stagger the product grid's entrance (card 0
-/// appears first, card 1 shortly after, etc.) instead of every card
-/// popping in at once -- purely cosmetic, no effect on data or logic.
 class _FadeSlideIn extends StatefulWidget {
   final Widget child;
   final Duration delay;
@@ -1642,9 +1480,6 @@ class _FadeSlideInState extends State<_FadeSlideIn> {
   }
 }
 
-/// Maps a category name to a representative icon for the Shopee-style
-/// icon rail. Falls back to a generic tag icon for anything unrecognized,
-/// so new categories added later never render blank.
 IconData _iconForCategory(String category) {
   switch (category) {
     case 'All':

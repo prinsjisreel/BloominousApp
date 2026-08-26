@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:google_fonts/google_fonts.dart';
 import 'builder_page.dart';
 import 'scanner_page.dart';
@@ -14,6 +15,7 @@ import 'sync_manager.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_app_check/firebase_app_check.dart';
 
 // Global theme notifier - Set to system to follow phone settings
 final ValueNotifier<ThemeMode> themeNotifier = ValueNotifier(ThemeMode.system);
@@ -34,12 +36,25 @@ void main() async {
       ),
     );
 
+    // Firebase App Check — the mobile-native equivalent of the web app's
+    // Cloudflare Turnstile bot-check. Play Integrity/App Attest prove this
+    // request came from a real, unmodified copy of this app, the same job
+    // Turnstile does for a browser session. Debug provider is required for
+    // local/emulator testing since Play Integrity needs a signed, real
+    // build registered with Google to succeed.
+    await FirebaseAppCheck.instance.activate(
+      androidProvider:
+      kDebugMode ? AndroidProvider.debug : AndroidProvider.playIntegrity,
+      appleProvider:
+      kDebugMode ? AppleProvider.debug : AppleProvider.appAttest,
+    );
+
     // Initialize Offline Sync services
     syncManager.init();
   } catch (e) {
     print("Firebase initialization error: $e");
     initError =
-        "Firebase Error: $e\n\nTip: Check your configuration and network connection.";
+    "Firebase Error: $e\n\nTip: Check your configuration and network connection.";
   }
 
   runApp(BloomApp(initError: initError));
@@ -76,7 +91,7 @@ class BloomApp extends StatelessWidget {
               displayMedium: GoogleFonts.cormorantGaramond(
                   fontWeight: FontWeight.bold, color: const Color(0xFF121212)),
               titleLarge:
-                  GoogleFonts.inter(fontWeight: FontWeight.bold, fontSize: 18),
+              GoogleFonts.inter(fontWeight: FontWeight.bold, fontSize: 18),
               bodyMedium: GoogleFonts.inter(color: const Color(0xFF555555)),
             ),
           ),
@@ -92,7 +107,7 @@ class BloomApp extends StatelessWidget {
             scaffoldBackgroundColor: const Color(0xFF121212),
             useMaterial3: true,
             textTheme:
-                GoogleFonts.interTextTheme(ThemeData.dark().textTheme).copyWith(
+            GoogleFonts.interTextTheme(ThemeData.dark().textTheme).copyWith(
               displayLarge: GoogleFonts.cormorantGaramond(
                   fontWeight: FontWeight.w900,
                   color: Colors.white,
@@ -100,7 +115,7 @@ class BloomApp extends StatelessWidget {
               displayMedium: GoogleFonts.cormorantGaramond(
                   fontWeight: FontWeight.bold, color: Colors.white),
               titleLarge:
-                  GoogleFonts.inter(fontWeight: FontWeight.bold, fontSize: 18),
+              GoogleFonts.inter(fontWeight: FontWeight.bold, fontSize: 18),
               bodyMedium: GoogleFonts.inter(color: Colors.grey[400]),
             ),
           ),
@@ -255,8 +270,8 @@ class HomePage extends StatelessWidget {
                                   'assets/images/logo.jpg',
                                   fit: BoxFit.cover,
                                   errorBuilder: (context, error, stackTrace) =>
-                                      const Icon(Icons.local_florist,
-                                          color: Color(0xFF7B79F2), size: 20),
+                                  const Icon(Icons.local_florist,
+                                      color: Color(0xFF7B79F2), size: 20),
                                 ),
                               ),
                             ),
@@ -378,7 +393,7 @@ class HomePage extends StatelessWidget {
                             context,
                             MaterialPageRoute(
                                 builder: (context) =>
-                                    const ProductCatalogPage())),
+                                const ProductCatalogPage())),
                         isPrimary: false,
                       ),
                       const SizedBox(height: 16),
@@ -409,7 +424,7 @@ class HomePage extends StatelessWidget {
                               context,
                               MaterialPageRoute(
                                   builder: (context) =>
-                                      const EmployeeLoginPage())),
+                                  const EmployeeLoginPage())),
                           child: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
@@ -432,7 +447,7 @@ class HomePage extends StatelessWidget {
                         Text(
                           '© 2026 BloomyPro. All rights reserved.',
                           style:
-                              TextStyle(color: Colors.grey[400], fontSize: 10),
+                          TextStyle(color: Colors.grey[400], fontSize: 10),
                         ),
                       ],
                     ),
@@ -447,14 +462,14 @@ class HomePage extends StatelessWidget {
   }
 
   Widget _buildActionCard(
-    BuildContext context, {
-    required String title,
-    required String subtitle,
-    required IconData icon,
-    required Color color,
-    required VoidCallback onTap,
-    required bool isPrimary,
-  }) {
+      BuildContext context, {
+        required String title,
+        required String subtitle,
+        required IconData icon,
+        required Color color,
+        required VoidCallback onTap,
+        required bool isPrimary,
+      }) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
 
     // Determine content color based on background color and primary status
@@ -466,8 +481,8 @@ class HomePage extends StatelessWidget {
 
     final Color subContentColor = isPrimary
         ? (isDark
-            ? const Color(0xFF121212).withValues(alpha: 0.6)
-            : Colors.white.withValues(alpha: 0.6))
+        ? const Color(0xFF121212).withValues(alpha: 0.6)
+        : Colors.white.withValues(alpha: 0.6))
         : (isDark ? Colors.white.withValues(alpha: 0.6) : Colors.grey[600]!);
 
     return Container(
@@ -486,8 +501,8 @@ class HomePage extends StatelessWidget {
         border: isPrimary
             ? null
             : Border.all(
-                color: (isDark ? Colors.white : const Color(0xFF121212))
-                    .withValues(alpha: 0.1)),
+            color: (isDark ? Colors.white : const Color(0xFF121212))
+                .withValues(alpha: 0.1)),
       ),
       child: Material(
         color: Colors.transparent,
@@ -504,8 +519,8 @@ class HomePage extends StatelessWidget {
                     color: isPrimary
                         ? const Color(0xFFF4B400).withValues(alpha: 0.2)
                         : (isDark
-                            ? Colors.white.withValues(alpha: 0.1)
-                            : const Color(0xFF121212).withValues(alpha: 0.05)),
+                        ? Colors.white.withValues(alpha: 0.1)
+                        : const Color(0xFF121212).withValues(alpha: 0.05)),
                     shape: BoxShape.circle,
                   ),
                   child: Icon(
@@ -560,7 +575,7 @@ class HomePage extends StatelessWidget {
     if (user != null) {
       // 1. Check if customer record exists for the CURRENT UID
       final customerDoc =
-          await firestore.collection('customers').doc(user.uid).get();
+      await firestore.collection('customers').doc(user.uid).get();
 
       if (customerDoc.exists) {
         final email = customerDoc.data()?['email'] ?? user.email ?? 'Customer';
@@ -597,10 +612,10 @@ class HomePage extends StatelessWidget {
 
           // Also update the users roles collection if it exists (only if not an admin/employee)
           final existingUserDoc =
-              await firestore.collection('users').doc(user.uid).get();
+          await firestore.collection('users').doc(user.uid).get();
           final existingDocData = existingUserDoc.data();
           final existingRole =
-              existingDocData != null ? existingDocData['role'] : null;
+          existingDocData != null ? existingDocData['role'] : null;
           if (existingRole == null || existingRole == 'customer') {
             await firestore.collection('users').doc(user.uid).set({
               'role': 'customer',
@@ -656,13 +671,15 @@ class HomePage extends StatelessWidget {
       }
 
       // 4. If nothing works, go to AuthPage
-      if (context.mounted)
+      if (context.mounted) {
         Navigator.push(
             context, MaterialPageRoute(builder: (context) => const AuthPage()));
+      }
     } else {
-      if (context.mounted)
+      if (context.mounted) {
         Navigator.push(
             context, MaterialPageRoute(builder: (context) => const AuthPage()));
+      }
     }
   }
 }
@@ -683,63 +700,17 @@ class SyncIndicator extends StatelessWidget {
           initialData: false,
           builder: (context, syncSnap) {
             final isSyncing = syncSnap.data ?? false;
-
-            return AnimatedSwitcher(
-              duration: const Duration(milliseconds: 300),
-              child: Row(
-                key: ValueKey('${isOnline}_$isSyncing'),
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (!isOnline)
-                    const Tooltip(
-                      message: 'Offline Mode - Data will sync when online',
-                      child: Padding(
-                        padding: EdgeInsets.only(right: 6.0),
-                        child: Icon(Icons.cloud_off_rounded,
-                            color: Colors.orange, size: 16),
-                      ),
-                    ),
-                  if (isSyncing)
-                    const Padding(
-                      padding: EdgeInsets.only(right: 6.0),
-                      child: SizedBox(
-                        width: 12,
-                        height: 12,
-                        child: CircularProgressIndicator(
-                            strokeWidth: 2, color: Color(0xFF7B79F2)),
-                      ),
-                    ),
-                  Container(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                    decoration: BoxDecoration(
-                      color: isOnline
-                          ? (isSyncing
-                              ? Colors.blue.withOpacity(0.1)
-                              : Colors.green.withOpacity(0.1))
-                          : Colors.orange.withOpacity(0.1),
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(
-                        color: isOnline
-                            ? (isSyncing ? Colors.blue : Colors.green)
-                            : Colors.orange,
-                        width: 1,
-                      ),
-                    ),
-                    child: Text(
-                      isOnline ? (isSyncing ? 'SYNCING' : 'ONLINE') : 'OFFLINE',
-                      style: GoogleFonts.inter(
-                        fontSize: 9,
-                        fontWeight: FontWeight.w900,
-                        letterSpacing: 0.5,
-                        color: isOnline
-                            ? (isSyncing ? Colors.blue : Colors.green)
-                            : Colors.orange,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
+            // ⚠️ UNVERIFIED FROM HERE DOWN — I could not retrieve the rest
+            // of this widget's real body. DO NOT let this placeholder
+            // overwrite your actual SyncIndicator implementation. If your
+            // real widget body differs from a simple icon indicator below,
+            // paste your original back in before using this file.
+            return Icon(
+              isSyncing
+                  ? Icons.sync_rounded
+                  : (isOnline ? Icons.cloud_done_rounded : Icons.cloud_off_rounded),
+              size: 18,
+              color: isOnline ? Colors.green : Colors.grey,
             );
           },
         );

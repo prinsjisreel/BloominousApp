@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'dart:async';
 import 'admin_dashboard.dart';
 import 'delivery_dashboard.dart';
 import 'inventory_data.dart';
+import 'device_security_service.dart';
 
 class EmployeeLoginPage extends StatefulWidget {
   const EmployeeLoginPage({Key? key}) : super(key: key);
@@ -19,15 +21,66 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
   bool _obscurePassword = true;
   bool _rememberMe = false;
 
+  // --- Fraud/Lockout state (mirrors AuthPage's customer-side logic,
+  // but scoped separately so a customer's failed attempts never lock
+  // out this admin/employee portal, and vice versa) ---
+  final DeviceSecurityService _securityService =
+  DeviceSecurityService(scope: 'employee');
+  int _remainingLockoutSeconds = 0;
+  bool _superAdminLocked = false;
+  Timer? _lockoutTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _isRateLimited(); // Check on screen open in case this device is already locked out
+  }
+
   @override
   void dispose() {
+    _lockoutTimer?.cancel(); // prevent setState-after-dispose crash / leak
     emailController.dispose();
     passwordController.dispose();
     super.dispose();
   }
 
+  // --- FRAUD & RATE LIMITING HELPERS ---
+  Future<bool> _isRateLimited() async {
+    final rateLimit = await _securityService.checkRateLimit();
+    if (rateLimit['locked'] == true) {
+      if (mounted) {
+        setState(() {
+          _superAdminLocked = rateLimit['superAdminLock'] == true;
+          _remainingLockoutSeconds = rateLimit['remainingSeconds'] ?? 0;
+        });
+        _startTimer();
+      }
+      return true;
+    }
+    return false;
+  }
+
+  void _startTimer() {
+    _lockoutTimer?.cancel();
+    if (_remainingLockoutSeconds > 0 && !_superAdminLocked) {
+      _lockoutTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+        if (mounted) {
+          setState(() {
+            if (_remainingLockoutSeconds > 0) {
+              _remainingLockoutSeconds--;
+            } else {
+              _lockoutTimer?.cancel();
+            }
+          });
+        }
+      });
+    }
+  }
+  // -------------------------------------
+
   Future<void> _login() async {
     if (!_formKey.currentState!.validate()) return;
+    if (await _isRateLimited()) return; // Blocks the call entirely while locked out
 
     setState(() => isLoading = true);
     try {
@@ -40,6 +93,8 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
         final role = await InventoryData.getUserRole(credential.user!.uid);
         if (role == null || role == 'customer') {
           await FirebaseAuth.instance.signOut();
+          await _securityService.recordFailedAttempt(); // A customer probing the admin portal still counts as a strike
+          await _isRateLimited(); // refresh countdown UI immediately
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
@@ -62,6 +117,9 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
           return;
         }
 
+        // Successful, authorized login — clear the strike counter.
+        await _securityService.resetAttempts();
+
         if (mounted) {
           if (role == 'delivery') {
             Navigator.pushReplacement(
@@ -81,6 +139,9 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
         }
       }
     } on FirebaseAuthException catch (e) {
+      await _securityService.recordFailedAttempt();
+      await _isRateLimited();
+
       String message = 'Login failed';
       if (e.code == 'user-not-found') {
         message = 'No user found for that email.';
@@ -105,11 +166,13 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
             backgroundColor: Colors.redAccent,
             behavior: SnackBarBehavior.floating,
             shape:
-                RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
           ),
         );
       }
     } catch (e) {
+      await _securityService.recordFailedAttempt();
+      await _isRateLimited();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('An unexpected error occurred: $e')),
@@ -195,8 +258,8 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
                         'assets/images/logo.jpg',
                         fit: BoxFit.contain,
                         errorBuilder: (context, error, stackTrace) =>
-                            const Icon(Icons.business_center,
-                                size: 40, color: Color(0xFFF4B400)),
+                        const Icon(Icons.business_center,
+                            size: 40, color: Color(0xFFF4B400)),
                       ),
                     ),
                   ),
@@ -278,7 +341,7 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
                                 size: 20,
                               ),
                               onPressed: () => setState(
-                                  () => _obscurePassword = !_obscurePassword),
+                                      () => _obscurePassword = !_obscurePassword),
                             ),
                             validator: (value) {
                               if (value == null || value.isEmpty)
@@ -288,6 +351,41 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
                               return null;
                             },
                           ),
+
+                          // --- LOCKOUT WARNING UI ---
+                          if (_superAdminLocked || _remainingLockoutSeconds > 0)
+                            Container(
+                              width: double.infinity,
+                              margin: const EdgeInsets.only(top: 16),
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                color: Colors.red.withOpacity(0.1),
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(
+                                    color: Colors.red.withOpacity(0.3)),
+                              ),
+                              child: Row(
+                                children: [
+                                  const Icon(Icons.lock_clock,
+                                      color: Colors.redAccent),
+                                  const SizedBox(width: 12),
+                                  Expanded(
+                                    child: Text(
+                                      _superAdminLocked
+                                          ? 'Account locked. Please coordinate with a Super Admin to reset access.'
+                                          : 'Too many attempts. Please wait $_remainingLockoutSeconds seconds.',
+                                      style: const TextStyle(
+                                        color: Colors.redAccent,
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 13,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          // ---------------------------------------------------------------
+
                           const SizedBox(height: 12),
                           Row(
                             mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -300,11 +398,11 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
                                     child: Checkbox(
                                       value: _rememberMe,
                                       onChanged: (val) => setState(
-                                          () => _rememberMe = val ?? false),
+                                              () => _rememberMe = val ?? false),
                                       activeColor: const Color(0xFFF4B400),
                                       shape: RoundedRectangleBorder(
                                           borderRadius:
-                                              BorderRadius.circular(4)),
+                                          BorderRadius.circular(4)),
                                     ),
                                   ),
                                   const SizedBox(width: 8),
@@ -334,7 +432,10 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
                                     color: Color(0xFFF4B400)))
                           else
                             ElevatedButton(
-                              onPressed: _login,
+                              onPressed: (_superAdminLocked ||
+                                  _remainingLockoutSeconds > 0)
+                                  ? null
+                                  : _login,
                               style: ElevatedButton.styleFrom(
                                 minimumSize: const Size(double.infinity, 56),
                                 backgroundColor: const Color(0xFF121212),
@@ -409,7 +510,7 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
           borderSide: const BorderSide(color: Colors.redAccent, width: 1),
         ),
         contentPadding:
-            const EdgeInsets.symmetric(vertical: 18, horizontal: 20),
+        const EdgeInsets.symmetric(vertical: 18, horizontal: 20),
       ),
     );
   }
@@ -426,7 +527,7 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
       builder: (context) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
           shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
           title: const Text('Initial Admin Setup',
               style: TextStyle(fontWeight: FontWeight.bold)),
           content: SingleChildScrollView(
