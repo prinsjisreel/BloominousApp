@@ -13,6 +13,8 @@ import 'my_orders_page.dart';
 import 'customer_profile_page.dart';
 import 'device_security_service.dart';
 import 'registration_risk_service.dart';
+import 'email_verification_service.dart';
+import 'email_verification_pending_page.dart';
 
 class AuthPage extends StatefulWidget {
   final bool returnAfterLogin;
@@ -57,6 +59,7 @@ class _AuthPageState extends State<AuthPage> {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final DeviceSecurityService _securityService = DeviceSecurityService();
   final RegistrationRiskService _registrationRiskService = RegistrationRiskService();
+  final EmailVerificationService _emailVerificationService = EmailVerificationService();
 
   @override
   void initState() {
@@ -119,6 +122,19 @@ class _AuthPageState extends State<AuthPage> {
 
       if (customerDoc.exists) {
         // Doc already exists at the correct ID
+        final requiresVerification =
+            customerDoc.data()?['requireEmailVerification'] == true;
+        if (requiresVerification && !user.emailVerified) {
+          if (mounted) {
+            Navigator.pushReplacement(
+              context,
+              MaterialPageRoute(
+                  builder: (context) =>
+                      EmailVerificationPendingPage(customerId: user.uid)),
+            );
+          }
+          return;
+        }
         if (mounted) {
           if (widget.returnAfterLogin) {
             widget.onLoginSuccess?.call();
@@ -910,10 +926,15 @@ class _AuthPageState extends State<AuthPage> {
           if (oldId != uid) {
             await _firestore.collection('customers').doc(uid).set({
               ...userData,
-              'password': 'migrated_to_auth',
               'lastLogin': FieldValue.serverTimestamp(),
               'migratedFrom': oldId,
             }, SetOptions(merge: true));
+            // 'password' field removed — same reasoning as registration.
+            // If the OLD doc (userData, spread in above) still carries a
+            // legacy plaintext password field from before this fix, it
+            // rides along here unchanged — that's a separate cleanup
+            // (stripping old plaintext passwords from existing docs),
+            // not something this specific write needs to solve.
             await _firestore.collection('customers').doc(oldId).delete();
           }
         } else {
@@ -942,6 +963,33 @@ class _AuthPageState extends State<AuthPage> {
             'created_at': FieldValue.serverTimestamp(),
             'lastLogin': FieldValue.serverTimestamp(),
           }, SetOptions(merge: true));
+        }
+      }
+
+      // 2.5 EMAIL VERIFICATION GATE — mirrors set_session.php's
+      // EMAIL_NOT_VERIFIED check exactly. Only accounts whose doc opted
+      // into requireEmailVerification (set only by the NEW registration
+      // flow above) are held here — accounts created before this
+      // feature shipped never have that field, so they pass through
+      // untouched, same as web's own non-retroactive design.
+      final verificationCheckDoc =
+      await _firestore.collection('customers').doc(uid).get();
+      final requiresVerification =
+          verificationCheckDoc.data()?['requireEmailVerification'] == true;
+      if (requiresVerification) {
+        await userCredential.user!.reload();
+        final refreshedUser = FirebaseAuth.instance.currentUser;
+        if (refreshedUser != null && !refreshedUser.emailVerified) {
+          setState(() => _isLoading = false);
+          if (mounted) {
+            Navigator.pushReplacement(
+              context,
+              MaterialPageRoute(
+                  builder: (context) =>
+                      EmailVerificationPendingPage(customerId: uid)),
+            );
+          }
+          return;
         }
       }
 
@@ -1864,7 +1912,12 @@ class _AuthPageState extends State<AuthPage> {
         }
       } else {
         customerData['email'] = email;
-        customerData['password'] = password;
+        customerData['requireEmailVerification'] = true;
+        // No password field — Firebase Auth is already the password
+        // store, and firestore.rules explicitly blocks any client write
+        // to `customers` that includes a 'password' key at all. Writing
+        // it here silently turned every new email/password registration
+        // into a permission-denied.
       }
 
       await _firestore
@@ -1905,10 +1958,26 @@ class _AuthPageState extends State<AuthPage> {
         if (riskResult != null && riskResult.flagged && riskResult.scoreBump > 0) {
           await _registrationRiskService.recordScore(riskResult.scoreBump);
         }
+
+        // Email verification requirement — mirrors register.php exactly.
+        // Best-effort: a failed send here doesn't trap the customer —
+        // EmailVerificationPendingPage's own "Resend" button gives them
+        // another shot regardless of whether this first attempt worked.
+        await _emailVerificationService.sendVerificationEmail();
       }
 
       if (mounted) {
-        if (widget.returnAfterLogin) {
+        if (!_isPhoneAuth) {
+          // Email/password signups must verify before entering the app —
+          // matches web's register.php -> index.php?registered=verify_pending
+          // flow, which never auto-logs a fresh signup straight into shop.php.
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(
+                builder: (context) =>
+                    EmailVerificationPendingPage(customerId: uid)),
+          );
+        } else if (widget.returnAfterLogin) {
           widget.onLoginSuccess?.call();
           Navigator.pop(context, true);
         } else {

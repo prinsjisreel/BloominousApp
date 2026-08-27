@@ -137,11 +137,32 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
   bool _isSearchingStreet = false;
   Timer? _streetSearchDebounce;
 
+  // --- Account-restriction / phone-trust-restore state ---
+  StreamSubscription<DocumentSnapshot>? _fraudStatusSub;
+  bool _isAccountRestricted = false;
+  String? _restrictedUntilText;
+  bool _otpVerifiedThisSession = false;
+  bool _isVerifyingPhone = false;
+  String? _phoneVerificationId;
+  int _resendCooldown = 0;
+  Timer? _resendTimer;
+  final TextEditingController _otpInputController = TextEditingController();
+  // -------------------------------------------------------
+
   static const double feePerKm = 1.0;
 
   static const Map<String, String> _nominatimHeaders = {
     'User-Agent': 'BloominousApp/1.0 (contact: support@bloominous.example)',
   };
+
+  static const String _restoreTrustEndpoint =
+      'https://honeydew-duck-132160.hostingersite.com/restore_trust.php';
+
+  // check_phone_risk.php requires only a Firebase ID token — same
+  // platform-agnostic shape as record_email_risk.php — so this is
+  // reused as-is from web, no separate mobile endpoint needed.
+  static const String _phoneRiskEndpoint =
+      'https://honeydew-duck-132160.hostingersite.com/check_phone_risk.php';
 
   @override
   void initState() {
@@ -155,6 +176,9 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
 
   @override
   void dispose() {
+    _fraudStatusSub?.cancel();
+    _resendTimer?.cancel();
+    _otpInputController.dispose();
     _streetSearchDebounce?.cancel();
     streetController.removeListener(_onStreetTextChanged);
     postalCodeController.removeListener(_updateFullAddress);
@@ -282,45 +306,51 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
     }
   }
 
-  Future<void> _checkUserFraudStatus() async {
+  void _checkUserFraudStatus() {
     final user = FirebaseAuth.instance.currentUser;
-    if (user != null) {
-      try {
-        final doc = await FirebaseFirestore.instance
-            .collection('customers')
-            .doc(user.uid)
-            .get();
-        if (doc.exists && doc.data() != null) {
-          final data = doc.data()!;
-          final bool isRestricted = data['isRestricted'] ?? false;
-          final bool isBanned = (data['status'] ?? '') == 'blocked';
-          final int score = (data['fraudScore'] ?? 0) as int;
+    if (user == null) return;
 
-          bool restrictCod = false;
-          String reason = "";
+    _fraudStatusSub = FirebaseFirestore.instance
+        .collection('customers')
+        .doc(user.uid)
+        .snapshots()
+        .listen((doc) {
+      if (!mounted || !doc.exists || doc.data() == null) return;
+      final data = doc.data()!;
 
-          if (isBanned || score >= 90) {
-            restrictCod = true;
-            reason = "Account flagged for severe fraud. Cash on Delivery is disabled.";
-          } else if (isRestricted || (score >= 50 && score <= 86)) {
-            restrictCod = true;
-            reason = "Cash-on-Delivery (COD) disabled due to account restriction (50-86% risk rating).";
-          }
+      final bool isRestricted = data['isRestricted'] ?? false;
+      final bool isBanned = (data['status'] ?? '') == 'blocked';
+      final int score = (data['fraudScore'] ?? 0) as int;
+      final restrictedUntil = data['restrictedUntil'];
 
-          if (mounted && restrictCod) {
-            setState(() {
-              isCodRestricted = true;
-              restrictionReason = reason;
-              if (selectedPaymentMethod == 'cod') {
-                selectedPaymentMethod = 'gcash';
-              }
-            });
-          }
-        }
-      } catch (e) {
-        debugPrint('Error checking fraud status: $e');
+      bool restrictCod = false;
+      String reason = "";
+
+      if (isBanned || score >= 90) {
+        restrictCod = true;
+        reason = "Account flagged for severe fraud. Cash on Delivery is disabled.";
+      } else if (isRestricted || (score >= 50 && score <= 86)) {
+        restrictCod = true;
+        reason = "Cash-on-Delivery (COD) disabled due to account restriction (50-86% risk rating).";
       }
-    }
+
+      String? untilText;
+      if (isRestricted && restrictedUntil is Timestamp) {
+        final daysLeft = restrictedUntil.toDate().difference(DateTime.now()).inDays;
+        untilText = daysLeft > 0 ? 'for the next $daysLeft days' : 'for 30 days';
+      }
+
+      setState(() {
+        isCodRestricted = restrictCod;
+        restrictionReason = reason;
+        _isAccountRestricted = isRestricted;
+        _restrictedUntilText = untilText;
+        if (restrictCod && selectedPaymentMethod == 'cod') {
+          selectedPaymentMethod = 'gcash';
+        }
+        if (!isRestricted) _otpVerifiedThisSession = false;
+      });
+    }, onError: (e) => debugPrint('Fraud status listener error: $e'));
   }
 
   void _updateFullAddress() {
@@ -634,6 +664,355 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
     return amount.toStringAsFixed(2);
   }
 
+  void _handlePlaceOrderTapped() {
+    _updateFullAddress();
+    if (recipientController.text.isEmpty ||
+        addressController.text.isEmpty ||
+        phoneController.text.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text('Please fill in all recipient, contact and location choices.')),
+      );
+      return;
+    }
+
+    if (_isAccountRestricted && !_otpVerifiedThisSession) {
+      _showPhoneVerificationSheet();
+      return;
+    }
+
+    _processCheckout(selectedPaymentMethod);
+  }
+
+  /// UX-tier pre-check (see check_phone_risk.php) — stops an obviously
+  /// disposable/VOIP number before spending an SMS credit and gives
+  /// instant feedback. NOT the real enforcement boundary; submit_order.php
+  /// runs its own unbypassable version of this same check regardless of
+  /// what happens here. Fails OPEN on any error, same policy as web's
+  /// checkout.php.
+  Future<bool> _checkPhoneRiskPreCheck(String normalizedPhone) async {
+    try {
+      final user = FirebaseAuth.instance.currentUser;
+      if (user == null) return true;
+      final idToken = await user.getIdToken();
+
+      final response = await http
+          .post(
+        Uri.parse(_phoneRiskEndpoint),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $idToken',
+        },
+        body: jsonEncode({'phone': normalizedPhone}),
+      )
+          .timeout(const Duration(seconds: 8));
+
+      if (response.statusCode != 200) return true;
+
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      if (data['success'] != true) return true;
+
+      if (data['block'] == true) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(data['reason'] as String? ??
+                  'This phone number can\'t be used for verification.'),
+              backgroundColor: Colors.redAccent,
+            ),
+          );
+        }
+        return false;
+      }
+      return true;
+    } catch (e) {
+      debugPrint('Phone risk pre-check failed, proceeding anyway: $e');
+      return true;
+    }
+  }
+
+  Future<void> _startPhoneVerification(String rawPhone) async {
+    setState(() => _isVerifyingPhone = true);
+    String phoneNumber = rawPhone.trim();
+    if (!phoneNumber.startsWith('+')) {
+      if (phoneNumber.startsWith('09')) {
+        phoneNumber = '+63${phoneNumber.substring(2)}';
+      } else if (phoneNumber.startsWith('9')) {
+        phoneNumber = '+63$phoneNumber';
+      } else {
+        phoneNumber = '+63$phoneNumber';
+      }
+    }
+
+    // Cheapest, fastest check first — same ordering principle used
+    // throughout this project's fraud pipeline (rate limit before
+    // anything paid, etc.).
+    final allowed = await _checkPhoneRiskPreCheck(phoneNumber);
+    if (!allowed) {
+      setState(() => _isVerifyingPhone = false);
+      return;
+    }
+
+    try {
+      await FirebaseAuth.instance.verifyPhoneNumber(
+        phoneNumber: phoneNumber,
+        timeout: const Duration(seconds: 60),
+        verificationCompleted: (PhoneAuthCredential credential) async {
+          await _linkPhoneCredential(credential);
+        },
+        verificationFailed: (FirebaseAuthException e) {
+          setState(() => _isVerifyingPhone = false);
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('Verification failed: ${e.message}')),
+            );
+          }
+        },
+        codeSent: (String verificationId, int? resendToken) {
+          setState(() {
+            _phoneVerificationId = verificationId;
+            _isVerifyingPhone = false;
+          });
+          _startResendCooldown();
+        },
+        codeAutoRetrievalTimeout: (String verificationId) {
+          _phoneVerificationId = verificationId;
+        },
+      );
+    } catch (e) {
+      setState(() => _isVerifyingPhone = false);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not send verification code: $e')),
+        );
+      }
+    }
+  }
+
+  void _startResendCooldown() {
+    _resendTimer?.cancel();
+    setState(() => _resendCooldown = 60);
+    _resendTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) return;
+      setState(() {
+        if (_resendCooldown > 0) {
+          _resendCooldown--;
+        } else {
+          timer.cancel();
+        }
+      });
+    });
+  }
+
+  Future<void> _linkPhoneCredential(PhoneAuthCredential credential) async {
+    setState(() => _isVerifyingPhone = true);
+    try {
+      final user = FirebaseAuth.instance.currentUser;
+      if (user == null) throw 'No active session. Please sign in again.';
+
+      try {
+        await user.linkWithCredential(credential);
+      } on FirebaseAuthException catch (e) {
+        if (e.code != 'provider-already-linked') rethrow;
+      }
+
+      final freshToken = await user.getIdToken(true);
+
+      final response = await http.post(
+        Uri.parse(_restoreTrustEndpoint),
+        headers: {'Authorization': 'Bearer $freshToken'},
+      );
+
+      final result = jsonDecode(response.body) as Map<String, dynamic>;
+      if (result['success'] != true) {
+        throw result['message'] ?? 'Could not restore trust. Please try again.';
+      }
+
+      setState(() {
+        _otpVerifiedThisSession = true;
+        _isVerifyingPhone = false;
+      });
+
+      if (mounted) {
+        Navigator.pop(context);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Identity verified! Placing your order...'),
+            backgroundColor: Colors.green,
+          ),
+        );
+        _processCheckout(selectedPaymentMethod);
+      }
+    } catch (e) {
+      setState(() => _isVerifyingPhone = false);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Verification failed: $e')),
+        );
+      }
+    }
+  }
+
+  void _showPhoneVerificationSheet() {
+    _otpInputController.clear();
+    _phoneVerificationId = null;
+    _resendCooldown = 0;
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (sheetContext) {
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            final isDark = Theme.of(context).brightness == Brightness.dark;
+            return Padding(
+              padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+              child: Container(
+                padding: const EdgeInsets.all(24),
+                decoration: BoxDecoration(
+                  color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
+                  borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Container(
+                      width: 40,
+                      height: 4,
+                      margin: const EdgeInsets.only(bottom: 20),
+                      alignment: Alignment.center,
+                      child: Container(
+                        width: 40,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: isDark ? Colors.grey[700] : Colors.grey[300],
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                      ),
+                    ),
+                    Text('Identity Verification',
+                        style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 18,
+                            color: isDark ? Colors.white : Colors.black)),
+                    const SizedBox(height: 8),
+                    Text(
+                      _phoneVerificationId == null
+                          ? 'Enter the 6-digit code to restore your account trust.'
+                          : 'Enter the 6-digit code sent to your phone.',
+                      style: TextStyle(fontSize: 12, color: isDark ? Colors.grey[400] : Colors.grey[600]),
+                    ),
+                    const SizedBox(height: 20),
+                    if (_phoneVerificationId == null) ...[
+                      Container(
+                        padding: const EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: isDark ? const Color(0xFF2A2A2A) : const Color(0xFFF8F8F6),
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.phone_android, color: Color(0xFFF4B400), size: 20),
+                            const SizedBox(width: 10),
+                            Text('We will send a code to ${phoneController.text}',
+                                style: TextStyle(
+                                    fontSize: 13, color: isDark ? Colors.white : Colors.black87)),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 20),
+                      SizedBox(
+                        height: 50,
+                        child: ElevatedButton(
+                          onPressed: _isVerifyingPhone
+                              ? null
+                              : () async {
+                            await _startPhoneVerification(phoneController.text);
+                            setModalState(() {});
+                          },
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFFF4B400),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                          ),
+                          child: _isVerifyingPhone
+                              ? const SizedBox(
+                              width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                              : const Text('SEND CODE',
+                              style: TextStyle(fontWeight: FontWeight.bold)),
+                        ),
+                      ),
+                    ] else ...[
+                      TextField(
+                        controller: _otpInputController,
+                        keyboardType: TextInputType.number,
+                        maxLength: 6,
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                            fontSize: 26,
+                            letterSpacing: 10,
+                            fontWeight: FontWeight.bold,
+                            color: isDark ? Colors.white : Colors.black),
+                        decoration: InputDecoration(
+                          counterText: '',
+                          hintText: '000000',
+                          filled: true,
+                          fillColor: isDark ? const Color(0xFF2A2A2A) : const Color(0xFFF8F8F6),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(14),
+                            borderSide: BorderSide.none,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      SizedBox(
+                        height: 50,
+                        child: ElevatedButton(
+                          onPressed: _isVerifyingPhone
+                              ? null
+                              : () {
+                            if (_otpInputController.text.length != 6) return;
+                            final credential = PhoneAuthProvider.credential(
+                              verificationId: _phoneVerificationId!,
+                              smsCode: _otpInputController.text.trim(),
+                            );
+                            _linkPhoneCredential(credential);
+                          },
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFFF4B400),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                          ),
+                          child: _isVerifyingPhone
+                              ? const SizedBox(
+                              width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                              : const Text('VERIFY', style: TextStyle(fontWeight: FontWeight.bold)),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Center(
+                        child: TextButton(
+                          onPressed: (_resendCooldown > 0 || _isVerifyingPhone)
+                              ? null
+                              : () async {
+                            await _startPhoneVerification(phoneController.text);
+                            setModalState(() {});
+                          },
+                          child: Text(_resendCooldown > 0
+                              ? 'Resend in ${_resendCooldown}s'
+                              : 'Resend Code'),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
   Future<void> _processCheckout(String method) async {
     _updateFullAddress();
     if (recipientController.text.isEmpty ||
@@ -703,6 +1082,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
           isGift: sendAsGift,
           customerLat: _customerLat,
           customerLng: _customerLng,
+          otpVerified: _otpVerifiedThisSession,
         );
 
         final url = Uri.parse(checkoutUrl);
@@ -725,6 +1105,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
           isGift: sendAsGift,
           customerLat: _customerLat,
           customerLng: _customerLng,
+          otpVerified: _otpVerifiedThisSession,
         );
 
         debugPrint('Order placed: ${result.invoiceId} (${result.orderId})');
@@ -739,8 +1120,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
     } on OrderSubmissionException catch (e) {
       String message = e.message;
       if (e.code == 'RESTRICTED') {
-        message =
-        '$message\n\nPhone verification is required to lift this restriction — this flow isn\'t available in the app yet. Please contact support.';
+        setState(() => _otpVerifiedThisSession = false);
       }
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -776,6 +1156,52 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            if (_isAccountRestricted) ...[
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.amber.withOpacity(isDark ? 0.15 : 0.1),
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(color: Colors.amber.withOpacity(0.4)),
+                ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Icon(Icons.warning_amber_rounded, color: Colors.amber, size: 22),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            _otpVerifiedThisSession
+                                ? 'Identity Verified'
+                                : 'Account Soft Restriction Active',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 12,
+                              color: isDark ? Colors.amber[200] : Colors.amber[900],
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            _otpVerifiedThisSession
+                                ? 'You\'ve verified your identity for this order. You can now place it normally.'
+                                : 'This account was restricted ${_restrictedUntilText ?? "for 30 days"} due to behavioral tracking flags. A verification code will be required to place an order.',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: isDark ? Colors.amber[100] : Colors.amber[800],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+            ],
             _sectionCard(
               context,
               title: 'Recipient Information',
@@ -1114,7 +1540,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
               SizedBox(
                 height: 58,
                 child: ElevatedButton(
-                  onPressed: () => _processCheckout(selectedPaymentMethod),
+                  onPressed: _handlePlaceOrderTapped,
                   style: _actionButtonStyle(const Color(0xFFF4B400)),
                   child: const Text('PLACE ORDER',
                       style: TextStyle(fontWeight: FontWeight.w800, letterSpacing: 1)),

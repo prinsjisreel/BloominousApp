@@ -1,8 +1,10 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:model_viewer_plus/model_viewer_plus.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'inventory_data.dart';
 import 'delivery_details_page.dart';
 import 'auth_page.dart';
@@ -33,11 +35,21 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
   late final AnimationController _pageFadeController;
   late final Animation<double> _pageFadeAnimation;
 
+  // --- Account restriction banner state — mirrors shop.php's real-time
+  // "Real-Time Account Soft-Restriction Listener Engine Hook" so a
+  // flagged customer sees the same warning while browsing on mobile,
+  // not just at checkout.
+  StreamSubscription<DocumentSnapshot>? _restrictionSub;
+  bool _isAccountRestricted = false;
+  String? _restrictedUntilText;
+  bool _restrictionBannerDismissed = false;
+
   @override
   void initState() {
     super.initState();
     _loadBranchDetails();
     _getCurrentLocation();
+    _listenToRestrictionStatus();
 
     _pageFadeController = AnimationController(
       vsync: this,
@@ -52,9 +64,41 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
 
   @override
   void dispose() {
+    _restrictionSub?.cancel();
     _pageFadeController.dispose();
     _searchController.dispose();
     super.dispose();
+  }
+
+  /// Real-time listener on the signed-in customer's own doc — same
+  /// pattern as delivery_details_page.dart's fraud-status listener, and
+  /// matching web's onSnapshot-based restriction banner. Guests/anonymous
+  /// users never have a customer doc, so this simply does nothing for them.
+  void _listenToRestrictionStatus() {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null || user.isAnonymous) return;
+
+    _restrictionSub = FirebaseFirestore.instance
+        .collection('customers')
+        .doc(user.uid)
+        .snapshots()
+        .listen((doc) {
+      if (!mounted || !doc.exists || doc.data() == null) return;
+      final data = doc.data()!;
+      final bool isRestricted = data['isRestricted'] ?? false;
+      final restrictedUntil = data['restrictedUntil'];
+
+      String? untilText;
+      if (isRestricted && restrictedUntil is Timestamp) {
+        final daysLeft = restrictedUntil.toDate().difference(DateTime.now()).inDays;
+        untilText = daysLeft > 0 ? 'for the next $daysLeft days' : 'for 30 days';
+      }
+
+      setState(() {
+        _isAccountRestricted = isRestricted;
+        _restrictedUntilText = untilText;
+      });
+    }, onError: (e) => debugPrint('Restriction status listener error: $e'));
   }
 
   Future<void> _loadBranchDetails() async {
@@ -229,10 +273,9 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
         _cart[id] = (_cart[id] ?? 0) + 1;
         _cartItemDetails[id] = product;
       });
-      // No snackbar here anymore — the persistent mini-cart bar at the
-      // bottom of the screen already shows "N items in cart / View Cart"
-      // the instant _cartItemCount goes above 0, so a snackbar saying
-      // the same thing a moment later was pure duplication.
+      // No snackbar here — the persistent mini-cart bar at the bottom of
+      // the screen already shows "N items in cart / View Cart" the
+      // instant _cartItemCount goes above 0.
     });
   }
 
@@ -655,6 +698,69 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
     });
   }
 
+  Widget _buildRestrictionBanner(bool isDark) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      decoration: BoxDecoration(
+        color: isDark ? const Color(0xFF3A1418) : const Color(0xFFFDF0F0),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(
+          color: (isDark ? Colors.red[300]! : Colors.red[200]!).withOpacity(0.5),
+        ),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: Colors.red.withOpacity(isDark ? 0.2 : 0.12),
+              shape: BoxShape.circle,
+            ),
+            child: Icon(Icons.shield_rounded,
+                color: isDark ? Colors.red[300] : Colors.red[600], size: 18),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'SECURITY PROTOCOL RESTRICTION TRIGGERED',
+                  style: TextStyle(
+                    fontWeight: FontWeight.w800,
+                    fontSize: 11,
+                    letterSpacing: 0.2,
+                    color: isDark ? Colors.red[200] : Colors.red[900],
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Your account was restricted ${_restrictedUntilText ?? "for 30 days"}. A verification code will be required to place an order.',
+                  style: TextStyle(
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w600,
+                    color: isDark ? Colors.red[100] : Colors.red[700],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          InkWell(
+            onTap: () => setState(() => _restrictionBannerDismissed = true),
+            borderRadius: BorderRadius.circular(12),
+            child: Padding(
+              padding: const EdgeInsets.all(4),
+              child: Icon(Icons.close_rounded,
+                  size: 18, color: isDark ? Colors.red[300] : Colors.red[400]),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -718,6 +824,9 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
         opacity: _pageFadeAnimation,
         child: Column(
           children: [
+            if (_isAccountRestricted && !_restrictionBannerDismissed)
+              _buildRestrictionBanner(isDark),
+
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
               child: Row(
@@ -1132,8 +1241,6 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
           : null,
       floatingActionButtonLocation: FloatingActionButtonLocation.endFloat,
       floatingActionButton: Padding(
-        // Reduced from 72 — just enough clearance to clear the cart bar's
-        // own height without leaving a visible gap floating above it.
         padding: EdgeInsets.only(
           bottom: _cartItemCount > 0
               ? 58 + MediaQuery.of(context).padding.bottom
