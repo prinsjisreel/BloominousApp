@@ -1,10 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'dart:math';
-import 'dart:convert';
 import 'dart:async';
-import 'package:http/http.dart' as http;
 import 'package:google_fonts/google_fonts.dart';
 
 import 'main.dart';
@@ -33,7 +30,6 @@ class AuthPage extends StatefulWidget {
 
 class _AuthPageState extends State<AuthPage> {
   final TextEditingController _emailController = TextEditingController();
-  final TextEditingController _otpController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
   final TextEditingController _confirmPasswordController = TextEditingController();
   final TextEditingController _firstNameController = TextEditingController();
@@ -43,12 +39,9 @@ class _AuthPageState extends State<AuthPage> {
   DateTime? _selectedBirthday;
   String _selectedSex = 'Male';
 
-  bool _isOtpSent = false;
   bool _isLoading = false;
   bool _obscurePassword = true;
   bool _isSigningUp = false;
-
-  String? _generatedOtp;
 
   // --- COUNTDOWN STATE ---
   int _remainingLockoutSeconds = 0;
@@ -154,8 +147,13 @@ class _AuthPageState extends State<AuthPage> {
           final userData = existingDoc.data() as Map<String, dynamic>;
           final oldDocId = existingDoc.id;
 
+          // 'password' stripped before writing — firestore.rules blocks
+          // any client create/update on `customers` that includes a
+          // 'password' key at all, regardless of its value.
+          final sanitizedUserData = Map<String, dynamic>.from(userData)..remove('password');
+
           await _firestore.collection('customers').doc(user.uid).set({
-            ...userData,
+            ...sanitizedUserData,
             'lastLogin': FieldValue.serverTimestamp(),
             'migratedFrom': oldDocId,
           }, SetOptions(merge: true));
@@ -181,6 +179,12 @@ class _AuthPageState extends State<AuthPage> {
     }
   }
 
+  /// Registration entry point — now matches web's register.php shape
+  /// exactly: validate fields, check for an existing account, then go
+  /// straight to _registerNewUser(). No pre-account OTP step; the real
+  /// email-ownership proof happens AFTER account creation via Firebase's
+  /// own verification link (see _registerNewUser() and
+  /// EmailVerificationPendingPage), same as web.
   Future<void> _handleContinue() async {
     final email = _emailController.text.trim().toLowerCase();
     if (email.isEmpty || !email.contains('@')) {
@@ -242,7 +246,9 @@ class _AuthPageState extends State<AuthPage> {
           ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Email already exists. Please sign in.')));
           return;
         }
-        _sendOtp();
+        // Straight to account creation — matches web's register.php,
+        // which never has a pre-account verification-code step either.
+        await _registerNewUser();
       }
     } catch (e) {
       setState(() => _isLoading = false);
@@ -312,7 +318,6 @@ class _AuthPageState extends State<AuthPage> {
             throw Exception('Incorrect password.');
           }
         } else {
-          // Explicitly throw a clean error if email is not found
           throw Exception('Account not found. Please click "REGISTER HERE" to sign up.');
         }
       }
@@ -338,9 +343,10 @@ class _AuthPageState extends State<AuthPage> {
           final oldId = existingDoc.id;
 
           if (oldId != uid) {
+            final sanitizedUserData = Map<String, dynamic>.from(userData)..remove('password');
+
             await _firestore.collection('customers').doc(uid).set({
-              ...userData,
-              'password': 'migrated_to_auth',
+              ...sanitizedUserData,
               'lastLogin': FieldValue.serverTimestamp(),
               'migratedFrom': oldId,
             }, SetOptions(merge: true));
@@ -397,174 +403,6 @@ class _AuthPageState extends State<AuthPage> {
     }
   }
 
-  final String _emailJsServiceId = 'service_o3ezmmu';
-  final String _emailJsTemplateId = 'template_xxvpjru';
-  final String _emailJsPublicKey = 'Mm9xloWH69DjgykmX';
-
-  String _generatePin() {
-    var rng = Random();
-    var code = rng.nextInt(900000) + 100000;
-    return code.toString();
-  }
-
-  Future<void> _sendEmailJS(String email, String otp) async {
-    final url = Uri.parse('https://api.emailjs.com/api/v1.0/email/send');
-    try {
-      final response = await http.post(
-        url,
-        headers: {'Content-Type': 'application/json', 'origin': 'http://localhost'},
-        body: jsonEncode({
-          'service_id': _emailJsServiceId,
-          'template_id': _emailJsTemplateId,
-          'user_id': _emailJsPublicKey,
-          'template_params': {'email': email, 'passcode': otp, 'time': '15 minutes'},
-        }),
-      );
-      if (response.statusCode != 200) {
-        throw Exception('EmailJS Error (${response.statusCode}): ${response.body}');
-      }
-    } catch (e) {
-      rethrow;
-    }
-  }
-
-  Future<void> _sendOtp() async {
-    final email = _emailController.text.trim().toLowerCase();
-
-    if (await _isRateLimited()) return;
-
-    setState(() => _isLoading = true);
-
-    try {
-      final existingDoc = await _firestore.collection('customer_otps').doc(email).get();
-
-      if (existingDoc.exists) {
-        final data = existingDoc.data() as Map<String, dynamic>;
-        final expiresAtStr = data['expiresAt'] as String?;
-
-        if (expiresAtStr != null) {
-          final expiresAt = DateTime.parse(expiresAtStr);
-          if (DateTime.now().isBefore(expiresAt)) {
-            setState(() {
-              _isOtpSent = true;
-              _isLoading = false;
-            });
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('A valid PIN was already sent. Please check your inbox.'), backgroundColor: Color(0xFF1A1A1A)),
-              );
-            }
-            return;
-          }
-        }
-      }
-
-      final otp = _generatePin();
-      _generatedOtp = otp;
-
-      await _firestore.collection('customer_otps').doc(email).set({
-        'otp': otp,
-        'email': email,
-        'createdAt': FieldValue.serverTimestamp(),
-        'expiresAt': DateTime.now().add(const Duration(minutes: 5)).toIso8601String(),
-      });
-
-      await _sendEmailJS(email, otp);
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Verification PIN sent to your email!'), backgroundColor: Color(0xFF1A1A1A)),
-        );
-      }
-
-      setState(() {
-        _isOtpSent = true;
-        _isLoading = false;
-      });
-    } catch (e) {
-      setState(() => _isLoading = false);
-      await _securityService.recordFailedAttempt();
-      await _isRateLimited();
-      if (mounted) {
-        _showMockDialog(email, _generatedOtp ?? '000000', e.toString());
-      }
-    }
-  }
-
-  void _showMockDialog(String email, String otp, String error) {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFFFEFCF8),
-        title: const Text('Email Connection Error', style: TextStyle(color: Colors.red, fontSize: 16)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text('Real email failed: $error', style: const TextStyle(fontSize: 12)),
-            const Divider(),
-            const Text('For testing, use this PIN:'),
-            const SizedBox(height: 8),
-            Text(otp, style: const TextStyle(fontSize: 32, fontWeight: FontWeight.bold, letterSpacing: 8, color: Color(0xFF5D4037))),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              Navigator.pop(context);
-              setState(() => _isOtpSent = true);
-            },
-            child: const Text('Use PIN anyway', style: TextStyle(color: Color(0xFF5D4037))),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _verifyOtp() async {
-    final email = _emailController.text.trim().toLowerCase();
-    final enteredOtp = _otpController.text.trim();
-
-    if (enteredOtp.isEmpty) return;
-    if (await _isRateLimited()) return;
-
-    setState(() => _isLoading = true);
-
-    try {
-      final doc = await _firestore.collection('customer_otps').doc(email).get();
-
-      if (doc.exists) {
-        final data = doc.data() as Map<String, dynamic>;
-        final correctOtp = data['otp'];
-        final expiresAtStr = data['expiresAt'] as String?;
-
-        if (expiresAtStr != null) {
-          final expiresAt = DateTime.parse(expiresAtStr);
-          if (DateTime.now().isAfter(expiresAt)) {
-            throw Exception('PIN has expired. Please request a new one.');
-          }
-        }
-
-        if (enteredOtp == correctOtp) {
-          await _securityService.resetAttempts();
-          await _registerNewUser(); // Proceed to create the account
-        } else {
-          throw Exception('Invalid PIN. Please try again.');
-        }
-      } else {
-        throw Exception('No PIN found for $email. Please try sending it first.');
-      }
-    } catch (e) {
-      setState(() => _isLoading = false);
-      await _securityService.recordFailedAttempt();
-      await _isRateLimited();
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(e.toString().replaceAll('Exception: ', '')), backgroundColor: Colors.redAccent),
-        );
-      }
-    }
-  }
-
   bool _isDisposableEmail(String email) {
     if (!email.contains('@')) return true;
     final domain = email.split('@')[1].toLowerCase().trim();
@@ -600,6 +438,10 @@ class _AuthPageState extends State<AuthPage> {
     }
   }
 
+  /// Creates the account directly — matches register.php's real shape:
+  /// checks pass → createUserWithEmailAndPassword → write customer doc →
+  /// send verification link → show "check your inbox" page. No OTP
+  /// anywhere in this sequence, same as web.
   Future<void> _registerNewUser() async {
     final email = _emailController.text.trim().toLowerCase();
     final password = _passwordController.text.trim();
@@ -673,8 +515,6 @@ class _AuthPageState extends State<AuthPage> {
         await _firestore.collection('users').doc(uid).set(userData, SetOptions(merge: true));
       }
 
-      await _firestore.collection('customer_otps').doc(email).delete();
-
       if (riskResult.flagged && riskResult.scoreBump > 0) {
         await _registrationRiskService.recordScore(riskResult.scoreBump);
       }
@@ -695,319 +535,264 @@ class _AuthPageState extends State<AuthPage> {
 
   @override
   Widget build(BuildContext context) {
-    // Dynamic Theme Variables for Light/Dark Mode Support
     final isDark = Theme.of(context).brightness == Brightness.dark;
-
-    // In Light mode: Cream background. In Dark Mode: Deep Espresso/Charcoal
     final bgColor = isDark ? const Color(0xFF1C1814) : const Color(0xFFFCF9F5);
-
-    // In Light mode: Pure White card. In Dark Mode: Darker Espresso card
     final cardColor = isDark ? const Color(0xFF2A241D) : Colors.white;
-
-    // Text colors
     final textColor = isDark ? const Color(0xFFEAE6DF) : const Color(0xFF1A1A1A);
     final subTextColor = isDark ? const Color(0xFFA0998F) : const Color(0xFF9E9E9E);
-
-    // Input borders and fills
     final borderColor = isDark ? const Color(0xFF3F382F) : const Color(0xFFE0E0E0);
     final inputFillColor = isDark ? const Color(0xFF221D17) : Colors.white;
 
-    return PopScope(
-      canPop: !_isOtpSent,
-      onPopInvokedWithResult: (didPop, result) {
-        if (didPop) return;
-        if (_isOtpSent) {
-          setState(() => _isOtpSent = false);
-        }
-      },
-      child: Scaffold(
-        backgroundColor: bgColor,
-        body: Center(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 40.0),
-            child: Container(
-              constraints: const BoxConstraints(maxWidth: 450),
-              padding: const EdgeInsets.symmetric(horizontal: 40.0, vertical: 56.0),
-              decoration: BoxDecoration(
-                color: cardColor,
-                borderRadius: BorderRadius.circular(24),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withOpacity(isDark ? 0.4 : 0.04),
-                    blurRadius: 40,
-                    offset: const Offset(0, 10),
+    return Scaffold(
+      backgroundColor: bgColor,
+      body: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 40.0),
+          child: Container(
+            constraints: const BoxConstraints(maxWidth: 450),
+            padding: const EdgeInsets.symmetric(horizontal: 40.0, vertical: 56.0),
+            decoration: BoxDecoration(
+              color: cardColor,
+              borderRadius: BorderRadius.circular(24),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(isDark ? 0.4 : 0.04),
+                  blurRadius: 40,
+                  offset: const Offset(0, 10),
+                ),
+              ],
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // --- BLOOM LOGO TEXT ---
+                Text(
+                  'B L O O M',
+                  textAlign: TextAlign.center,
+                  style: GoogleFonts.cormorantGaramond(
+                    fontSize: 32,
+                    fontWeight: FontWeight.bold,
+                    color: _primaryGold,
+                    letterSpacing: 4.0,
                   ),
-                ],
-              ),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  // Back button for OTP State
-                  if (_isOtpSent)
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: IconButton(
-                        padding: EdgeInsets.zero,
-                        constraints: const BoxConstraints(),
-                        icon: Icon(Icons.arrow_back, color: textColor),
-                        onPressed: () => setState(() => _isOtpSent = false),
-                      ),
-                    ),
+                ),
+                const SizedBox(height: 24),
 
-                  // --- BLOOM LOGO TEXT ---
-                  Text(
-                    'B L O O M',
-                    textAlign: TextAlign.center,
-                    style: GoogleFonts.cormorantGaramond(
-                      fontSize: 32,
-                      fontWeight: FontWeight.bold,
-                      color: _primaryGold,
-                      letterSpacing: 4.0,
-                    ),
+                // --- HEADINGS ---
+                Text(
+                  _isSigningUp ? 'Create an Account' : 'Authenticated Access',
+                  textAlign: TextAlign.center,
+                  style: GoogleFonts.cormorantGaramond(
+                    fontSize: 34,
+                    color: textColor,
+                    fontWeight: FontWeight.w600,
+                    height: 1.1,
                   ),
-                  const SizedBox(height: 24),
-
-                  // --- HEADINGS ---
-                  Text(
-                    _isOtpSent
-                        ? 'Verify Email'
-                        : (_isSigningUp ? 'Create an Account' : 'Authenticated Access'),
-                    textAlign: TextAlign.center,
-                    style: GoogleFonts.cormorantGaramond(
-                      fontSize: 34,
-                      color: textColor,
-                      fontWeight: FontWeight.w600,
-                      height: 1.1,
-                    ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  _isSigningUp ? 'CUSTOMER REGISTRATION' : 'MANAGEMENT CONSOLE LOGIN',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: subTextColor,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.8,
                   ),
-                  const SizedBox(height: 8),
-                  Text(
-                    _isOtpSent
-                        ? 'ENTER YOUR ONE-TIME PIN'
-                        : (_isSigningUp ? 'CUSTOMER REGISTRATION' : 'MANAGEMENT CONSOLE LOGIN'),
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: subTextColor,
-                      fontWeight: FontWeight.w700,
-                      letterSpacing: 1.8,
+                ),
+                const SizedBox(height: 48),
+
+                // --- LOCKOUT WARNING UI ---
+                if (_superAdminLocked || _remainingLockoutSeconds > 0)
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    margin: const EdgeInsets.only(bottom: 24),
+                    decoration: BoxDecoration(
+                      color: Colors.red.withOpacity(isDark ? 0.15 : 0.05),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.red.withOpacity(0.3)),
                     ),
-                  ),
-                  const SizedBox(height: 48),
-
-                  // --- LOCKOUT WARNING UI ---
-                  if (_superAdminLocked || _remainingLockoutSeconds > 0)
-                    Container(
-                      padding: const EdgeInsets.all(12),
-                      margin: const EdgeInsets.only(bottom: 24),
-                      decoration: BoxDecoration(
-                        color: Colors.red.withOpacity(isDark ? 0.15 : 0.05),
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: Colors.red.withOpacity(0.3)),
-                      ),
-                      child: Row(
-                        children: [
-                          const Icon(Icons.lock_clock, color: Colors.redAccent, size: 20),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: Text(
-                              _superAdminLocked
-                                  ? 'Account locked. Please coordinate with a Super Admin.'
-                                  : 'Too many attempts. Please wait $_remainingLockoutSeconds seconds.',
-                              style: const TextStyle(color: Colors.redAccent, fontSize: 13, fontWeight: FontWeight.bold),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-
-                  // --- FORM FIELDS ---
-                  if (!_isOtpSent) ...[
-                    if (_isSigningUp) ...[
-                      _buildTextField(
-                        controller: _firstNameController,
-                        hint: 'First Name',
-                        textColor: textColor,
-                        subTextColor: subTextColor,
-                        borderColor: borderColor,
-                        fillColor: inputFillColor,
-                      ),
-                      _buildTextField(
-                        controller: _middleNameController,
-                        hint: 'Middle Name',
-                        textColor: textColor,
-                        subTextColor: subTextColor,
-                        borderColor: borderColor,
-                        fillColor: inputFillColor,
-                      ),
-                      _buildTextField(
-                        controller: _lastNameController,
-                        hint: 'Last Name',
-                        textColor: textColor,
-                        subTextColor: subTextColor,
-                        borderColor: borderColor,
-                        fillColor: inputFillColor,
-                      ),
-
-                      // Birthday Picker
-                      GestureDetector(
-                        onTap: () async {
-                          final date = await showDatePicker(
-                            context: context,
-                            initialDate: DateTime(2000),
-                            firstDate: DateTime(1950),
-                            lastDate: DateTime.now(),
-                          );
-                          if (date != null) setState(() => _selectedBirthday = date);
-                        },
-                        child: Container(
-                          margin: const EdgeInsets.only(bottom: 16),
-                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 18),
-                          decoration: BoxDecoration(
-                            color: inputFillColor,
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(color: borderColor, width: 1),
-                          ),
-                          child: Text(
-                            _selectedBirthday == null ? 'Select Birthday' : 'Birthday: ${_selectedBirthday!.toIso8601String().split('T')[0]}',
-                            style: TextStyle(color: _selectedBirthday == null ? subTextColor : textColor, fontSize: 15),
-                          ),
-                        ),
-                      ),
-
-                      // Sex Dropdown
-                      Container(
-                        margin: const EdgeInsets.only(bottom: 16),
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                        decoration: BoxDecoration(
-                          color: inputFillColor,
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: borderColor, width: 1),
-                        ),
-                        child: DropdownButtonHideUnderline(
-                          child: DropdownButton<String>(
-                            value: _selectedSex,
-                            isExpanded: true,
-                            dropdownColor: cardColor,
-                            icon: Icon(Icons.arrow_drop_down, color: subTextColor),
-                            style: TextStyle(color: textColor, fontSize: 15),
-                            items: const [
-                              DropdownMenuItem(value: 'Male', child: Text('Male')),
-                              DropdownMenuItem(value: 'Female', child: Text('Female')),
-                            ],
-                            onChanged: (val) => setState(() => _selectedSex = val!),
-                          ),
-                        ),
-                      ),
-                    ],
-
-                    _buildTextField(
-                      controller: _emailController,
-                      hint: 'Email Address',
-                      keyboardType: TextInputType.emailAddress,
-                      textColor: textColor,
-                      subTextColor: subTextColor,
-                      borderColor: borderColor,
-                      fillColor: inputFillColor,
-                    ),
-
-                    _buildTextField(
-                      controller: _passwordController,
-                      hint: 'Password',
-                      isPassword: true,
-                      obscureText: _obscurePassword,
-                      onToggleVisibility: () => setState(() => _obscurePassword = !_obscurePassword),
-                      textColor: textColor,
-                      subTextColor: subTextColor,
-                      borderColor: borderColor,
-                      fillColor: inputFillColor,
-                    ),
-
-                    if (_isSigningUp)
-                      _buildTextField(
-                        controller: _confirmPasswordController,
-                        hint: 'Confirm Password',
-                        isPassword: true,
-                        obscureText: _obscurePassword,
-                        textColor: textColor,
-                        subTextColor: subTextColor,
-                        borderColor: borderColor,
-                        fillColor: inputFillColor,
-                      ),
-
-                    if (!_isSigningUp)
-                      Align(
-                        alignment: Alignment.centerRight,
-                        child: TextButton(
-                          onPressed: _forgotPassword,
-                          style: TextButton.styleFrom(
-                            padding: EdgeInsets.zero,
-                            minimumSize: const Size(50, 30),
-                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                          ),
-                          child: Text(
-                            'Forgot Password?',
-                            style: TextStyle(color: subTextColor, fontSize: 13, fontWeight: FontWeight.bold),
-                          ),
-                        ),
-                      ),
-
-                    const SizedBox(height: 32),
-
-                    _buildPrimaryButton(
-                      onPressed: (_isLoading || _superAdminLocked || _remainingLockoutSeconds > 0)
-                          ? null
-                          : (_isSigningUp ? _handleContinue : _loginWithPassword),
-                      text: _isSigningUp ? 'REGISTER' : 'LOGIN',
-                      isLoading: _isLoading,
-                    ),
-
-                    const SizedBox(height: 32),
-
-                    // Toggle Register/Login
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
+                    child: Row(
                       children: [
-                        Text(
-                          _isSigningUp ? "Already have an account?  " : "Don't have an account?  ",
-                          style: TextStyle(color: subTextColor, fontSize: 13, fontWeight: FontWeight.bold),
-                        ),
-                        GestureDetector(
-                          onTap: () => setState(() {
-                            _isSigningUp = !_isSigningUp;
-                            _emailController.clear();
-                            _passwordController.clear();
-                          }),
+                        const Icon(Icons.lock_clock, color: Colors.redAccent, size: 20),
+                        const SizedBox(width: 12),
+                        Expanded(
                           child: Text(
-                            _isSigningUp ? 'LOGIN HERE' : 'REGISTER HERE',
-                            style: TextStyle(color: textColor, fontSize: 13, fontWeight: FontWeight.bold),
+                            _superAdminLocked
+                                ? 'Account locked. Please coordinate with a Super Admin.'
+                                : 'Too many attempts. Please wait $_remainingLockoutSeconds seconds.',
+                            style: const TextStyle(color: Colors.redAccent, fontSize: 13, fontWeight: FontWeight.bold),
                           ),
                         ),
                       ],
                     ),
-                  ] else ...[
-                    // --- OTP STATE ---
-                    _buildTextField(
-                      controller: _otpController,
-                      hint: '000000',
-                      keyboardType: TextInputType.number,
-                      maxLength: 6,
-                      isOtp: true,
-                      textColor: textColor,
-                      subTextColor: subTextColor,
-                      borderColor: borderColor,
-                      fillColor: inputFillColor,
+                  ),
+
+                // --- FORM FIELDS ---
+                if (_isSigningUp) ...[
+                  _buildTextField(
+                    controller: _firstNameController,
+                    hint: 'First Name',
+                    textColor: textColor,
+                    subTextColor: subTextColor,
+                    borderColor: borderColor,
+                    fillColor: inputFillColor,
+                  ),
+                  _buildTextField(
+                    controller: _middleNameController,
+                    hint: 'Middle Name',
+                    textColor: textColor,
+                    subTextColor: subTextColor,
+                    borderColor: borderColor,
+                    fillColor: inputFillColor,
+                  ),
+                  _buildTextField(
+                    controller: _lastNameController,
+                    hint: 'Last Name',
+                    textColor: textColor,
+                    subTextColor: subTextColor,
+                    borderColor: borderColor,
+                    fillColor: inputFillColor,
+                  ),
+
+                  // Birthday Picker
+                  GestureDetector(
+                    onTap: () async {
+                      final date = await showDatePicker(
+                        context: context,
+                        initialDate: DateTime(2000),
+                        firstDate: DateTime(1950),
+                        lastDate: DateTime.now(),
+                      );
+                      if (date != null) setState(() => _selectedBirthday = date);
+                    },
+                    child: Container(
+                      margin: const EdgeInsets.only(bottom: 16),
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 18),
+                      decoration: BoxDecoration(
+                        color: inputFillColor,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: borderColor, width: 1),
+                      ),
+                      child: Text(
+                        _selectedBirthday == null ? 'Select Birthday' : 'Birthday: ${_selectedBirthday!.toIso8601String().split('T')[0]}',
+                        style: TextStyle(color: _selectedBirthday == null ? subTextColor : textColor, fontSize: 15),
+                      ),
                     ),
-                    const SizedBox(height: 32),
-                    _buildPrimaryButton(
-                      onPressed: (_isLoading || _superAdminLocked || _remainingLockoutSeconds > 0) ? null : _verifyOtp,
-                      text: 'VERIFY',
-                      isLoading: _isLoading,
+                  ),
+
+                  // Sex Dropdown
+                  Container(
+                    margin: const EdgeInsets.only(bottom: 16),
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: inputFillColor,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: borderColor, width: 1),
+                    ),
+                    child: DropdownButtonHideUnderline(
+                      child: DropdownButton<String>(
+                        value: _selectedSex,
+                        isExpanded: true,
+                        dropdownColor: cardColor,
+                        icon: Icon(Icons.arrow_drop_down, color: subTextColor),
+                        style: TextStyle(color: textColor, fontSize: 15),
+                        items: const [
+                          DropdownMenuItem(value: 'Male', child: Text('Male')),
+                          DropdownMenuItem(value: 'Female', child: Text('Female')),
+                        ],
+                        onChanged: (val) => setState(() => _selectedSex = val!),
+                      ),
+                    ),
+                  ),
+                ],
+
+                _buildTextField(
+                  controller: _emailController,
+                  hint: 'Email Address',
+                  keyboardType: TextInputType.emailAddress,
+                  textColor: textColor,
+                  subTextColor: subTextColor,
+                  borderColor: borderColor,
+                  fillColor: inputFillColor,
+                ),
+
+                _buildTextField(
+                  controller: _passwordController,
+                  hint: 'Password',
+                  isPassword: true,
+                  obscureText: _obscurePassword,
+                  onToggleVisibility: () => setState(() => _obscurePassword = !_obscurePassword),
+                  textColor: textColor,
+                  subTextColor: subTextColor,
+                  borderColor: borderColor,
+                  fillColor: inputFillColor,
+                ),
+
+                if (_isSigningUp)
+                  _buildTextField(
+                    controller: _confirmPasswordController,
+                    hint: 'Confirm Password',
+                    isPassword: true,
+                    obscureText: _obscurePassword,
+                    textColor: textColor,
+                    subTextColor: subTextColor,
+                    borderColor: borderColor,
+                    fillColor: inputFillColor,
+                  ),
+
+                if (!_isSigningUp)
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton(
+                      onPressed: _forgotPassword,
+                      style: TextButton.styleFrom(
+                        padding: EdgeInsets.zero,
+                        minimumSize: const Size(50, 30),
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      child: Text(
+                        'Forgot Password?',
+                        style: TextStyle(color: subTextColor, fontSize: 13, fontWeight: FontWeight.bold),
+                      ),
+                    ),
+                  ),
+
+                const SizedBox(height: 32),
+
+                _buildPrimaryButton(
+                  onPressed: (_isLoading || _superAdminLocked || _remainingLockoutSeconds > 0)
+                      ? null
+                      : (_isSigningUp ? _handleContinue : _loginWithPassword),
+                  text: _isSigningUp ? 'REGISTER' : 'LOGIN',
+                  isLoading: _isLoading,
+                ),
+
+                const SizedBox(height: 32),
+
+                // Toggle Register/Login
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Text(
+                      _isSigningUp ? "Already have an account?  " : "Don't have an account?  ",
+                      style: TextStyle(color: subTextColor, fontSize: 13, fontWeight: FontWeight.bold),
+                    ),
+                    GestureDetector(
+                      onTap: () => setState(() {
+                        _isSigningUp = !_isSigningUp;
+                        _emailController.clear();
+                        _passwordController.clear();
+                      }),
+                      child: Text(
+                        _isSigningUp ? 'LOGIN HERE' : 'REGISTER HERE',
+                        style: TextStyle(color: textColor, fontSize: 13, fontWeight: FontWeight.bold),
+                      ),
                     ),
                   ],
-                ],
-              ),
+                ),
+              ],
             ),
           ),
         ),
@@ -1023,8 +808,6 @@ class _AuthPageState extends State<AuthPage> {
     required Color borderColor,
     required Color fillColor,
     TextInputType keyboardType = TextInputType.text,
-    int? maxLength,
-    bool isOtp = false,
     bool isPassword = false,
     bool obscureText = false,
     VoidCallback? onToggleVisibility,
@@ -1034,19 +817,14 @@ class _AuthPageState extends State<AuthPage> {
       child: TextField(
         controller: controller,
         keyboardType: keyboardType,
-        maxLength: maxLength,
         obscureText: obscureText,
-        textAlign: isOtp ? TextAlign.center : TextAlign.start,
         style: TextStyle(
-          fontSize: isOtp ? 24 : 15,
-          letterSpacing: isOtp ? 8 : 0,
+          fontSize: 15,
           color: textColor,
-          fontWeight: isOtp ? FontWeight.bold : FontWeight.normal,
         ),
         decoration: InputDecoration(
           hintText: hint,
-          hintStyle: TextStyle(color: subTextColor, fontSize: 15, letterSpacing: 0),
-          counterText: '',
+          hintStyle: TextStyle(color: subTextColor, fontSize: 15),
           filled: true,
           fillColor: fillColor,
           contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 18),
