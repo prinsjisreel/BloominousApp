@@ -32,35 +32,51 @@ class _FraudAnalyticsPageState extends State<FraudAnalyticsPage> {
     return censoredWords.join(' ');
   }
 
+  /// Matches web's manualAdminOverrideToggle() exactly: real 30-day
+  /// restrictedUntil timestamp, arrayUnion/arrayRemove on fraudFlags
+  /// instead of overwriting the whole array, and writes ONLY to
+  /// `customers` — the collection your actual fraud engine
+  /// (submit_order.php, record_email_risk.php, restore_trust.php, the
+  /// mobile checkout flow) reads and writes everywhere else. The old
+  /// dual-write to `users` was pointless — nothing in the real pipeline
+  /// ever reads fraud fields from there — and risked the two collections
+  /// silently disagreeing with each other over time.
   Future<void> _manualRestrict(
       String userId, Map<String, dynamic> userData) async {
     final bool currentRestricted = userData['isRestricted'] ?? false;
     final bool newRestricted = !currentRestricted;
-    final int newScore =
-        newRestricted ? 65 : 20; // 65 is inside 50-86% COD restriction range
+
+    final confirmed = await _showConfirmDialog(
+      title: newRestricted
+          ? 'Apply Manual Override Restriction?'
+          : 'Lift Manual Override Penalty?',
+      message: newRestricted
+          ? 'This will restrict the account for 30 days and disable Cash on Delivery.'
+          : 'This will lift the restriction and restore full account trust.',
+      confirmColor: newRestricted ? Colors.red : Colors.green,
+    );
+    if (!confirmed) return;
 
     try {
-      await _db.collection('users').doc(userId).set({
-        'isRestricted': newRestricted,
-        'fraudScore': newScore,
-        'restrictionReason':
-            newRestricted ? 'Restricted by Admin for security audit.' : null,
-        'updatedAt': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
+      final expiryDate = DateTime.now().add(const Duration(days: 30));
+      const flagText = 'Restricted by admin manual override parameters';
 
-      // Also sync to customers collection if exists
-      await _db.collection('customers').doc(userId).set({
+      await _db.collection('customers').doc(userId).update({
         'isRestricted': newRestricted,
-        'fraudScore': newScore,
-      }, SetOptions(merge: true));
+        'restrictedUntil':
+        newRestricted ? Timestamp.fromDate(expiryDate) : null,
+        'fraudFlags': newRestricted
+            ? FieldValue.arrayUnion([flagText])
+            : FieldValue.arrayRemove([flagText]),
+      });
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
               newRestricted
-                  ? 'Account Restricted (Risk Rating: $newScore%). COD payment method is now disabled for this user.'
-                  : 'Account Restriction lifted. Trust restored.',
+                  ? 'Account restricted for 30 days. COD payment method is now disabled for this user.'
+                  : 'Account restriction lifted. Trust restored.',
             ),
             backgroundColor: newRestricted ? Colors.orange : Colors.green,
           ),
@@ -74,78 +90,100 @@ class _FraudAnalyticsPageState extends State<FraudAnalyticsPage> {
     }
   }
 
-  Future<void> _banDevice(String userId, Map<String, dynamic> userData) async {
-    final bool currentBanned =
-        (userData['isBanned'] ?? false) || (userData['fraudScore'] ?? 0) >= 100;
-    final bool newBanned = !currentBanned;
-    final int newScore = newBanned ? 100 : 10;
+  /// Matches web's manualBanDevices() exactly: bans every REAL hash in
+  /// this account's deviceHashes array — the same field
+  /// DeviceSecurityService writes to on registration, and the same
+  /// field submit_order.php/register.php actually check against. The
+  /// old version invented a fake 'DEV_xxxxxx' ID that would never match
+  /// a real device, meaning it likely banned nothing that actually
+  /// existed.
+  ///
+  /// Note this is intentionally a DIFFERENT action from unbanning — this
+  /// project has no single "toggle" for device bans since a customer can
+  /// have MULTIPLE device hashes on file, potentially banned at
+  /// different times for different reasons. This button always bans;
+  /// lifting a specific device ban is a separate, deliberate admin
+  /// action (see the banned_devices collection directly, same as web
+  /// doesn't offer a one-click "unban all" either).
+  Future<void> _banDevices(
+      String userId, Map<String, dynamic> userData) async {
+    final rawHashes = userData['deviceHashes'];
+    final List<String> deviceHashes = rawHashes is List
+        ? rawHashes.map((e) => e.toString()).toList()
+        : <String>[];
 
-    final email = (userData['email'] ?? '').toString();
-    final emailDomain = email.contains('@') ? email.split('@')[1] : '';
-    final deviceId = (userData['deviceId'] ??
-            'DEV_${userId.substring(0, min(6, userId.length))}')
-        .toString();
-    final ipAddress =
-        (userData['ipAddress'] ?? userData['lastIp'] ?? '192.168.1.100')
-            .toString();
-    final networkSignature =
-        (userData['networkSignature'] ?? 'NET_SIG_${userId.hashCode}')
-            .toString();
+    if (deviceHashes.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+              content: Text('No device history on file for this account yet.')),
+        );
+      }
+      return;
+    }
+
+    final confirmed = await _showConfirmDialog(
+      title: 'Ban ${deviceHashes.length} Device(s)?',
+      message:
+      'This blocks every device linked to this account from registering new accounts or placing orders. This action cannot be undone from this screen.',
+      confirmColor: Colors.red,
+    );
+    if (!confirmed) return;
 
     try {
-      // 1. Update user account
-      await _db.collection('users').doc(userId).set({
-        'isBanned': newBanned,
-        'isRestricted': newBanned,
-        'fraudScore': newScore,
-        'status': newBanned ? 'DEVICE BANNED' : 'ACCOUNT SAFE',
-        'updatedAt': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
-
-      await _db.collection('customers').doc(userId).set({
-        'isBanned': newBanned,
-        'isRestricted': newBanned,
-        'fraudScore': newScore,
-      }, SetOptions(merge: true));
-
-      // 2. Manage banned_devices collection for strict device & IP & network signature enforcement
-      if (newBanned) {
-        await _db.collection('banned_devices').doc(deviceId).set({
-          'deviceId': deviceId,
-          'bannedUserId': userId,
-          'email': email,
-          'emailDomain': emailDomain,
-          'ipAddress': ipAddress,
-          'networkSignature': networkSignature,
+      final batch = _db.batch();
+      for (final hash in deviceHashes) {
+        final ref = _db.collection('banned_devices').doc(hash);
+        batch.set(ref, {
+          'bannedUid': userId,
+          'reason': 'Manually banned by admin from Fraud Risk Analytics',
           'bannedAt': FieldValue.serverTimestamp(),
-          'reason':
-              'Device & Network Fingerprint Banned by Admin due to Fraud.',
         });
-      } else {
-        await _db.collection('banned_devices').doc(deviceId).delete();
       }
+      await batch.commit();
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text(
-              newBanned
-                  ? 'DEVICE BANNED: Account, Device ID ($deviceId), IP ($ipAddress) & Email domain are strictly blacklisted.'
-                  : 'Device Ban lifted.',
-            ),
-            backgroundColor: newBanned ? Colors.red : Colors.green,
+            content:
+            Text('${deviceHashes.length} device(s) banned successfully.'),
+            backgroundColor: Colors.red,
           ),
         );
       }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('Error banning device: $e')));
+            .showSnackBar(SnackBar(content: Text('Error banning device(s): $e')));
       }
     }
   }
 
-  int min(int a, int b) => a < b ? a : b;
+  Future<bool> _showConfirmDialog({
+    required String title,
+    required String message,
+    required Color confirmColor,
+  }) async {
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(title),
+        content: Text(message),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('CANCEL'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(backgroundColor: confirmColor),
+            child: const Text('CONFIRM', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+    return result ?? false;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -154,7 +192,7 @@ class _FraudAnalyticsPageState extends State<FraudAnalyticsPage> {
 
     return Scaffold(
       backgroundColor:
-          isDark ? const Color(0xFF121212) : const Color(0xFFFFFDF9),
+      isDark ? const Color(0xFF121212) : const Color(0xFFFFFDF9),
       appBar: AppBar(
         title: Text(
           'Fraud Risk Analytics',
@@ -165,8 +203,14 @@ class _FraudAnalyticsPageState extends State<FraudAnalyticsPage> {
         foregroundColor: Colors.white,
         elevation: 0,
       ),
+      // Reads directly from `customers` — the real collection your fraud
+      // engine writes to everywhere else in this project. The old
+      // `users` stream was showing stale/default values for every real
+      // customer, since nothing in submit_order.php, register.php,
+      // record_email_risk.php, or restore_trust.php ever writes fraud
+      // fields to `users`.
       body: StreamBuilder<QuerySnapshot>(
-        stream: _db.collection('users').snapshots(),
+        stream: _db.collection('customers').snapshots(),
         builder: (context, snapshot) {
           if (snapshot.hasError) {
             return Center(
@@ -177,19 +221,14 @@ class _FraudAnalyticsPageState extends State<FraudAnalyticsPage> {
                 child: CircularProgressIndicator(color: Color(0xFFF59E0B)));
           }
 
-          final allDocs = snapshot.data?.docs ?? [];
-          final customers = allDocs.where((d) {
-            final data = d.data() as Map<String, dynamic>;
-            final role = data['role'] ?? 'customer';
-            return role == 'customer';
-          }).toList();
+          final customers = snapshot.data?.docs ?? [];
 
           int totalAudited = customers.length;
           int highRiskCount = customers.where((d) {
             final data = d.data() as Map<String, dynamic>;
             final score = (data['fraudScore'] ?? 0) as int;
-            final isBanned = data['isBanned'] ?? false;
-            return isBanned || score >= 80;
+            final status = data['status'] as String?;
+            return status == 'blocked' || score >= 75;
           }).length;
 
           double trustRatio = totalAudited == 0
@@ -260,18 +299,18 @@ class _FraudAnalyticsPageState extends State<FraudAnalyticsPage> {
                                   size: 18, color: Colors.grey),
                               suffixIcon: _searchQuery.isNotEmpty
                                   ? IconButton(
-                                      icon: const Icon(Icons.clear, size: 16),
-                                      onPressed: () {
-                                        _searchController.clear();
-                                        setState(() => _searchQuery = '');
-                                      },
-                                    )
+                                icon: const Icon(Icons.clear, size: 16),
+                                onPressed: () {
+                                  _searchController.clear();
+                                  setState(() => _searchQuery = '');
+                                },
+                              )
                                   : null,
                               contentPadding: const EdgeInsets.symmetric(
                                   vertical: 0, horizontal: 14),
                               filled: true,
                               fillColor:
-                                  isDark ? Colors.grey[900] : Colors.white,
+                              isDark ? Colors.grey[900] : Colors.white,
                               border: OutlineInputBorder(
                                 borderRadius: BorderRadius.circular(20),
                                 borderSide: BorderSide(
@@ -351,32 +390,45 @@ class _FraudAnalyticsPageState extends State<FraudAnalyticsPage> {
                       final email = data['email'] ?? '';
                       final rawName = data['name'] ??
                           data['fullName'] ??
-                          (email.contains('@')
-                              ? email.split('@')[0]
+                          (email.toString().contains('@')
+                              ? email.toString().split('@')[0]
                               : 'Customer');
                       final censoredName = _censorName(rawName);
 
-                      final bool isBanned = (data['isBanned'] ?? false) ||
-                          (data['status'] == 'DEVICE BANNED');
+                      final String? statusField = data['status'] as String?;
+                      final bool isBlocked = statusField == 'blocked';
                       final bool isRestricted = data['isRestricted'] ?? false;
-                      int score = (data['fraudScore'] ?? 20) as int;
+                      int score = (data['fraudScore'] ?? 10) as int;
 
                       String statusLabel = 'ACCOUNT SAFE';
                       Color statusColor = Colors.green;
-                      if (isBanned || score >= 100) {
-                        statusLabel = 'DEVICE BANNED';
-                        statusColor = Colors.red;
+                      if (isBlocked || score >= 100) {
+                        statusLabel = 'PERMANENTLY TERMINATED';
+                        statusColor = Colors.grey[850]!;
                         score = 100;
-                      } else if (score >= 90) {
-                        statusLabel = 'SUSPENDED';
-                        statusColor = Colors.deepOrange;
-                      } else if (isRestricted || (score >= 50 && score <= 86)) {
-                        statusLabel = 'RESTRICTED (NO COD)';
+                      } else if (score >= 75) {
+                        statusLabel = 'CRITICAL SCRUTINY';
+                        statusColor = Colors.red;
+                      } else if (score >= 50 || isRestricted) {
+                        statusLabel = 'SUSPICIOUS PROFILE';
                         statusColor = Colors.amber[800]!;
                       }
 
-                      final auditFlags = data['auditFlags'] ??
-                          'Rapid Separated Checkouts Flagged (< 5 min window), Restricted for 30 days by admin, Identity verified via SMS - Trust Restored';
+                      // Real fraudFlags array, matching web exactly —
+                      // the honest fallback for a genuinely clean profile
+                      // says so plainly, rather than showing fabricated
+                      // history that never happened.
+                      final rawFlags = data['fraudFlags'];
+                      final List<String> fraudFlags = rawFlags is List
+                          ? rawFlags.map((e) => e.toString()).toList()
+                          : <String>[];
+                      final flagsDisplay = fraudFlags.isNotEmpty
+                          ? fraudFlags.join(', ')
+                          : 'Profile registers secure telemetry baselines.';
+
+                      final rawHashes = data['deviceHashes'];
+                      final deviceCount =
+                      rawHashes is List ? rawHashes.length : 0;
 
                       return Container(
                         margin: const EdgeInsets.only(bottom: 16),
@@ -385,10 +437,10 @@ class _FraudAnalyticsPageState extends State<FraudAnalyticsPage> {
                           color: isDark ? Colors.grey[900] : Colors.white,
                           borderRadius: BorderRadius.circular(20),
                           border: Border.all(
-                            color: isBanned
+                            color: isBlocked
                                 ? Colors.red.withOpacity(0.4)
                                 : Colors.grey.withOpacity(0.15),
-                            width: isBanned ? 1.5 : 1,
+                            width: isBlocked ? 1.5 : 1,
                           ),
                           boxShadow: [
                             BoxShadow(
@@ -450,7 +502,7 @@ class _FraudAnalyticsPageState extends State<FraudAnalyticsPage> {
                                   horizontal: 10, vertical: 6),
                               decoration: BoxDecoration(
                                 color:
-                                    isDark ? Colors.grey[850] : Colors.grey[50],
+                                isDark ? Colors.grey[850] : Colors.grey[50],
                                 borderRadius: BorderRadius.circular(10),
                               ),
                               child: Row(
@@ -472,8 +524,8 @@ class _FraudAnalyticsPageState extends State<FraudAnalyticsPage> {
                                           value: score / 100.0,
                                           backgroundColor: Colors.grey[300],
                                           valueColor:
-                                              AlwaysStoppedAnimation<Color>(
-                                                  statusColor),
+                                          AlwaysStoppedAnimation<Color>(
+                                              statusColor),
                                         ),
                                       ),
                                     ),
@@ -492,91 +544,118 @@ class _FraudAnalyticsPageState extends State<FraudAnalyticsPage> {
                             ),
                             const SizedBox(height: 10),
 
-                            // Row 3: UID Line
-                            SelectableText(
-                              'UID: ${userId.toUpperCase()}',
-                              style: TextStyle(
-                                fontSize: 10,
-                                color: Colors.grey[500],
-                                fontFamily: 'monospace',
-                                fontWeight: FontWeight.w500,
-                              ),
-                            ),
-                            const SizedBox(height: 12),
-
-                            // Row 4: Action Buttons (Responsive Wrap)
-                            Wrap(
-                              spacing: 8,
-                              runSpacing: 8,
+                            // Row 3: UID Line + device count context
+                            Row(
                               children: [
-                                ElevatedButton.icon(
-                                  onPressed: () =>
-                                      _manualRestrict(userId, data),
-                                  icon: Icon(
-                                    isRestricted
-                                        ? Icons.lock_open
-                                        : Icons.block,
-                                    size: 13,
-                                  ),
-                                  label: Text(
-                                    isRestricted
-                                        ? 'LIFT RESTRICTION'
-                                        : 'MANUAL RESTRICT',
-                                    style: const TextStyle(
+                                Expanded(
+                                  child: SelectableText(
+                                    'UID: ${userId.toUpperCase()}',
+                                    style: TextStyle(
                                       fontSize: 10,
-                                      fontWeight: FontWeight.bold,
-                                      letterSpacing: 0.3,
+                                      color: Colors.grey[500],
+                                      fontFamily: 'monospace',
+                                      fontWeight: FontWeight.w500,
                                     ),
-                                  ),
-                                  style: ElevatedButton.styleFrom(
-                                    backgroundColor: isRestricted
-                                        ? Colors.orange[800]
-                                        : const Color(0xFFDC2626),
-                                    foregroundColor: Colors.white,
-                                    shape: RoundedRectangleBorder(
-                                        borderRadius:
-                                            BorderRadius.circular(12)),
-                                    padding: const EdgeInsets.symmetric(
-                                        horizontal: 12, vertical: 8),
-                                    elevation: 0,
-                                    minimumSize: const Size(0, 34),
                                   ),
                                 ),
-                                ElevatedButton.icon(
-                                  onPressed: () => _banDevice(userId, data),
-                                  icon: Icon(
-                                    isBanned
-                                        ? Icons.phonelink_setup
-                                        : Icons.phonelink_erase,
-                                    size: 13,
-                                  ),
-                                  label: Text(
-                                    isBanned ? 'UNBAN DEVICE' : 'BAN DEVICE(S)',
-                                    style: const TextStyle(
-                                      fontSize: 10,
-                                      fontWeight: FontWeight.bold,
-                                      letterSpacing: 0.3,
-                                    ),
-                                  ),
-                                  style: ElevatedButton.styleFrom(
-                                    backgroundColor: isBanned
-                                        ? Colors.green[700]
-                                        : const Color(0xFF0F172A),
-                                    foregroundColor: Colors.white,
-                                    shape: RoundedRectangleBorder(
-                                        borderRadius:
-                                            BorderRadius.circular(12)),
-                                    padding: const EdgeInsets.symmetric(
-                                        horizontal: 12, vertical: 8),
-                                    elevation: 0,
-                                    minimumSize: const Size(0, 34),
+                                Text(
+                                  '$deviceCount device${deviceCount == 1 ? '' : 's'} on file',
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    color: Colors.grey[500],
+                                    fontWeight: FontWeight.w500,
                                   ),
                                 ),
                               ],
                             ),
                             const SizedBox(height: 12),
 
-                            // Row 5: Audit Trail Logging Flags Box
+                            // Row 4: Action Buttons (Responsive Wrap)
+                            if (!isBlocked)
+                              Wrap(
+                                spacing: 8,
+                                runSpacing: 8,
+                                children: [
+                                  ElevatedButton.icon(
+                                    onPressed: () =>
+                                        _manualRestrict(userId, data),
+                                    icon: Icon(
+                                      isRestricted
+                                          ? Icons.lock_open
+                                          : Icons.block,
+                                      size: 13,
+                                    ),
+                                    label: Text(
+                                      isRestricted
+                                          ? 'LIFT RESTRICTION'
+                                          : 'MANUAL RESTRICT',
+                                      style: const TextStyle(
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.bold,
+                                        letterSpacing: 0.3,
+                                      ),
+                                    ),
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: isRestricted
+                                          ? Colors.orange[800]
+                                          : const Color(0xFFDC2626),
+                                      foregroundColor: Colors.white,
+                                      shape: RoundedRectangleBorder(
+                                          borderRadius:
+                                          BorderRadius.circular(12)),
+                                      padding: const EdgeInsets.symmetric(
+                                          horizontal: 12, vertical: 8),
+                                      elevation: 0,
+                                      minimumSize: const Size(0, 34),
+                                    ),
+                                  ),
+                                  ElevatedButton.icon(
+                                    onPressed: () =>
+                                        _banDevices(userId, data),
+                                    icon: const Icon(Icons.phonelink_erase,
+                                        size: 13),
+                                    label: const Text(
+                                      'BAN DEVICE(S)',
+                                      style: TextStyle(
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.bold,
+                                        letterSpacing: 0.3,
+                                      ),
+                                    ),
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: const Color(0xFF0F172A),
+                                      foregroundColor: Colors.white,
+                                      shape: RoundedRectangleBorder(
+                                          borderRadius:
+                                          BorderRadius.circular(12)),
+                                      padding: const EdgeInsets.symmetric(
+                                          horizontal: 12, vertical: 8),
+                                      elevation: 0,
+                                      minimumSize: const Size(0, 34),
+                                    ),
+                                  ),
+                                ],
+                              )
+                            else
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 12, vertical: 8),
+                                decoration: BoxDecoration(
+                                  color: Colors.grey.withOpacity(0.15),
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                child: Text(
+                                  'BLACKLISTED',
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.w900,
+                                    color: Colors.grey[600],
+                                  ),
+                                ),
+                              ),
+                            const SizedBox(height: 12),
+
+                            // Row 5: Audit Trail Logging Flags Box (real data)
                             Container(
                               width: double.infinity,
                               padding: const EdgeInsets.all(10),
@@ -602,7 +681,7 @@ class _FraudAnalyticsPageState extends State<FraudAnalyticsPage> {
                                   ),
                                   const SizedBox(height: 4),
                                   Text(
-                                    auditFlags,
+                                    flagsDisplay,
                                     style: TextStyle(
                                       fontSize: 11,
                                       color: isDark
@@ -663,7 +742,7 @@ class _FraudAnalyticsPageState extends State<FraudAnalyticsPage> {
                     fontSize: 20,
                     fontWeight: FontWeight.bold,
                     color:
-                        valueColor ?? (isDark ? Colors.white : Colors.black87),
+                    valueColor ?? (isDark ? Colors.white : Colors.black87),
                   ),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
