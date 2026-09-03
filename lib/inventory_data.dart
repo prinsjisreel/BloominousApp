@@ -5,11 +5,7 @@ import 'package:flutter/foundation.dart';
 class InventoryData {
   static final FirebaseFirestore _db = FirebaseFirestore.instance;
 
-  // Selected Branch ID (can be updated by location detection)
-  static String? selectedBranchId =
-      'main_branch'; // Default to main_branch instead of 'all' for better reliability
-
-  // --- Collection Accessors ---
+  static String? selectedBranchId = 'main_branch';
 
   static CollectionReference _inventoryCollection() {
     String bid = selectedBranchId ?? 'main_branch';
@@ -43,14 +39,9 @@ class InventoryData {
     return _db.collection('freshness_analysis');
   }
 
-  // Product ratings/reviews live in one root-level collection (not nested
-  // under a branch) since a product review is about the item itself, not
-  // tied to which branch fulfilled a particular order.
   static CollectionReference _productRatingsCollection() {
     return _db.collection('product_ratings');
   }
-
-  // --- Stream Methods ---
 
   static Stream<List<Map<String, dynamic>>> inventoryStream(
       {String? branchId, String? category}) {
@@ -76,18 +67,19 @@ class InventoryData {
             .where((d) => d['isDeleted'] != true && d['status'] != 'archived')
             .toList();
 
-        // Filter by category in memory if needed
-        if (category != null && category != 'All') {
-          return docs.where((d) => d['category'] == category).toList();
-        }
-        return docs;
+        final filtered = (category != null && category != 'All')
+            ? docs.where((d) => d['category'] == category).toList()
+            : docs;
+
+        filtered.sort((a, b) =>
+            (a['name'] ?? '').toString().toLowerCase().compareTo((b['name'] ?? '').toString().toLowerCase()));
+        return filtered;
       }).handleError((err) {
         debugPrint('Error in collectionGroup inventory: $err');
         return <Map<String, dynamic>>[];
       });
     }
 
-    // Direct branch query
     return _db
         .collection('branches')
         .doc(bid)
@@ -106,10 +98,13 @@ class InventoryData {
           .where((d) => d['isDeleted'] != true && d['status'] != 'archived')
           .toList();
 
-      if (category != null && category != 'All') {
-        return docs.where((d) => d['category'] == category).toList();
-      }
-      return docs;
+      final filtered = (category != null && category != 'All')
+          ? docs.where((d) => d['category'] == category).toList()
+          : docs;
+
+      filtered.sort((a, b) =>
+          (a['name'] ?? '').toString().toLowerCase().compareTo((b['name'] ?? '').toString().toLowerCase()));
+      return filtered;
     }).handleError((err) {
       debugPrint('Error in branch inventory: $err');
       return <Map<String, dynamic>>[];
@@ -125,7 +120,6 @@ class InventoryData {
           .toSet()
           .toList();
 
-      // Fallback categories that match what the user wants to see
       final List<String> fallback = [
         'Flowers',
         'Chocolates',
@@ -137,7 +131,6 @@ class InventoryData {
         'Balloons'
       ];
 
-      // Combine docs and fallback, then deduplicate
       final Set<String> combined = {...namesFromDocs, ...fallback};
       final List<String> result = combined.toList();
       result.sort();
@@ -167,7 +160,6 @@ class InventoryData {
       final docs = snapshot.docs
           .map((doc) => {...doc.data() as Map<String, dynamic>, 'id': doc.id})
           .toList();
-      // Sort in memory to avoid needing composite indexes for every filter combination
       docs.sort((a, b) {
         final dateA = (a['createdAt'] ?? a['created_at']) as dynamic;
         final dateB = (b['createdAt'] ?? b['created_at']) as dynamic;
@@ -196,7 +188,6 @@ class InventoryData {
       final docs = snapshot.docs
           .map((doc) => {...doc.data() as Map<String, dynamic>, 'id': doc.id})
           .toList();
-      // Sort in memory to avoid needing composite indexes for every branch
       docs.sort((a, b) {
         final dateA = (a['createdAt'] ?? a['created_at']) as dynamic;
         final dateB = (b['createdAt'] ?? b['created_at']) as dynamic;
@@ -250,7 +241,6 @@ class InventoryData {
       final docs = snapshot.docs
           .map((doc) => {...doc.data() as Map<String, dynamic>, 'id': doc.id})
           .toList();
-      // Sort in memory to be resilient to missing timestamps
       docs.sort((a, b) {
         final dateA = (a['createdAt'] ?? a['created_at']) as dynamic;
         final dateB = (b['createdAt'] ?? b['created_at']) as dynamic;
@@ -265,7 +255,6 @@ class InventoryData {
 
   static Stream<List<Map<String, dynamic>>> deliveryOrdersStream(
       {String? branchId}) {
-    // Stream all active/delivered orders and filter in memory to avoid Firestore index errors or hiding unassigned branch orders
     return _ordersCollection().snapshots().map((snapshot) {
       final docs = snapshot.docs
           .map((doc) => {...doc.data() as Map<String, dynamic>, 'id': doc.id})
@@ -339,15 +328,6 @@ class InventoryData {
     });
   }
 
-  // --- Product Ratings / Reviews ---
-  //
-  // A customer can only rate a product after it's actually been delivered
-  // to them -- see hasUserReceivedProduct() below, which is the gate the
-  // UI checks before showing a "Rate this product" button at all. This
-  // mirrors how Shopee/Lazada only unlock reviews post-delivery, so
-  // ratings reflect real purchases rather than anyone who happens to view
-  // the product page.
-
   static Stream<List<Map<String, dynamic>>> getProductRatingsStream(
       String productId) {
     return _productRatingsCollection()
@@ -370,13 +350,6 @@ class InventoryData {
     return snap.docs.isNotEmpty;
   }
 
-  /// Checks whether this user has at least one DELIVERED order containing
-  /// this product. Done client-side (fetch the user's orders once, filter
-  /// in memory) rather than a compound Firestore query, since `items` is
-  /// stored as an array of maps -- Firestore can't query "does this array
-  /// contain a map with this specific id field" directly without an
-  /// exact-match arrayContains, which the full item map (price, qty, etc.)
-  /// would never reliably match against.
   static Future<bool> hasUserReceivedProduct({
     required String userId,
     required String productId,
@@ -414,8 +387,6 @@ class InventoryData {
       'createdAt': FieldValue.serverTimestamp(),
     });
   }
-
-  // --- Action Methods ---
 
   static Future<String> placeOrder(Map<String, dynamic> orderData) async {
     final docRef = await _ordersCollection().add({
@@ -519,12 +490,21 @@ class InventoryData {
   }
 
   static Future<void> deleteProduct(String productId) async {
-    // Soft-delete: update status to 'archived' and isDeleted to true to preserve historical data
     await _inventoryCollection().doc(productId).update({
       'isDeleted': true,
       'status': 'archived',
       'archivedAt': FieldValue.serverTimestamp(),
     });
+
+    try {
+      await _db.collection('inventory').doc(productId).update({
+        'isDeleted': true,
+        'status': 'archived',
+        'archivedAt': FieldValue.serverTimestamp(),
+      });
+    } catch (e) {
+      debugPrint('Global inventory doc archive skip or handled: $e');
+    }
   }
 
   static Future<Map<String, int>> reportSpoilage({
@@ -539,7 +519,6 @@ class InventoryData {
     final batch = _db.batch();
     final bid = selectedBranchId ?? 'main_branch';
 
-    // 1. Add Spoilage/Salvage Record
     final spoilageRef = _spoilageCollection().doc();
     batch.set(spoilageRef, {
       'productId': productId,
@@ -553,14 +532,12 @@ class InventoryData {
       'created_at': FieldValue.serverTimestamp(),
     });
 
-    // 2. Deduct Original Inventory
     final inventoryRef = _inventoryCollection().doc(productId);
     batch.update(inventoryRef, {'stock': FieldValue.increment(-quantity)});
 
     int newBouquets = 0;
     int newLeftovers = 0;
 
-    // 3. Handle Salvaged Items (Add to Recycled Bouquet)
     if (isSalvaged) {
       final recycledQuery = await _inventoryCollection()
           .where('name', isEqualTo: 'Recycled Bouquet')
@@ -580,7 +557,7 @@ class InventoryData {
       }
 
       final totalFlowers = quantity + currentLeftovers;
-      newBouquets = totalFlowers ~/ 4; // Integer division
+      newBouquets = totalFlowers ~/ 4;
       newLeftovers = totalFlowers % 4;
 
       if (recycledQuery.docs.isNotEmpty) {
@@ -588,11 +565,10 @@ class InventoryData {
           'stock': FieldValue.increment(newBouquets),
           'leftoverFlowers': newLeftovers,
           'description': description,
-          'price': 150.0, // Fixed price for bouquets
+          'price': 150.0,
           'updatedAt': FieldValue.serverTimestamp(),
         });
       } else {
-        // Create Recycled Bouquet item if not exists
         final recRef = _inventoryCollection().doc();
         batch.set(recRef, {
           'name': 'Recycled Bouquet',
@@ -610,7 +586,6 @@ class InventoryData {
       }
     }
 
-    // 4. Add Notification
     final notifRef = _db.collection('notifications').doc();
     final notifTitle =
     isSalvaged ? 'Bouquet Created from Salvage' : 'Spoilage Reported';
@@ -662,7 +637,7 @@ class InventoryData {
       'aiRecommendation': aiRecommendation,
       'branchId': bid,
       'createdAt': FieldValue.serverTimestamp(),
-      'scanned_at': FieldValue.serverTimestamp(), // Match web version
+      'scanned_at': FieldValue.serverTimestamp(),
     });
   }
 
@@ -673,7 +648,6 @@ class InventoryData {
   }) async {
     final bid = selectedBranchId ?? 'main_branch';
 
-    // 1. Find product in inventory
     final invSnap = await _db
         .collection('branches')
         .doc(bid)
@@ -691,7 +665,6 @@ class InventoryData {
 
     if (stockToRecycle <= 0) throw Exception('No stock available to recycle.');
 
-    // Use reportSpoilage with isSalvaged: true to handle the logic centrally
     await reportSpoilage(
       productId: productDoc.id,
       quantity: stockToRecycle,
@@ -702,7 +675,6 @@ class InventoryData {
       isSalvaged: true,
     );
 
-    // Mark analysis as recycled if needed (optional metadata)
     await _freshnessCollection().doc(analysisId).update({'is_recycled': true});
   }
 
@@ -799,6 +771,20 @@ class InventoryData {
     );
   }
 
+  // --- NEW: lets a signed-in user edit their OWN name/birthday/sex
+  // fields, using the exact same field names createEmployee() writes.
+  // A merge-set means this never overwrites fields it wasn't given
+  // (role, branchId, email, createdAt all stay untouched) — only the
+  // specific keys passed in get updated. Since ProfilePage now reads
+  // this document via a live snapshots() listener rather than a
+  // one-time fetch, any write here (or, eventually, any write from the
+  // web admin side to this same document) shows up immediately without
+  // needing a manual refresh.
+  static Future<void> updateOwnProfile(
+      String uid, Map<String, dynamic> data) async {
+    await _usersCollection().doc(uid).set(data, SetOptions(merge: true));
+  }
+
   static Future<void> saveTripoModel(Map<String, dynamic> tripoData) async {
     await _tripoCollection().add({
       ...tripoData,
@@ -818,12 +804,10 @@ class InventoryData {
       return data;
     }
 
-    // Fallback: search by current user's email if UID doc doesn't exist
     final user = FirebaseAuth.instance.currentUser;
     if (user != null && user.uid == userId && user.email != null) {
       final normalizedEmail = user.email!.trim().toLowerCase();
 
-      // If it is the super admin, auto-provision and force-return the super-admin data
       if (normalizedEmail == '789jojoalvarado@gmail.com') {
         final superAdminData = {
           'uid': userId,
@@ -839,14 +823,12 @@ class InventoryData {
         return superAdminData;
       }
 
-      // First query by 'email'
       var snap = await _usersCollection()
           .where('email', isEqualTo: normalizedEmail)
           .limit(1)
           .get();
 
       if (snap.docs.isEmpty) {
-        // Fallback: query by 'username'
         snap = await _usersCollection()
             .where('username', isEqualTo: normalizedEmail)
             .limit(1)
@@ -855,8 +837,6 @@ class InventoryData {
 
       if (snap.docs.isNotEmpty) {
         final data = snap.docs.first.data() as Map<String, dynamic>;
-        // Optional: Save the UID mapping to the existing document for future checkings
-        // ignore_const_await
         await snap.docs.first.reference.update({'uid': userId});
         return data;
       }
@@ -874,7 +854,6 @@ class InventoryData {
   }
 
   static Future<void> syncInventoryFromFirestore() async {
-    // This could be a complex sync logic, for now a placeholder
     debugPrint('Syncing inventory...');
   }
 
@@ -904,14 +883,12 @@ class InventoryData {
   }
 
   static Future<Map<String, dynamic>?> getProductByCode(String code) async {
-    // 1. Try searching in the currently selected branch with 'code' (primary field)
     try {
       var snap = await _inventoryCollection()
           .where('code', isEqualTo: code)
           .limit(1)
           .get();
 
-      // 2. Fallback to 'sku' field if 'code' was empty
       if (snap.docs.isEmpty) {
         snap = await _inventoryCollection()
             .where('sku', isEqualTo: code)
@@ -929,8 +906,6 @@ class InventoryData {
       debugPrint('Error searching in selected branch: $e');
     }
 
-    // 3. Global fallback: Search across ALL branches if not found in current one
-    // We try collectionGroup first in a local try-catch to avoid crashing if composite index is missing
     try {
       final globalSnap = await _db
           .collectionGroup('inventory')
@@ -959,12 +934,11 @@ class InventoryData {
       debugPrint('Collection group search failed (index might be missing): $e');
     }
 
-    // 4. Fully compliant branch-by-branch search fallback (does NOT require any collectionGroup index)
     try {
       final branchesSnap = await _db.collection('branches').get();
       for (final branchDoc in branchesSnap.docs) {
         final bId = branchDoc.id;
-        if (bId == selectedBranchId) continue; // Already searched
+        if (bId == selectedBranchId) continue;
 
         final branchInventory =
         _db.collection('branches').doc(bId).collection('inventory');
@@ -995,7 +969,6 @@ class InventoryData {
     debugPrint('Starting migration to branch: $targetBranchId');
     int totalMigrated = 0;
 
-    // Helper to migrate a collection from source to target branch
     Future<void> migrateCollection(
         Query sourceQuery, CollectionReference targetRef) async {
       final snapshot = await sourceQuery.get();
@@ -1003,14 +976,12 @@ class InventoryData {
           'Migrating ${snapshot.docs.length} docs from ${sourceQuery.parameters}');
       for (var doc in snapshot.docs) {
         final data = doc.data() as Map<String, dynamic>;
-        // Ensure branchId is set inside the document too
         data['branchId'] = targetBranchId;
         await targetRef.doc(doc.id).set(data);
         totalMigrated++;
       }
     }
 
-    // 1. Migrate Inventory
     await migrateCollection(
       _db.collection('branches').doc('main_branch').collection('inventory'),
       _db.collection('branches').doc(targetBranchId).collection('inventory'),
@@ -1020,7 +991,6 @@ class InventoryData {
       _db.collection('branches').doc(targetBranchId).collection('inventory'),
     );
 
-    // 2. Migrate Categories
     await migrateCollection(
       _db.collection('branches').doc('main_branch').collection('categories'),
       _db.collection('branches').doc(targetBranchId).collection('categories'),
@@ -1030,7 +1000,6 @@ class InventoryData {
       _db.collection('branches').doc(targetBranchId).collection('categories'),
     );
 
-    // 3. Migrate Spoilage
     await migrateCollection(
       _db.collection('branches').doc('main_branch').collection('spoilage'),
       _db.collection('branches').doc(targetBranchId).collection('spoilage'),
@@ -1039,13 +1008,11 @@ class InventoryData {
       _db.collection('spoilage'),
       _db.collection('branches').doc(targetBranchId).collection('spoilage'),
     );
-    // Also try root-level "inventory_spoilage" if it exists from older versions
     await migrateCollection(
       _db.collection('inventory_spoilage'),
       _db.collection('branches').doc(targetBranchId).collection('spoilage'),
     );
 
-    // 4. Update Orders
     final orders = await _db.collection('orders').get();
     debugPrint('Checking ${orders.docs.length} orders for migration...');
     for (var doc in orders.docs) {
@@ -1125,11 +1092,9 @@ class InventoryData {
       await snapshot.docs.first.reference.update({
         'role': role,
         'branchId': branchId,
-        'email': normalizedEmail, // Ensure it's stored normalized
+        'email': normalizedEmail,
       });
     } else {
-      // If user doc doesn't exist yet, we add it.
-      // Note: Ideally we'd have the UID, but searching by email in getUserData will find this.
       await _db.collection('users').add({
         'email': normalizedEmail,
         'role': role,
@@ -1139,13 +1104,11 @@ class InventoryData {
     }
   }
 
-  // Auto-check expired Recycled Bouquet (2 days older) & Remove "Recycled Flowers" documents
   static Future<void> _checkExpiredRecycledBouquets(String bid) async {
     try {
       final invCol =
       _db.collection('branches').doc(bid).collection('inventory');
 
-      // 1. Double check and cleanup of stale 'Recycled Flowers'
       final flowersSnap =
       await invCol.where('name', isEqualTo: 'Recycled Flowers').get();
       if (flowersSnap.docs.isNotEmpty) {
@@ -1157,7 +1120,6 @@ class InventoryData {
         debugPrint('Flutter: Cleaned up Recycled Flowers in $bid.');
       }
 
-      // 2. Scan and handle Recycled Bouquet expiration (2 days)
       final snap =
       await invCol.where('name', isEqualTo: 'Recycled Bouquet').get();
       if (snap.docs.isEmpty) return;
@@ -1183,13 +1145,11 @@ class InventoryData {
       if (diff.inDays >= 2) {
         final batch = _db.batch();
 
-        // Set stock of Recycled Bouquet to 0
         batch.update(doc.reference, {
           'stock': 0,
           'updatedAt': FieldValue.serverTimestamp(),
         });
 
-        // Add Spoilage/Loss Record
         final spoilRef =
         _db.collection('branches').doc(bid).collection('spoilage').doc();
         batch.set(spoilRef, {
@@ -1205,7 +1165,6 @@ class InventoryData {
           'created_at': FieldValue.serverTimestamp(),
         });
 
-        // Add Notification
         final notifRef = _db.collection('notifications').doc();
         batch.set(notifRef, {
           'title': 'Recycled Bouquet Expired',

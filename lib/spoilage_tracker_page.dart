@@ -3,10 +3,12 @@ import 'package:intl/intl.dart';
 import 'inventory_data.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'app_sidebar.dart';
 
 class SpoilageTrackerPage extends StatefulWidget {
   final String? initialProductId;
-  const SpoilageTrackerPage({super.key, this.initialProductId});
+  final String role;
+  const SpoilageTrackerPage({super.key, this.initialProductId, this.role = 'employee'});
 
   @override
   State<SpoilageTrackerPage> createState() => _SpoilageTrackerPageState();
@@ -44,8 +46,10 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
+    final isDesktop = MediaQuery.of(context).size.width >= 850;
 
     return Scaffold(
+      backgroundColor: isDark ? const Color(0xFF121212) : const Color(0xFFF8F9FA),
       appBar: AppBar(
         title: Column(
           children: [
@@ -72,77 +76,88 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
         foregroundColor: const Color(0xFFF4B400),
         elevation: 0,
       ),
-      body: StreamBuilder<List<Map<String, dynamic>>>(
-        stream: InventoryData.spoilageStream(),
-        builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(
-                child: CircularProgressIndicator(color: Color(0xFFF4B400)));
-          }
+      // NEW: setting `drawer` makes the AppBar auto-draw a hamburger icon
+      // on mobile — same pattern as every other portal page.
+      drawer: isDesktop ? null : Drawer(child: AppSidebar(role: widget.role, currentPage: 'spoilage')),
+      body: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (isDesktop) AppSidebar(role: widget.role, currentPage: 'spoilage'),
+          Expanded(
+            child: StreamBuilder<List<Map<String, dynamic>>>(
+              stream: InventoryData.spoilageStream(),
+              builder: (context, snapshot) {
+                if (snapshot.connectionState == ConnectionState.waiting) {
+                  return const Center(
+                      child: CircularProgressIndicator(color: Color(0xFFF4B400)));
+                }
 
-          final spoilageHistory = snapshot.data ?? [];
-          double totalLoss = 0;
-          int totalWasted = 0;
+                final spoilageHistory = snapshot.data ?? [];
+                double totalLoss = 0;
+                int totalWasted = 0;
 
-          for (var item in spoilageHistory) {
-            totalLoss += (item['loss_amount'] as num? ?? 0.0).toDouble();
-            totalWasted += (item['quantity'] as num? ?? 0).toInt();
-          }
+                for (var item in spoilageHistory) {
+                  totalLoss += (item['loss_amount'] as num? ?? 0.0).toDouble();
+                  totalWasted += (item['quantity'] as num? ?? 0).toInt();
+                }
 
-          return CustomScrollView(
-            slivers: [
-              SliverToBoxAdapter(
-                child: Padding(
-                  padding: const EdgeInsets.all(20.0),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      _buildSummaryCards(totalLoss, totalWasted),
-                      const SizedBox(height: 30),
-                      _buildReportForm(isDark),
-                      const SizedBox(height: 30),
-                      const Text(
-                        'SPOILAGE HISTORY',
-                        style: TextStyle(
-                            fontWeight: FontWeight.w900,
-                            fontSize: 16,
-                            letterSpacing: 1.0),
-                      ),
-                      const SizedBox(height: 15),
-                    ],
-                  ),
-                ),
-              ),
-              if (spoilageHistory.isEmpty)
-                const SliverToBoxAdapter(
-                  child: Center(
-                    child: Padding(
-                      padding: EdgeInsets.symmetric(vertical: 60.0),
-                      child: Column(
-                        children: [
-                          Icon(Icons.eco_rounded, size: 64, color: Colors.grey),
-                          SizedBox(height: 16),
-                          Text('No spoilage recorded yet.',
-                              style: TextStyle(color: Colors.grey)),
-                        ],
+                return CustomScrollView(
+                  slivers: [
+                    SliverToBoxAdapter(
+                      child: Padding(
+                        padding: const EdgeInsets.all(20.0),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            _buildSummaryCards(totalLoss, totalWasted),
+                            const SizedBox(height: 30),
+                            _buildReportForm(isDark),
+                            const SizedBox(height: 30),
+                            const Text(
+                              'SPOILAGE HISTORY',
+                              style: TextStyle(
+                                  fontWeight: FontWeight.w900,
+                                  fontSize: 16,
+                                  letterSpacing: 1.0),
+                            ),
+                            const SizedBox(height: 15),
+                          ],
+                        ),
                       ),
                     ),
-                  ),
-                )
-              else
-                SliverList(
-                  delegate: SliverChildBuilderDelegate(
-                    (context, index) {
-                      final item = spoilageHistory[index];
-                      return _buildHistoryItem(item, isDark);
-                    },
-                    childCount: spoilageHistory.length,
-                  ),
-                ),
-              const SliverToBoxAdapter(child: SizedBox(height: 40)),
-            ],
-          );
-        },
+                    if (spoilageHistory.isEmpty)
+                      const SliverToBoxAdapter(
+                        child: Center(
+                          child: Padding(
+                            padding: EdgeInsets.symmetric(vertical: 60.0),
+                            child: Column(
+                              children: [
+                                Icon(Icons.eco_rounded, size: 64, color: Colors.grey),
+                                SizedBox(height: 16),
+                                Text('No spoilage recorded yet.',
+                                    style: TextStyle(color: Colors.grey)),
+                              ],
+                            ),
+                          ),
+                        ),
+                      )
+                    else
+                      SliverList(
+                        delegate: SliverChildBuilderDelegate(
+                              (context, index) {
+                            final item = spoilageHistory[index];
+                            return _buildHistoryItem(item, isDark);
+                          },
+                          childCount: spoilageHistory.length,
+                        ),
+                      ),
+                    const SliverToBoxAdapter(child: SizedBox(height: 40)),
+                  ],
+                );
+              },
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -188,6 +203,7 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
         children: [
           Icon(icon, color: color, size: 28),
           const SizedBox(height: 12),
@@ -200,9 +216,10 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
           const SizedBox(height: 4),
           FittedBox(
             fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
             child: Text(value,
                 style:
-                    const TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+                const TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
           ),
         ],
       ),
@@ -231,12 +248,14 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
                 final products = snapshot.data ?? [];
                 return DropdownButtonFormField<String>(
                   value: _selectedProductId,
+                  isExpanded: true,
                   decoration: _inputDecoration(
                       'Select Product', Icons.local_florist_rounded),
                   items: products.map<DropdownMenuItem<String>>((p) {
                     return DropdownMenuItem<String>(
                       value: p['id'] as String,
-                      child: Text('${p['name']} (Stock: ${p['stock']})'),
+                      child: Text('${p['name']} (Stock: ${p['stock']})',
+                          overflow: TextOverflow.ellipsis),
                     );
                   }).toList(),
                   onChanged: (val) {
@@ -251,6 +270,7 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
             ),
             const SizedBox(height: 15),
             Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Expanded(
                   child: TextFormField(
@@ -263,7 +283,7 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
                       });
                     },
                     validator: (val) =>
-                        (val == null || val.isEmpty) ? 'Required' : null,
+                    (val == null || val.isEmpty) ? 'Required' : null,
                   ),
                 ),
                 const SizedBox(width: 15),
@@ -278,16 +298,26 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
                     ),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
                       children: [
                         Text('LOSS AMOUNT',
                             style: TextStyle(
                                 fontSize: 9,
                                 color: Colors.grey[500],
                                 fontWeight: FontWeight.w800)),
-                        Text('₱${_lossAmount.toStringAsFixed(2)}',
-                            style: const TextStyle(
-                                fontWeight: FontWeight.w900,
-                                color: Colors.redAccent)),
+                        const SizedBox(height: 2),
+                        // FittedBox guards against a large loss figure
+                        // (e.g. ₱12,340.00) overflowing this narrow box on
+                        // small phones — same pattern used across the
+                        // rest of this project's metric boxes.
+                        FittedBox(
+                          fit: BoxFit.scaleDown,
+                          alignment: Alignment.centerLeft,
+                          child: Text('₱${_lossAmount.toStringAsFixed(2)}',
+                              style: const TextStyle(
+                                  fontWeight: FontWeight.w900,
+                                  color: Colors.redAccent)),
+                        ),
                       ],
                     ),
                   ),
@@ -299,10 +329,11 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
               value: _reasonController.text.isEmpty
                   ? null
                   : _reasonController.text,
+              isExpanded: true,
               decoration:
-                  _inputDecoration('Reason', Icons.info_outline_rounded),
+              _inputDecoration('Reason', Icons.info_outline_rounded),
               items: _reasons
-                  .map((r) => DropdownMenuItem(value: r, child: Text(r)))
+                  .map((r) => DropdownMenuItem(value: r, child: Text(r, overflow: TextOverflow.ellipsis)))
                   .toList(),
               onChanged: (val) {
                 setState(() {
@@ -313,7 +344,7 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
                 });
               },
               validator: (val) =>
-                  (val == null || val.isEmpty) ? 'Required' : null,
+              (val == null || val.isEmpty) ? 'Required' : null,
             ),
             const SizedBox(height: 25),
             SizedBox(
@@ -329,9 +360,14 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
                   elevation: 0,
                 ),
                 child: _isSaving
-                    ? const CircularProgressIndicator(color: Colors.white)
-                    : const Text('SAVE REPORT & DEDUCT STOCK',
-                        style: TextStyle(fontWeight: FontWeight.w900)),
+                    ? const SizedBox(
+                    width: 22, height: 22,
+                    child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                    : const FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Text('SAVE REPORT & DEDUCT STOCK',
+                      style: TextStyle(fontWeight: FontWeight.w900)),
+                ),
               ),
             ),
           ],
@@ -438,7 +474,7 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
   Widget _buildHistoryItem(Map<String, dynamic> item, bool isDark) {
     final rawDate = item['createdAt'] ?? item['created_at'];
     final date =
-        rawDate != null ? (rawDate as dynamic).toDate() : DateTime.now();
+    rawDate != null ? (rawDate as dynamic).toDate() : DateTime.now();
 
     final isSalvaged = item['is_salvaged'] == true ||
         item['reason'] == 'Salvaged / Reusable Scraps';
@@ -457,6 +493,7 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
         ],
       ),
       child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Container(
             padding: const EdgeInsets.all(10),
@@ -480,10 +517,16 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
               children: [
                 Row(
                   children: [
-                    Text(
-                      item['flower_name'] ?? 'Unknown',
-                      style: const TextStyle(
-                          fontWeight: FontWeight.w800, fontSize: 14),
+                    // FIXED: name text now flexible + ellipsis instead of
+                    // an unguarded Text competing with the SALVAGED pill
+                    // on the same line.
+                    Flexible(
+                      child: Text(
+                        item['flower_name'] ?? 'Unknown',
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                            fontWeight: FontWeight.w800, fontSize: 14),
+                      ),
                     ),
                     if (isSalvaged)
                       Container(
@@ -504,6 +547,7 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
                 ),
                 Text(
                   '${item['quantity']} pcs • ${item['reason']}',
+                  overflow: TextOverflow.ellipsis,
                   style: TextStyle(
                       color: Colors.grey[500],
                       fontSize: 11,
@@ -511,13 +555,16 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
                 ),
                 Text(
                   'By: ${item['reported_by']}',
+                  overflow: TextOverflow.ellipsis,
                   style: TextStyle(color: Colors.grey[400], fontSize: 9),
                 ),
               ],
             ),
           ),
+          const SizedBox(width: 8),
           Column(
             crossAxisAlignment: CrossAxisAlignment.end,
+            mainAxisSize: MainAxisSize.min,
             children: [
               Text(
                 '₱${NumberFormat('#,###.00').format(item['loss_amount'] ?? 0.0)}',

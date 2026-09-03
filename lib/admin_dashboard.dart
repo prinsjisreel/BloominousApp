@@ -1,24 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'inventory_data.dart';
-import 'inventory_page.dart';
-import 'pos_scanner_page.dart';
-import 'profile_page.dart';
-import 'orders_page.dart';
-import 'sales_report_page.dart';
-import 'settings_page.dart';
-import 'low_stock_alerts_page.dart';
-import 'spoilage_tracker_page.dart';
-import 'manage_employees_page.dart';
-import 'barcode_generator_page.dart';
-import 'kiri_generator_page.dart';
-import 'freshness_matrix_page.dart';
-import 'preorder_reservations_page.dart';
-import 'fraud_analytics_page.dart';
-import 'sales_anomalies_page.dart';
-import 'delivery_status_page.dart';
-import 'invoice_portal_page.dart';
+import 'app_sidebar.dart';
 
 class AdminDashboard extends StatefulWidget {
   final String role;
@@ -43,10 +28,10 @@ class _AdminDashboardState extends State<AdminDashboard> {
     final bool isSuperAdmin = widget.role == 'super-admin';
 
     if (isSuperAdmin) {
-      InventoryData.selectedBranchId = null;
       if (mounted) {
         setState(() {
-          _branchName = 'All Branches (Super Admin)';
+          _selectedBranchId = InventoryData.selectedBranchId;
+          _branchName = _selectedBranchId == null ? 'All Branches (Super Admin)' : 'Loading...';
         });
       }
     } else {
@@ -91,30 +76,25 @@ class _AdminDashboardState extends State<AdminDashboard> {
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
 
-    // Dark mode deep slate vs Clean light mode
     final bgColor = isDark ? const Color(0xFF121212) : const Color(0xFFF8F9FA);
     final cardColor = isDark ? const Color(0xFF1A1A1A) : Colors.white;
     final borderColor = isDark ? const Color(0xFF2A2A2A) : Colors.grey.withValues(alpha: 0.2);
     final textColor = isDark ? Colors.white : const Color(0xFF1E293B);
     final subTextColor = isDark ? Colors.grey[400]! : Colors.grey[600]!;
 
-    // Responsive layout breakpoint
     final isDesktop = MediaQuery.of(context).size.width >= 850;
 
     return Scaffold(
       backgroundColor: bgColor,
-      drawer: isDesktop ? null : Drawer(child: _buildSidebar(cardColor, textColor, subTextColor, isDark, effectiveRole, isAdmin)),
+      drawer: isDesktop ? null : Drawer(child: AppSidebar(role: effectiveRole, currentPage: 'dashboard')),
       body: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Sidebar for wide screens
-          if (isDesktop) _buildSidebar(cardColor, textColor, subTextColor, isDark, effectiveRole, isAdmin),
+          if (isDesktop) AppSidebar(role: effectiveRole, currentPage: 'dashboard'),
 
-          // Main Content Area
           Expanded(
             child: CustomScrollView(
               slivers: [
-                // Minimal Mobile App Bar
                 if (!isDesktop)
                   SliverAppBar(
                     backgroundColor: cardColor,
@@ -137,7 +117,6 @@ class _AdminDashboardState extends State<AdminDashboard> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        // The updated top bar (profile beside branch dropdown) with Overlap Fix
                         _buildTopBar(cardColor, textColor, subTextColor, borderColor, isDark, isSuperAdmin, user, effectiveRole, isAdmin),
                         const SizedBox(height: 32),
 
@@ -152,12 +131,11 @@ class _AdminDashboardState extends State<AdminDashboard> {
                         ),
                         const SizedBox(height: 16),
 
-                        // Muted Aesthetic Grid Layout for Stat Cards
                         GridView.count(
                           crossAxisCount: isDesktop ? 4 : 2,
                           crossAxisSpacing: 16,
                           mainAxisSpacing: 16,
-                          childAspectRatio: isDesktop ? 1.6 : 1.3,
+                          childAspectRatio: isDesktop ? 1.6 : 1.05,
                           shrinkWrap: true,
                           physics: const NeverScrollableScrollPhysics(),
                           children: [
@@ -181,7 +159,11 @@ class _AdminDashboardState extends State<AdminDashboard> {
                               calculator: (data) {
                                 double total = 0;
                                 for (var o in data) {
-                                  total += (o['totalAmount'] ?? (o['total_amount'] ?? 0.0)).toDouble();
+                                  total += (o['totalAmount'] ??
+                                      o['total_amount'] ??
+                                      o['total_price'] ??
+                                      0.0)
+                                      .toDouble();
                                 }
                                 return '₱${total.toStringAsFixed(0)}';
                               },
@@ -230,7 +212,6 @@ class _AdminDashboardState extends State<AdminDashboard> {
                         ),
                         const SizedBox(height: 16),
 
-                        // Top 5 / Bottom 5 Performance Cards (FIXED - Horizontal layout in column)
                         Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
@@ -263,167 +244,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
     );
   }
 
-  // --- Sidebar Component (Untouched) ---
-  Widget _buildSidebar(Color cardColor, Color textColor, Color subTextColor, bool isDark, String effectiveRole, bool isAdmin) {
-    String displayRole = effectiveRole == 'super-admin' ? 'SUPER ADMIN' : (effectiveRole == 'admin' ? 'ADMINISTRATOR' : 'STAFF MEMBER');
-
-    return Container(
-      width: 260,
-      color: cardColor,
-      child: Column(
-        children: [
-          const SizedBox(height: 40),
-          Column(
-            children: [
-              Container(
-                width: 60,
-                height: 60,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: isDark ? Colors.grey[800] : Colors.white,
-                  boxShadow: [
-                    if (!isDark)
-                      BoxShadow(color: Colors.black.withValues(alpha: 0.05), blurRadius: 10)
-                  ],
-                ),
-                child: ClipOval(
-                  child: Image.asset(
-                    'assets/images/logo.jpg',
-                    fit: BoxFit.cover,
-                    errorBuilder: (context, error, stackTrace) => const Icon(Icons.local_florist, color: Color(0xFFF59E0B)),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 16),
-              Text(
-                'BLOOMINOUS',
-                style: GoogleFonts.cormorantGaramond(
-                  fontSize: 22,
-                  fontWeight: FontWeight.bold,
-                  letterSpacing: 2.0,
-                  color: const Color(0xFFD4AF37),
-                ),
-              ),
-              const SizedBox(height: 4),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                decoration: BoxDecoration(
-                  color: const Color(0xFFF59E0B).withValues(alpha: 0.1),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: const Color(0xFFF59E0B).withValues(alpha: 0.3)),
-                ),
-                child: Text(
-                  displayRole,
-                  style: const TextStyle(
-                    fontSize: 9,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 1.5,
-                    color: Color(0xFFF59E0B),
-                  ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 30),
-          // Navigation Links
-          Expanded(
-            child: ListView(
-              padding: EdgeInsets.zero,
-              physics: const BouncingScrollPhysics(),
-              children: [
-                _buildSidebarItem('Dashboard', Icons.dashboard, null, isDark, textColor, isActive: true),
-                _buildSidebarItem('Orders', Icons.shopping_cart_checkout, OrdersPage(role: effectiveRole), isDark, textColor),
-                _buildSidebarItem('Invoice Portal', Icons.receipt_long, InvoicePortalPage(role: effectiveRole), isDark, textColor),
-                _buildSidebarItem('Pre-Orders', Icons.calendar_today, const PreordersPage(), isDark, textColor, isHidden: !isAdmin),
-                _buildSidebarItem('Fraud Analytics', Icons.security, const FraudAnalyticsPage(), isDark, textColor, isHidden: !isAdmin),
-                _buildSidebarItem('Sales Anomalies', Icons.warning_amber, const SalesAnomaliesPage(), isDark, textColor, isHidden: !isAdmin),
-                _buildSidebarItem('Inventory', Icons.inventory_2, InventoryPage(role: effectiveRole), isDark, textColor),
-                _buildSidebarItem('Freshness Matrix', Icons.health_and_safety, const FreshnessMatrixPage(), isDark, textColor),
-                _buildSidebarItem('Spoilage Tracker', Icons.delete_sweep, const SpoilageTrackerPage(), isDark, textColor),
-                _buildSidebarItem('AI Stock Alerts', Icons.notification_important, const LowStockAlertsPage(), isDark, textColor),
-                _buildSidebarItem('POS Scanner', Icons.qr_code_scanner, const POSScannerPage(), isDark, textColor),
-                _buildSidebarItem('Barcode Gen', Icons.barcode_reader, const BarcodeGeneratorPage(), isDark, textColor),
-                _buildSidebarItem('Delivery Status', Icons.local_shipping, const DeliveryStatusPage(), isDark, textColor),
-                _buildSidebarItem('Profile', Icons.person_outline, const ProfilePage(), isDark, textColor),
-                _buildSidebarItem('Manage Employees', Icons.badge, ManageEmployeesPage(role: effectiveRole), isDark, textColor, isHidden: !isAdmin),
-                _buildSidebarItem('Sales Report', Icons.analytics, SalesReportPage(role: effectiveRole), isDark, textColor, isHidden: !isAdmin),
-                _buildSidebarItem('3D Realism Hub', Icons.auto_awesome_mosaic, const KiriGeneratorPage(), isDark, textColor),
-                _buildSidebarItem('Settings', Icons.settings, SettingsPage(role: effectiveRole), isDark, textColor),
-              ],
-            ),
-          ),
-
-          // --- Relocated Logout Button ---
-          Container(
-            margin: const EdgeInsets.only(bottom: 24, top: 8),
-            decoration: const BoxDecoration(
-              border: Border(
-                left: BorderSide(color: Colors.transparent, width: 4),
-              ),
-            ),
-            child: ListTile(
-              leading: const Icon(Icons.logout_rounded, color: Colors.redAccent, size: 20),
-              title: const Text(
-                'Logout',
-                style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w600,
-                  color: Colors.redAccent,
-                ),
-              ),
-              onTap: () async {
-                await FirebaseAuth.instance.signOut();
-                if (mounted) Navigator.pop(context);
-              },
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildSidebarItem(String title, IconData icon, Widget? page, bool isDark, Color textColor, {bool isActive = false, bool isHidden = false}) {
-    if (isHidden) return const SizedBox.shrink();
-
-    return Container(
-      margin: const EdgeInsets.only(bottom: 4),
-      decoration: BoxDecoration(
-        color: isActive
-            ? (isDark ? const Color(0xFFF59E0B).withValues(alpha: 0.15) : const Color(0xFFFFF8E1))
-            : Colors.transparent,
-        border: Border(
-          left: BorderSide(
-            color: isActive ? const Color(0xFFF59E0B) : Colors.transparent,
-            width: 4,
-          ),
-        ),
-      ),
-      child: ListTile(
-        leading: Icon(
-          icon,
-          size: 20,
-          color: isActive
-              ? const Color(0xFFF59E0B)
-              : (isDark ? Colors.grey[400] : Colors.grey[700]),
-        ),
-        title: Text(
-          title,
-          style: TextStyle(
-            fontSize: 13,
-            fontWeight: isActive ? FontWeight.bold : FontWeight.w600,
-            color: isActive ? const Color(0xFFF59E0B) : textColor,
-          ),
-        ),
-        onTap: () {
-          if (!isActive && page != null) {
-            Navigator.push(context, MaterialPageRoute(builder: (context) => page));
-          }
-        },
-      ),
-    );
-  }
-
-  // --- Top Navigation Bar ---
+  // --- Top Navigation Bar (dropdown crash-guarded + live profile data) ---
   Widget _buildTopBar(Color cardColor, Color textColor, Color subTextColor, Color borderColor, bool isDark, bool isSuperAdmin, User? user, String role, bool isAdmin) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -438,38 +259,56 @@ class _AdminDashboardState extends State<AdminDashboard> {
       ),
       child: Row(
         children: [
-          // Expanded gives the Branch Selector room to breathe
           Expanded(
             flex: 3,
             child: isSuperAdmin
-                ? DropdownButtonHideUnderline(
-              child: DropdownButton<String?>(
-                value: _selectedBranchId,
-                isExpanded: true,
-                hint: Text(
-                  _branchName ?? 'All Branches',
-                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: textColor),
-                  overflow: TextOverflow.ellipsis,
-                ),
-                icon: const Icon(Icons.keyboard_arrow_down, color: Color(0xFFF59E0B)),
-                dropdownColor: cardColor,
-                onChanged: (branchId) {
-                  setState(() {
-                    _selectedBranchId = branchId;
-                    InventoryData.selectedBranchId = branchId;
-                    if (branchId == null) {
-                      _branchName = 'All Branches (Super Admin)';
-                    } else {
-                      // ignore: cast_from_null_always_fails
-                      final branch = [];
-                      _branchName = branch.isNotEmpty ? branch[0] : 'Branch Selected';
-                    }
-                  });
-                },
-                items: const [
-                  DropdownMenuItem(value: null, child: Text('All Branches')),
-                ],
-              ),
+                ? StreamBuilder<List<Map<String, dynamic>>>(
+              stream: InventoryData.getBranchesStream(),
+              builder: (context, snapshot) {
+                final branches = snapshot.data ?? [];
+
+                // Guard: DropdownButton crashes if `value` isn't found in
+                // `items`. _selectedBranchId can already hold a remembered
+                // branch ID before this stream has finished its first
+                // load — during that gap, `branches` is still empty.
+                final bool selectedExists =
+                    _selectedBranchId != null &&
+                        branches.any((b) => b['id'] == _selectedBranchId);
+                final String? safeValue = selectedExists ? _selectedBranchId : null;
+
+                return DropdownButtonHideUnderline(
+                  child: DropdownButton<String?>(
+                    value: safeValue,
+                    isExpanded: true,
+                    hint: Text(
+                      _branchName ?? 'All Branches',
+                      style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: textColor),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    icon: const Icon(Icons.keyboard_arrow_down, color: Color(0xFFF59E0B)),
+                    dropdownColor: cardColor,
+                    onChanged: (branchId) {
+                      setState(() {
+                        _selectedBranchId = branchId;
+                        InventoryData.selectedBranchId = branchId;
+                        if (branchId == null) {
+                          _branchName = 'All Branches (Super Admin)';
+                        } else {
+                          final branch = branches.firstWhere((b) => b['id'] == branchId);
+                          _branchName = branch['name'];
+                        }
+                      });
+                    },
+                    items: [
+                      const DropdownMenuItem(value: null, child: Text('All Branches')),
+                      ...branches.map((b) => DropdownMenuItem(
+                        value: b['id'] as String,
+                        child: Text(b['name'] as String),
+                      )),
+                    ],
+                  ),
+                );
+              },
             )
                 : Text(
               _branchName ?? '',
@@ -484,52 +323,72 @@ class _AdminDashboardState extends State<AdminDashboard> {
           Container(height: 20, width: 1, color: borderColor),
           const SizedBox(width: 12),
 
-          // Flexible allows User Info to shrink gracefully without overflowing
-          Flexible(
-            flex: 2,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.end,
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Text(
-                  user?.email?.split('@')[0] ?? (isAdmin ? 'Admin' : 'Staff'),
-                  style: GoogleFonts.inter(
-                    color: textColor,
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
+          // Live-listens to users/{uid} so name + photo here always
+          // matches whatever was last saved from ProfilePage.
+          StreamBuilder<DocumentSnapshot>(
+            stream: user != null
+                ? FirebaseFirestore.instance.collection('users').doc(user.uid).snapshots()
+                : null,
+            builder: (context, snapshot) {
+              final userData = snapshot.data?.data() as Map<String, dynamic>?;
+              final firstName = (userData?['firstName'] ?? '').toString();
+              final displayName = firstName.isNotEmpty
+                  ? firstName
+                  : (user?.email?.split('@')[0] ?? (isAdmin ? 'Admin' : 'Staff'));
+              final photoUrl = (userData?['photoUrl'] ?? '').toString();
+              final avatarLetter = displayName.isNotEmpty ? displayName[0].toUpperCase() : 'A';
+
+              return Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Flexible(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Text(
+                          displayName,
+                          style: GoogleFonts.inter(
+                            color: textColor,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        Text(
+                          role.toUpperCase(),
+                          style: TextStyle(
+                            fontSize: 9,
+                            letterSpacing: 1.0,
+                            fontWeight: FontWeight.w600,
+                            color: subTextColor,
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ],
+                    ),
                   ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                Text(
-                  role.toUpperCase(),
-                  style: TextStyle(
-                    fontSize: 9,
-                    letterSpacing: 1.0,
-                    fontWeight: FontWeight.w600,
-                    color: subTextColor,
+                  const SizedBox(width: 12),
+                  CircleAvatar(
+                    backgroundColor: const Color(0xFFF59E0B).withValues(alpha: 0.15),
+                    radius: 16,
+                    backgroundImage: photoUrl.isNotEmpty ? NetworkImage(photoUrl) : null,
+                    child: photoUrl.isEmpty
+                        ? Text(avatarLetter, style: const TextStyle(color: Color(0xFFF59E0B), fontWeight: FontWeight.bold, fontSize: 12))
+                        : null,
                   ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(width: 12),
-          CircleAvatar(
-            backgroundColor: const Color(0xFFF59E0B).withValues(alpha: 0.15),
-            radius: 16,
-            child: Text(
-              user?.email?.substring(0, 1).toUpperCase() ?? 'A',
-              style: const TextStyle(color: Color(0xFFF59E0B), fontWeight: FontWeight.bold, fontSize: 12),
-            ),
+                ],
+              );
+            },
           ),
         ],
       ),
     );
   }
 
-  // --- Minimalist Stat Cards ---
+  // --- Minimalist Stat Cards (overflow-proofed via LayoutBuilder+FittedBox) ---
   Widget _buildMinimalStatCardStream({
     required String title,
     required IconData icon,
@@ -561,37 +420,48 @@ class _AdminDashboardState extends State<AdminDashboard> {
                 ),
             ],
           ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(icon, color: iconColor, size: 22),
-              const SizedBox(height: 16),
-              Text(
-                value,
-                style: TextStyle(
-                  fontSize: 22,
-                  fontWeight: FontWeight.bold,
-                  color: textColor,
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              return FittedBox(
+                fit: BoxFit.scaleDown,
+                alignment: Alignment.topLeft,
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(maxWidth: constraints.maxWidth),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(icon, color: iconColor, size: 22),
+                      const SizedBox(height: 12),
+                      Text(
+                        value,
+                        style: TextStyle(
+                          fontSize: 22,
+                          fontWeight: FontWeight.bold,
+                          color: textColor,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        title,
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: subTextColor,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                title,
-                style: TextStyle(
-                  fontSize: 11,
-                  color: subTextColor,
-                  fontWeight: FontWeight.w500,
-                ),
-              ),
-            ],
+              );
+            },
           ),
         );
       },
     );
   }
 
-  // --- Top 5 / Bottom 5 Performance Cards (HORIZONTAL LAYOUT - FIXED) ---
+  // --- Top 5 / Bottom 5 Performance Cards (title overflow-guarded) ---
   Widget _buildPerformanceCard(String title, Color cardColor, Color borderColor, Color textColor, Color subTextColor, bool isDark) {
     return Container(
       width: double.infinity,
@@ -612,16 +482,19 @@ class _AdminDashboardState extends State<AdminDashboard> {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          // Title on the left
-          Text(
-            title,
-            style: GoogleFonts.cormorantGaramond(
-              fontSize: 18,
-              fontWeight: FontWeight.w600,
-              color: textColor,
+          Expanded(
+            child: Text(
+              title,
+              style: GoogleFonts.cormorantGaramond(
+                fontSize: 18,
+                fontWeight: FontWeight.w600,
+                color: textColor,
+              ),
+              overflow: TextOverflow.ellipsis,
+              maxLines: 2,
             ),
           ),
-          // Status badge on the right
+          const SizedBox(width: 8),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
             decoration: BoxDecoration(

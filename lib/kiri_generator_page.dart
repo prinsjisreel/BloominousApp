@@ -1,51 +1,39 @@
+import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:image_picker/image_picker.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:http/http.dart' as http;
+import 'package:image_picker/image_picker.dart';
 import 'package:model_viewer_plus/model_viewer_plus.dart';
-import 'kiri_service.dart';
 import 'inventory_data.dart';
+import 'app_sidebar.dart';
 
 class KiriGeneratorPage extends StatefulWidget {
-  const KiriGeneratorPage({super.key});
+  final String role;
+  const KiriGeneratorPage({super.key, this.role = 'employee'});
 
   @override
   State<KiriGeneratorPage> createState() => _KiriGeneratorPageState();
 }
 
-class _KiriGeneratorPageState extends State<KiriGeneratorPage>
-    with SingleTickerProviderStateMixin {
-  late TabController _tabController;
+class _KiriGeneratorPageState extends State<KiriGeneratorPage> {
+  // ============================================================
+  // ONE LINE TO EDIT ONCE YOUR BACKEND ENDPOINT EXISTS:
+  // This should point to a PHP (or similar) endpoint you control —
+  // e.g. "https://honeydew-duck-132160.hostingersite.com/generate_3d_model.php"
+  // — the SAME hosting pattern as submit_order.php and restore_trust.php
+  // elsewhere in this project. That endpoint is what actually holds the
+  // Hyper3D secret key and calls Hyper3D's API server-side. The mobile
+  // app never sees or stores the real key — it only ever talks to YOUR
+  // backend, which is the entire point of not embedding a secret inside
+  // a compiled app that anyone can decompile.
+  static const String _generate3dEndpoint = 'PASTE_YOUR_BACKEND_ENDPOINT_URL_HERE';
+  // ============================================================
 
-  // API Tab State
   File? _image;
   bool _isGenerating = false;
   String _status = '';
   String? _resultUrl;
-  final TextEditingController _apiKeyController = TextEditingController(
-      text:
-          'kiri_R20FEsh6d9JAMTznxYICltXe5d3sioHNA6bq' // Live API Key provided by user
-      );
-
-  // Guide Tab & Testing State
-  final TextEditingController _testGlbController = TextEditingController(
-      text:
-          'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/MaterialsVariantsShoe/glTF-Binary/MaterialsVariantsShoe.glb');
-  String? _currentTestModelUrl;
-
-  @override
-  void initState() {
-    super.initState();
-    _tabController = TabController(length: 2, vsync: this);
-  }
-
-  @override
-  void dispose() {
-    _tabController.dispose();
-    _apiKeyController.dispose();
-    _testGlbController.dispose();
-    super.dispose();
-  }
 
   Future<void> _pickImage() async {
     final picker = ImagePicker();
@@ -59,33 +47,29 @@ class _KiriGeneratorPageState extends State<KiriGeneratorPage>
     }
   }
 
+  // --- Sends the reference photo to YOUR backend, not to Hyper3D
+  // directly. The backend is responsible for holding the real Hyper3D
+  // API key and forwarding the request — this function only ever knows
+  // about _generate3dEndpoint above, matching the same "client never
+  // holds the secret" pattern as the rest of this app's fraud/payment
+  // flows (PaymentService, OrderSubmissionService). ---
   Future<void> _generate() async {
     if (_image == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-            content: Text('Please select or capture a flower photo first.'),
-            backgroundColor: Colors.orange),
+        const SnackBar(content: Text('Please select a reference flower photo first.'), backgroundColor: Colors.orange),
       );
       return;
     }
 
-    final key = _apiKeyController.text.trim();
-    if (key.isEmpty || key.contains('placeholder')) {
-      // Direct warning about missing actual Kiri Key
+    if (_generate3dEndpoint == 'PASTE_YOUR_BACKEND_ENDPOINT_URL_HERE') {
       showDialog(
         context: context,
         builder: (ctx) => AlertDialog(
-          title: const Text('Update KIRI Key Required'),
+          title: const Text('Backend Not Configured'),
           content: const Text(
-            'KIRI Engine API requires your personal API secret key from kiriengine.app/api/keys.\n\n'
-            'Please paste your actual API key first to start generating.',
+            'The 3D generation endpoint hasn\'t been set up yet. Once the backend Hyper3D integration is ready, its URL needs to be pasted into _generate3dEndpoint in kiri_generator_page.dart.',
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('OK'),
-            )
-          ],
+          actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('OK'))],
         ),
       );
       return;
@@ -93,574 +77,306 @@ class _KiriGeneratorPageState extends State<KiriGeneratorPage>
 
     setState(() {
       _isGenerating = true;
-      _status = 'Connecting to Kiri service...';
+      _status = 'Uploading reference photo...';
     });
 
     try {
-      final service = KiriService(key);
-      final url = await service.generateModel(
-        _image!,
-        onStatusUpdate: (s) => setState(() => _status = s),
-      );
+      final request = http.MultipartRequest('POST', Uri.parse(_generate3dEndpoint));
+      request.files.add(await http.MultipartFile.fromPath('image', _image!.path));
 
-      // Save Kiri metadata inside Firestore collection path
+      setState(() => _status = 'Generating 3D model — this can take a minute...');
+      final streamedResponse = await request.send().timeout(const Duration(minutes: 3));
+      final response = await http.Response.fromStream(streamedResponse);
+
+      if (response.statusCode != 200) {
+        throw Exception('Server returned status ${response.statusCode}');
+      }
+
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      final glbUrl = data['url'] ?? data['modelUrl'] ?? data['glbUrl'];
+      if (glbUrl == null || glbUrl.toString().isEmpty) {
+        throw Exception('No model URL returned by the server.');
+      }
+
       await InventoryData.saveTripoModel({
-        'name': 'Kiri Photogrammetry Flower',
-        'url': url,
-        'type': 'kiri_image_to_3d',
+        'name': 'Hyper3D Generated Flower',
+        'url': glbUrl,
+        'type': 'hyper3d_image_to_3d',
         'userId': 'admin_uploader',
       });
 
       setState(() {
-        _resultUrl = url;
+        _resultUrl = glbUrl.toString();
         _isGenerating = false;
+        _status = '';
       });
     } catch (e) {
       setState(() {
         _isGenerating = false;
-        _status = 'Error: $e';
+        _status = '';
       });
-      showDialog(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          title: const Text('KIRI Generation Result'),
-          content: Text(
-            'The API call returned: $e\n\n'
-            'To achieve 100% perfect, studio-grade photoreal models for your thesis advisory, we highly recommend using Kiri\'s free mobile app (Plan A tab) to take 3D scans of actual flowers.',
-          ),
-          actions: [
-            TextButton(
-                onPressed: () => Navigator.pop(ctx), child: const Text('CLOSE'))
-          ],
-        ),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Generation failed: $e'), backgroundColor: Colors.redAccent),
+        );
+      }
     }
   }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+    final bgColor = isDark ? const Color(0xFF121212) : const Color(0xFFF8F9FA);
+    final cardColor = isDark ? const Color(0xFF1A1A1A) : Colors.white;
+    final borderColor = isDark ? const Color(0xFF2A2A2A) : Colors.grey.withValues(alpha: 0.2);
+    final textColor = isDark ? Colors.white : const Color(0xFF1E293B);
+    final subTextColor = isDark ? Colors.grey[400]! : Colors.grey[600]!;
+    final isDesktop = MediaQuery.of(context).size.width >= 850;
 
     return Scaffold(
-      backgroundColor:
-          const Color(0xFF0F0E13), // Deep charcoal black space theme
+      backgroundColor: bgColor,
       appBar: AppBar(
-        title: Text('3D REALISM HUB',
-            style: GoogleFonts.orbitron(
-                fontSize: 16, fontWeight: FontWeight.bold, letterSpacing: 1.5)),
-        backgroundColor: Colors.black,
+        title: Text('3D Realism Hub', style: GoogleFonts.cormorantGaramond(fontWeight: FontWeight.bold, fontSize: 22)),
+        backgroundColor: isDark ? Colors.black : const Color(0xFF1E293B),
         foregroundColor: Colors.white,
-        bottom: TabBar(
-          controller: _tabController,
-          labelColor: Colors.pinkAccent,
-          unselectedLabelColor: Colors.grey,
-          indicatorColor: Colors.pinkAccent,
-          tabs: const [
-            Tab(icon: Icon(Icons.auto_awesome), text: 'API GENERATOR'),
-            Tab(
-                icon: Icon(Icons.photo_camera_back_rounded),
-                text: 'PLAN A (REAL PHOTO SCAN)'),
-          ],
-        ),
+        elevation: 0,
       ),
-      body: TabBarView(
-        controller: _tabController,
+      drawer: isDesktop ? null : Drawer(child: AppSidebar(role: widget.role, currentPage: 'kiri')),
+      body: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // TAB 1: Kiri REST Api Generator
-          _buildApiTab(theme),
-
-          // TAB 2: Plan A Guide & Live 3D Preview Sandbox
-          _buildGuideTab(theme),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildApiTab(ThemeData theme) {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(20),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          // Banner Advice
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: Colors.pinkAccent.withOpacity(0.08),
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: Colors.pinkAccent.withOpacity(0.2)),
-            ),
-            child: Row(
-              children: [
-                const Icon(Icons.info_outline, color: Colors.pinkAccent),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Text(
-                    'Create fast 3D models using the Kiri Engine developers program. Ideal for instant drafts.',
-                    style: TextStyle(color: Colors.grey[350], fontSize: 13),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 20),
-
-          // Key Configuration
-          Text(
-            'KIRI Engine API Secret Key',
-            style: GoogleFonts.plusJakartaSans(
-                color: Colors.white, fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(height: 8),
-          TextField(
-            controller: _apiKeyController,
-            obscureText: true,
-            style: const TextStyle(color: Colors.white),
-            decoration: InputDecoration(
-              filled: true,
-              fillColor: const Color(0xFF1B1A22),
-              hintText: 'Enter kiri_sk_...',
-              hintStyle: const TextStyle(color: Colors.grey),
-              prefixIcon: const Icon(Icons.key, color: Colors.pinkAccent),
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(10),
-                borderSide: BorderSide.none,
-              ),
-            ),
-          ),
-          const SizedBox(height: 24),
-
-          // Upload Box
-          Text(
-            'Flower Reference Image',
-            style: GoogleFonts.plusJakartaSans(
-                color: Colors.white, fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(height: 8),
-          _image != null
-              ? ClipRRect(
-                  borderRadius: BorderRadius.circular(14),
-                  child: Stack(
-                    alignment: Alignment.topRight,
-                    children: [
-                      Image.file(_image!,
-                          height: 180,
-                          width: double.infinity,
-                          fit: BoxFit.cover),
-                      IconButton(
-                        style: IconButton.styleFrom(
-                            backgroundColor: Colors.black54),
-                        icon: const Icon(Icons.close, color: Colors.white),
-                        onPressed: () => setState(() => _image = null),
-                      )
-                    ],
-                  ),
-                )
-              : GestureDetector(
-                  onTap: _pickImage,
-                  child: Container(
-                    height: 180,
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF1B1A22),
-                      borderRadius: BorderRadius.circular(14),
-                      border: Border.all(
-                          color: Colors.grey[800]!, style: BorderStyle.solid),
-                    ),
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        const Icon(Icons.add_photo_alternate_rounded,
-                            size: 48, color: Colors.pinkAccent),
-                        const SizedBox(height: 10),
-                        Text(
-                          'Tap to pick reference flower photo',
-                          style:
-                              TextStyle(color: Colors.grey[400], fontSize: 13),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-          const SizedBox(height: 20),
-
-          ElevatedButton.icon(
-            onPressed: (_isGenerating || _image == null) ? null : _generate,
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.pinkAccent,
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(vertical: 14),
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(10)),
-              disabledBackgroundColor: Colors.grey[800],
-            ),
-            icon: const Icon(Icons.auto_awesome),
-            label: Text(
-              _isGenerating ? 'GENERATING...' : 'GENERATE 3D VIA KIRI API',
-              style: GoogleFonts.orbitron(
-                  fontWeight: FontWeight.bold, fontSize: 13),
-            ),
-          ),
-
-          if (_isGenerating || _status.isNotEmpty) ...[
-            const SizedBox(height: 24),
-            Center(
-              child: Column(
-                children: [
-                  const SizedBox(
-                    width: 28,
-                    height: 28,
-                    child: CircularProgressIndicator(
-                        color: Colors.pinkAccent, strokeWidth: 2.5),
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                    _status,
-                    textAlign: TextAlign.center,
-                    style: TextStyle(color: Colors.grey[400], fontSize: 13),
-                  ),
-                ],
-              ),
-            ),
-          ],
-
-          if (_resultUrl != null) ...[
-            const SizedBox(height: 30),
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: Colors.green.withOpacity(0.1),
-                border: Border.all(color: Colors.green.withOpacity(0.3)),
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  const Row(
-                    children: [
-                      Icon(Icons.check_circle_rounded, color: Colors.green),
-                      SizedBox(width: 8),
-                      Text('Successfully Generated Model!',
-                          style: TextStyle(
-                              color: Colors.white,
-                              fontWeight: FontWeight.bold)),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  SelectableText(
-                    _resultUrl!,
-                    style: const TextStyle(
-                        color: Colors.blueAccent,
-                        fontSize: 12,
-                        decoration: TextDecoration.underline),
-                  ),
-                  const SizedBox(height: 12),
-                  OutlinedButton.icon(
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: Colors.white,
-                      side: BorderSide(color: Colors.grey[700]!),
-                    ),
-                    icon: const Icon(Icons.view_in_ar, size: 18),
-                    label: const Text('TEST MODEL ON SANDBOX'),
-                    onPressed: () {
-                      _testGlbController.text = _resultUrl!;
-                      _tabController.animateTo(1);
-                      setState(() {
-                        _currentTestModelUrl = _resultUrl;
-                      });
-                    },
-                  ),
-                ],
-              ),
-            ),
-          ],
-
-          const SizedBox(height: 36),
-          const Divider(color: Color(0xFF23222A)),
-          const SizedBox(height: 16),
-          Text(
-            '3D Model Generation History',
-            style: GoogleFonts.orbitron(
-                color: Colors.white,
-                fontSize: 14,
-                fontWeight: FontWeight.bold,
-                letterSpacing: 1),
-          ),
-          const SizedBox(height: 12),
-          SizedBox(
-            height: 220,
-            child: StreamBuilder<List<Map<String, dynamic>>>(
-              stream: InventoryData.tripoHistoryStream(),
-              builder: (context, snapshot) {
-                if (snapshot.connectionState == ConnectionState.waiting) {
-                  return const Center(
-                      child:
-                          CircularProgressIndicator(color: Colors.pinkAccent));
-                }
-                if (!snapshot.hasData || snapshot.data!.isEmpty) {
-                  return Container(
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF14131B),
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                    child: const Center(
-                      child: Text('No generated models in history yet.',
-                          style: TextStyle(color: Colors.grey)),
-                    ),
-                  );
-                }
-
-                final list = snapshot.data!;
-                return ListView.builder(
-                  shrinkWrap: true,
-                  physics: const ClampingScrollPhysics(),
-                  itemCount: list.length,
-                  itemBuilder: (context, i) {
-                    final item = list[i];
-                    return ListTile(
-                      contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 14, vertical: 4),
-                      tileColor: const Color(0xFF15141D),
-                      shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(8)),
-                      title: Text(item['name'] ?? 'Kiri Scan Model',
-                          style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 13,
-                              fontWeight: FontWeight.bold)),
-                      subtitle: Text(item['url'] ?? '',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                              color: Colors.blueAccent, fontSize: 11)),
-                      leading: const Icon(Icons.forest_outlined,
-                          color: Colors.pinkAccent),
-                      trailing: IconButton(
-                        icon: const Icon(Icons.copy,
-                            color: Colors.grey, size: 18),
-                        onPressed: () {
-                          // Copy url
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(
-                                content: Text('Model link copied!'),
-                                duration: Duration(seconds: 1)),
-                          );
-                        },
-                      ),
-                    );
-                  },
-                );
-              },
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildGuideTab(ThemeData theme) {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(20),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          // Adviser Quote Header
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              gradient: const LinearGradient(
-                colors: [Color(0xFF2C192E), Color(0xFF191224)],
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-              ),
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: Colors.purple.withOpacity(0.3)),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
+          if (isDesktop) AppSidebar(role: widget.role, currentPage: 'kiri'),
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(20),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 760),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Icon(Icons.bookmark_added,
-                        color: Colors.pinkAccent, size: 20),
-                    const SizedBox(width: 8),
                     Text(
-                      'ADVISER\'S KEY RECOMMENDATION',
-                      style: GoogleFonts.orbitron(
-                          color: Colors.pinkAccent,
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold),
+                      '3D Realism Hub',
+                      style: GoogleFonts.cormorantGaramond(fontSize: isDesktop ? 32 : 24, fontWeight: FontWeight.bold, color: textColor),
                     ),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                const Text(
-                  '"Sabi ng adviser, picturan raw yung real flower ng 6 sides (top, bottom, and cross angles) '
-                  'para makuha yung precise visual realism. Gusto niya: What You See Is What You Get para sa customers gagamit." ',
-                  style: TextStyle(
-                      color: Colors.white,
-                      fontStyle: FontStyle.italic,
-                      height: 1.4,
-                      fontSize: 13.5),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 24),
-
-          // Steps of Plan A
-          Text(
-            'HOW TO CAPTURE REAL-WORLD FLOWERS (FREE & PRO)',
-            style: GoogleFonts.orbitron(
-                color: Colors.white,
-                fontSize: 13,
-                fontWeight: FontWeight.bold,
-                letterSpacing: 1),
-          ),
-          const SizedBox(height: 12),
-          _buildStepRow('1', 'SCAN IN REAL LIFE',
-              'Use free photogrammetry apps on your mobile phone: Polycam, Kiri Engine, or Luma AI to scan a physical flower. Take close-up photos from 6 distinct directional dimensions (top, bottom, & 4 sides) to capture the absolute realism your adviser expects.'),
-          _buildStepRow('2', 'EXPORT AS GLB',
-              'Export the finalized 3D mesh model completely free as a standard .glb (glTF Binary) file from your mobile app. This format contains embedded PBR textures which preserve exact highlights.'),
-          _buildStepRow('3', 'HOST GLB FREE',
-              'Upload your exported .glb file to any free host. You can upload them to your GitHub project repository, Firebase storage directory, or cheap file sharing servers to get a direct public URL link.'),
-          _buildStepRow('4', 'LINK IN INVENTORY',
-              'Paste that .glb URL into BloomyPro\'s Admin Inventory panel for any custom flower. Instantly, the genuine flower will display on the custom bouquet builder!'),
-
-          const SizedBox(height: 30),
-          const Divider(color: Color(0xFF23222A)),
-          const SizedBox(height: 16),
-
-          // Live 3D Sandbox Title
-          Text(
-            'LIVE GLB MODEL VIEW SANDBOX',
-            style: GoogleFonts.orbitron(
-                color: Colors.white,
-                fontSize: 13,
-                fontWeight: FontWeight.bold,
-                letterSpacing: 1),
-          ),
-          const SizedBox(height: 8),
-          const Text(
-            'Paste any .glb link to preview the realism of your photogrammetry model before adding it to products.',
-            style: TextStyle(color: Colors.grey, fontSize: 12),
-          ),
-          const SizedBox(height: 12),
-
-          Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _testGlbController,
-                  style: const TextStyle(color: Colors.white, fontSize: 12),
-                  decoration: InputDecoration(
-                    filled: true,
-                    fillColor: const Color(0xFF1B1A22),
-                    hintText: 'https://example.com/flower.glb',
-                    hintStyle:
-                        const TextStyle(color: Colors.grey, fontSize: 12),
-                    contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 14, vertical: 12),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
-                      borderSide: BorderSide.none,
+                    const SizedBox(height: 4),
+                    Text(
+                      'Upload a reference flower photo and generate a realistic 3D model automatically.',
+                      style: TextStyle(fontSize: 12, color: subTextColor),
                     ),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 10),
-              ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.purple,
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(8)),
-                ),
-                onPressed: () {
-                  setState(() {
-                    _currentTestModelUrl = _testGlbController.text.trim();
-                  });
-                },
-                child: const Text('LOAD 3D',
-                    style: TextStyle(
-                        color: Colors.white, fontWeight: FontWeight.bold)),
-              ),
-            ],
-          ),
+                    const SizedBox(height: 24),
 
-          const SizedBox(height: 16),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(14),
-            child: Container(
-              height: 280,
-              color: Colors.black,
-              child: _currentTestModelUrl != null &&
-                      _currentTestModelUrl!.isNotEmpty
-                  ? ModelViewer(
-                      key: ValueKey(_currentTestModelUrl),
-                      src: _currentTestModelUrl!,
-                      alt: 'Photogrammetry Test Model',
-                      ar: true,
-                      autoRotate: true,
-                      cameraControls: true,
-                      backgroundColor: Colors.transparent,
-                    )
-                  : const Center(
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
+                    // Instructions card — kept, recontextualized: no longer
+                    // a "how to manually scan without an API" guide, just
+                    // a short explanation of the new automated flow.
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFF59E0B).withValues(alpha: 0.08),
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(color: const Color(0xFFF59E0B).withValues(alpha: 0.2)),
+                      ),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Icon(Icons.view_in_ar_rounded,
-                              size: 48, color: Colors.grey),
-                          SizedBox(height: 10),
-                          Text(
-                            'Model Previews will display here.',
-                            style: TextStyle(color: Colors.grey, fontSize: 12),
+                          const Icon(Icons.info_outline, color: Color(0xFFF59E0B)),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              'Take a clear, well-lit photo of a real flower against a plain background. Upload it below and tap Generate — the model is built automatically and appears in the preview area once ready.',
+                              style: TextStyle(fontSize: 13, color: textColor, height: 1.4),
+                            ),
                           ),
                         ],
                       ),
                     ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
+                    const SizedBox(height: 24),
 
-  Widget _buildStepRow(String number, String title, String body) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 18),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          CircleAvatar(
-            radius: 12,
-            backgroundColor: Colors.pinkAccent,
-            child: Text(number,
-                style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 11,
-                    fontWeight: FontWeight.bold)),
-          ),
-          const SizedBox(width: 14),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  style: GoogleFonts.orbitron(
-                      color: Colors.white,
-                      fontSize: 11,
-                      fontWeight: FontWeight.bold,
-                      letterSpacing: 0.5),
+                    // --- Upload section ---
+                    Text('Flower Reference Photo', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: textColor)),
+                    const SizedBox(height: 8),
+                    _image != null
+                        ? ClipRRect(
+                      borderRadius: BorderRadius.circular(16),
+                      child: Stack(
+                        alignment: Alignment.topRight,
+                        children: [
+                          Image.file(_image!, height: 200, width: double.infinity, fit: BoxFit.cover),
+                          Padding(
+                            padding: const EdgeInsets.all(8.0),
+                            child: CircleAvatar(
+                              backgroundColor: Colors.black54,
+                              child: IconButton(
+                                icon: const Icon(Icons.close, color: Colors.white, size: 18),
+                                onPressed: () => setState(() {
+                                  _image = null;
+                                  _resultUrl = null;
+                                }),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    )
+                        : GestureDetector(
+                      onTap: _pickImage,
+                      child: Container(
+                        height: 200,
+                        width: double.infinity,
+                        decoration: BoxDecoration(
+                          color: cardColor,
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(color: borderColor, width: 1.5),
+                        ),
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            const Icon(Icons.add_photo_alternate_rounded, size: 44, color: Color(0xFFF59E0B)),
+                            const SizedBox(height: 10),
+                            Text('Tap to select a reference photo', style: TextStyle(color: subTextColor, fontSize: 13)),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+
+                    SizedBox(
+                      width: double.infinity,
+                      height: 52,
+                      child: ElevatedButton.icon(
+                        onPressed: (_isGenerating || _image == null) ? null : _generate,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFFF59E0B),
+                          foregroundColor: Colors.white,
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                          disabledBackgroundColor: borderColor,
+                        ),
+                        icon: _isGenerating
+                            ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                            : const Icon(Icons.auto_awesome),
+                        label: Text(
+                          _isGenerating ? 'GENERATING...' : 'GENERATE 3D MODEL',
+                          style: const TextStyle(fontWeight: FontWeight.bold, letterSpacing: 0.5),
+                        ),
+                      ),
+                    ),
+
+                    if (_status.isNotEmpty) ...[
+                      const SizedBox(height: 12),
+                      Text(_status, textAlign: TextAlign.center, style: TextStyle(color: subTextColor, fontSize: 12)),
+                    ],
+
+                    const SizedBox(height: 28),
+
+                    // --- 3D preview area — kept, restyled to match portal ---
+                    Text('3D Model Preview', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: textColor)),
+                    const SizedBox(height: 8),
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(16),
+                      child: Container(
+                        height: 280,
+                        width: double.infinity,
+                        color: isDark ? Colors.black : const Color(0xFFF1F1F1),
+                        child: _resultUrl != null
+                            ? ModelViewer(
+                          key: ValueKey(_resultUrl),
+                          src: _resultUrl!,
+                          alt: 'Generated 3D flower model',
+                          ar: true,
+                          autoRotate: true,
+                          cameraControls: true,
+                          backgroundColor: Colors.transparent,
+                        )
+                            : Center(
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(Icons.view_in_ar_rounded, size: 44, color: subTextColor),
+                              const SizedBox(height: 10),
+                              Text('Your generated model will appear here', style: TextStyle(color: subTextColor, fontSize: 12)),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+
+                    if (_resultUrl != null) ...[
+                      const SizedBox(height: 16),
+                      Container(
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          color: Colors.green.withValues(alpha: 0.08),
+                          borderRadius: BorderRadius.circular(14),
+                          border: Border.all(color: Colors.green.withValues(alpha: 0.25)),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                const Icon(Icons.check_circle_rounded, color: Colors.green, size: 18),
+                                const SizedBox(width: 8),
+                                Text('Model generated successfully', style: TextStyle(color: textColor, fontWeight: FontWeight.bold, fontSize: 13)),
+                              ],
+                            ),
+                            const SizedBox(height: 8),
+                            SelectableText(
+                              _resultUrl!,
+                              style: const TextStyle(color: Colors.blueAccent, fontSize: 11, decoration: TextDecoration.underline),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+
+                    const SizedBox(height: 32),
+                    Divider(color: borderColor),
+                    const SizedBox(height: 16),
+                    Text('Generation History', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: textColor)),
+                    const SizedBox(height: 12),
+
+                    StreamBuilder<List<Map<String, dynamic>>>(
+                      stream: InventoryData.tripoHistoryStream(),
+                      builder: (context, snapshot) {
+                        if (snapshot.connectionState == ConnectionState.waiting) {
+                          return const Center(child: CircularProgressIndicator(color: Color(0xFFF59E0B)));
+                        }
+                        if (!snapshot.hasData || snapshot.data!.isEmpty) {
+                          return Container(
+                            padding: const EdgeInsets.symmetric(vertical: 32),
+                            width: double.infinity,
+                            alignment: Alignment.center,
+                            decoration: BoxDecoration(color: cardColor, borderRadius: BorderRadius.circular(14), border: Border.all(color: borderColor)),
+                            child: Text('No generated models yet.', style: TextStyle(color: subTextColor)),
+                          );
+                        }
+
+                        final list = snapshot.data!;
+                        return Column(
+                          children: list.map((item) {
+                            return Container(
+                              margin: const EdgeInsets.only(bottom: 10),
+                              decoration: BoxDecoration(color: cardColor, borderRadius: BorderRadius.circular(12), border: Border.all(color: borderColor)),
+                              child: ListTile(
+                                leading: const Icon(Icons.view_in_ar_outlined, color: Color(0xFFF59E0B)),
+                                title: Text(item['name'] ?? 'Generated Model',
+                                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: textColor)),
+                                subtitle: Text((item['url'] ?? '').toString(),
+                                    maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.blueAccent, fontSize: 11)),
+                                trailing: IconButton(
+                                  icon: Icon(Icons.play_circle_outline, color: subTextColor, size: 20),
+                                  tooltip: 'Preview this model',
+                                  onPressed: () => setState(() => _resultUrl = item['url']),
+                                ),
+                              ),
+                            );
+                          }).toList(),
+                        );
+                      },
+                    ),
+                  ],
                 ),
-                const SizedBox(height: 3),
-                Text(
-                  body,
-                  style: TextStyle(
-                      color: Colors.grey[400], fontSize: 12.5, height: 1.35),
-                ),
-              ],
+              ),
             ),
           ),
         ],

@@ -10,9 +10,11 @@ import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import 'inventory_data.dart';
+import 'app_sidebar.dart';
 
 class BarcodeGeneratorPage extends StatefulWidget {
-  const BarcodeGeneratorPage({super.key});
+  final String role;
+  const BarcodeGeneratorPage({super.key, this.role = 'employee'});
 
   @override
   State<BarcodeGeneratorPage> createState() => _BarcodeGeneratorPageState();
@@ -22,7 +24,7 @@ class _BarcodeGeneratorPageState extends State<BarcodeGeneratorPage> {
   final List<String> _barcodeList = [];
   final TextEditingController _manualController = TextEditingController();
   final TextEditingController _prefixController =
-      TextEditingController(text: 'BLOOM-');
+  TextEditingController(text: 'BLOOM-');
 
   void _addBarcode(String data) {
     if (data.trim().isEmpty) return;
@@ -47,8 +49,6 @@ class _BarcodeGeneratorPageState extends State<BarcodeGeneratorPage> {
   }
 
   Future<void> _bulkGenerate() async {
-    int start = 1;
-    int count = 3;
     final startController = TextEditingController(text: '1');
     final countController = TextEditingController(text: '3');
 
@@ -62,7 +62,7 @@ class _BarcodeGeneratorPageState extends State<BarcodeGeneratorPage> {
             TextField(
               controller: _prefixController,
               decoration:
-                  const InputDecoration(labelText: 'Prefix (e.g., BLOOM-)'),
+              const InputDecoration(labelText: 'Prefix (e.g., BLOOM-)'),
             ),
             TextField(
               controller: startController,
@@ -185,12 +185,11 @@ class _BarcodeGeneratorPageState extends State<BarcodeGeneratorPage> {
                 padding: const EdgeInsets.all(20),
                 child: Row(
                   children: [
-                    Text(
+                    const Text(
                       'Select Items',
                       style: TextStyle(
                         fontSize: 20,
                         fontWeight: FontWeight.bold,
-                        fontFamily: 'Playfair Display',
                       ),
                     ),
                     const Spacer(),
@@ -205,8 +204,9 @@ class _BarcodeGeneratorPageState extends State<BarcodeGeneratorPage> {
                 child: StreamBuilder<List<Map<String, dynamic>>>(
                   stream: InventoryData.inventoryStream(),
                   builder: (context, snapshot) {
-                    if (!snapshot.hasData)
+                    if (!snapshot.hasData) {
                       return const Center(child: CircularProgressIndicator());
+                    }
                     final items = snapshot.data!;
                     return ListView.builder(
                       controller: scrollController,
@@ -223,8 +223,10 @@ class _BarcodeGeneratorPageState extends State<BarcodeGeneratorPage> {
                                 : Icons.check_box_outline_blank,
                             color: isAdded ? Colors.green : Colors.grey,
                           ),
-                          title: Text(item['name'] ?? 'Unnamed Product'),
-                          subtitle: Text('Barcode: $barcode'),
+                          title: Text(item['name'] ?? 'Unnamed Product',
+                              overflow: TextOverflow.ellipsis),
+                          subtitle: Text('Barcode: $barcode',
+                              overflow: TextOverflow.ellipsis),
                           onTap: () {
                             setState(() {
                               if (isAdded) {
@@ -250,11 +252,15 @@ class _BarcodeGeneratorPageState extends State<BarcodeGeneratorPage> {
   @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
+    final isDesktop = MediaQuery.of(context).size.width >= 850;
+    // NEW: below this width, the two full-label extended FABs risk
+    // crowding the screen edge — switch to compact icon-only FABs with
+    // tooltips instead of shrinking unreadable text.
+    final isNarrow = MediaQuery.of(context).size.width < 400;
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Batch Barcode Generator',
-            style: TextStyle(fontFamily: 'Playfair Display')),
+        title: const Text('Batch Barcode Generator'),
         backgroundColor: Colors.black,
         foregroundColor: Colors.white,
         actions: [
@@ -272,13 +278,19 @@ class _BarcodeGeneratorPageState extends State<BarcodeGeneratorPage> {
             ),
         ],
       ),
-      body: Column(
+      // NEW: sidebar drawer on mobile.
+      drawer: isDesktop ? null : Drawer(child: AppSidebar(role: widget.role, currentPage: 'barcode')),
+      body: Row(
         children: [
-          _buildInputSection(isDark),
+          if (isDesktop) AppSidebar(role: widget.role, currentPage: 'barcode'),
           Expanded(
-            child: _barcodeList.isEmpty
-                ? _buildEmptyState()
-                : ListView.builder(
+            child: Column(
+              children: [
+                _buildInputSection(isDark),
+                Expanded(
+                  child: _barcodeList.isEmpty
+                      ? _buildEmptyState()
+                      : ListView.builder(
                     padding: const EdgeInsets.all(16),
                     itemCount: _barcodeList.length,
                     itemBuilder: (context, index) => _BarcodeCard(
@@ -287,10 +299,37 @@ class _BarcodeGeneratorPageState extends State<BarcodeGeneratorPage> {
                       index: index + 1,
                     ),
                   ),
+                ),
+              ],
+            ),
           ),
         ],
       ),
-      floatingActionButton: Column(
+      floatingActionButton: isNarrow
+      // FIXED: compact icon-only FABs on narrow screens instead of
+      // two full-width extended buttons with long labels that could
+      // crowd or clip near the screen edge.
+          ? Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          FloatingActionButton(
+            onPressed: _bulkGenerate,
+            heroTag: 'bulk',
+            backgroundColor: Colors.blue[800],
+            tooltip: 'Bulk Generate (Prefix)',
+            child: const Icon(Icons.auto_awesome, color: Colors.white),
+          ),
+          const SizedBox(height: 12),
+          FloatingActionButton(
+            onPressed: _showInventoryPicker,
+            heroTag: 'inventory',
+            backgroundColor: Colors.orange[800],
+            tooltip: 'Pick from Inventory',
+            child: const Icon(Icons.add_shopping_cart, color: Colors.white),
+          ),
+        ],
+      )
+          : Column(
         mainAxisSize: MainAxisSize.min,
         children: [
           FloatingActionButton.extended(
@@ -362,24 +401,27 @@ class _BarcodeGeneratorPageState extends State<BarcodeGeneratorPage> {
 
   Widget _buildEmptyState() {
     return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(Icons.qr_code_scanner,
-              size: 80, color: Colors.grey.withOpacity(0.3)),
-          const SizedBox(height: 16),
-          Text(
-            'Enter data above or pick from inventory\nto generate barcodes',
-            textAlign: TextAlign.center,
-            style: TextStyle(color: Colors.grey[600]),
-          ),
-          const SizedBox(height: 24),
-          OutlinedButton.icon(
-            onPressed: _bulkGenerate,
-            icon: const Icon(Icons.auto_fix_high),
-            label: const Text('BULK GENERATE BLOOM- ITEMS'),
-          ),
-        ],
+      child: Padding(
+        padding: const EdgeInsets.all(24.0),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.qr_code_scanner,
+                size: 80, color: Colors.grey.withOpacity(0.3)),
+            const SizedBox(height: 16),
+            Text(
+              'Enter data above or pick from inventory\nto generate barcodes',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.grey[600]),
+            ),
+            const SizedBox(height: 24),
+            OutlinedButton.icon(
+              onPressed: _bulkGenerate,
+              icon: const Icon(Icons.auto_fix_high),
+              label: const Text('BULK GENERATE BLOOM- ITEMS'),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -446,7 +488,7 @@ class _BarcodeCard extends StatelessWidget {
               decoration: BoxDecoration(
                 color: isDark ? Colors.grey[850] : Colors.grey[200],
                 borderRadius:
-                    const BorderRadius.vertical(bottom: Radius.circular(20)),
+                const BorderRadius.vertical(bottom: Radius.circular(20)),
               ),
               child: Column(
                 children: [
@@ -471,10 +513,10 @@ class _BarcodeCard extends StatelessWidget {
   Future<void> _shareBarcode(BuildContext context) async {
     try {
       RenderRepaintBoundary boundary =
-          _cardKey.currentContext!.findRenderObject() as RenderRepaintBoundary;
+      _cardKey.currentContext!.findRenderObject() as RenderRepaintBoundary;
       ui.Image image = await boundary.toImage(pixelRatio: 3.0);
       ByteData? byteData =
-          await image.toByteData(format: ui.ImageByteFormat.png);
+      await image.toByteData(format: ui.ImageByteFormat.png);
       Uint8List pngBytes = byteData!.buffer.asUint8List();
 
       final tempDir = await getTemporaryDirectory();

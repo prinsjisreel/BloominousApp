@@ -4,6 +4,7 @@ import 'package:image_picker/image_picker.dart';
 import 'inventory_data.dart';
 import 'spoilage_tracker_page.dart';
 import 'kiri_service.dart';
+import 'app_sidebar.dart';
 
 class InventoryPage extends StatefulWidget {
   final String role;
@@ -14,16 +15,26 @@ class InventoryPage extends StatefulWidget {
 }
 
 class _InventoryPageState extends State<InventoryPage> {
+  Map<String, dynamic> _stockStatus(int stock) {
+    if (stock <= 0) {
+      return {'label': 'DEPLETED', 'bg': const Color(0xFFE91E63).withValues(alpha: 0.1), 'fg': const Color(0xFFE91E63)};
+    }
+    if (stock <= 10) {
+      return {'label': 'CRITICAL', 'bg': const Color(0xFFFFB142).withValues(alpha: 0.15), 'fg': const Color(0xFFF39C12)};
+    }
+    return {'label': 'STABLE', 'bg': const Color(0xFF2ECC71).withValues(alpha: 0.12), 'fg': const Color(0xFF27AE60)};
+  }
+
   void _showItemDialog([Map<String, dynamic>? item]) {
     final isEditing = item != null;
     final nameController =
-        TextEditingController(text: isEditing ? item['name'] : '');
+    TextEditingController(text: isEditing ? item['name'] : '');
     final codeController =
-        TextEditingController(text: isEditing ? item['code'] : '');
+    TextEditingController(text: isEditing ? item['code'] : '');
     final priceController =
-        TextEditingController(text: isEditing ? item['price'].toString() : '');
+    TextEditingController(text: isEditing ? item['price'].toString() : '');
     final stockController =
-        TextEditingController(text: isEditing ? item['stock'].toString() : '');
+    TextEditingController(text: isEditing ? item['stock'].toString() : '');
     String? selectedCategory = isEditing ? item['category'] : 'Flowers';
 
     final List<String> categories = [
@@ -37,9 +48,9 @@ class _InventoryPageState extends State<InventoryPage> {
 
     final addStockController = TextEditingController(text: '0');
     final modelController =
-        TextEditingController(text: isEditing ? (item['model'] ?? '') : '');
+    TextEditingController(text: isEditing ? (item['model'] ?? '') : '');
     final imageController =
-        TextEditingController(text: isEditing ? (item['image'] ?? '') : '');
+    TextEditingController(text: isEditing ? (item['image'] ?? '') : '');
     String generationStatus = '';
 
     final isAdmin = widget.role == 'admin' || widget.role == 'super-admin';
@@ -64,7 +75,7 @@ class _InventoryPageState extends State<InventoryPage> {
                     enabled: isAdmin,
                     controller: codeController,
                     decoration:
-                        const InputDecoration(labelText: 'Barcode/SKU')),
+                    const InputDecoration(labelText: 'Barcode/SKU')),
                 TextField(
                     enabled: isAdmin,
                     controller: priceController,
@@ -74,7 +85,7 @@ class _InventoryPageState extends State<InventoryPage> {
                     enabled: isAdmin,
                     controller: stockController,
                     decoration:
-                        const InputDecoration(labelText: 'Stock Quantity'),
+                    const InputDecoration(labelText: 'Stock Quantity'),
                     keyboardType: TextInputType.number),
                 DropdownButtonFormField<String>(
                   value: selectedCategory,
@@ -88,10 +99,10 @@ class _InventoryPageState extends State<InventoryPage> {
                   onChanged: !isAdmin
                       ? null
                       : (String? newValue) {
-                          setDialogState(() {
-                            selectedCategory = newValue;
-                          });
-                        },
+                    setDialogState(() {
+                      selectedCategory = newValue;
+                    });
+                  },
                 ),
                 const Divider(height: 30),
                 const Text("3D & VISUALS",
@@ -194,116 +205,114 @@ class _InventoryPageState extends State<InventoryPage> {
                       onPressed: generationStatus.isNotEmpty
                           ? null
                           : () async {
-                              final picker = ImagePicker();
-                              final pickedFile = await picker.pickImage(
-                                  source: ImageSource.gallery);
-                              if (pickedFile != null) {
-                                // Prompt for Kiri API key dynamically
-                                final keyController = TextEditingController(
-                                    text:
-                                        'kiri_R20FEsh6d9JAMTznxYICltXe5d3sioHNA6bq');
-                                final userKey = await showDialog<String>(
-                                  context: context,
-                                  builder: (ctx) => AlertDialog(
-                                    title: const Text(
-                                        'KIRI Engine Secret Key Required'),
-                                    content: Column(
-                                      mainAxisSize: MainAxisSize.min,
-                                      children: [
-                                        const Text(
-                                            'Please paste your active KIRI Engine API Secret Key from kiriengine.app/api/keys to run photogrammetry:'),
-                                        const SizedBox(height: 14),
-                                        TextField(
-                                          controller: keyController,
-                                          obscureText: true,
-                                          style: const TextStyle(fontSize: 13),
-                                          decoration: const InputDecoration(
-                                            labelText:
-                                                'Secret Key (kiri_sk_...)',
-                                            prefixIcon: Icon(Icons.key,
-                                                color: Colors.purple),
-                                            border: OutlineInputBorder(),
-                                          ),
-                                        ),
-                                      ],
+                        final picker = ImagePicker();
+                        final pickedFile = await picker.pickImage(
+                            source: ImageSource.gallery);
+                        if (pickedFile != null) {
+                          final keyController = TextEditingController(
+                              text:
+                              'kiri_R20FEsh6d9JAMTznxYICltXe5d3sioHNA6bq');
+                          final userKey = await showDialog<String>(
+                            context: context,
+                            builder: (ctx) => AlertDialog(
+                              title: const Text(
+                                  'KIRI Engine Secret Key Required'),
+                              content: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  const Text(
+                                      'Please paste your active KIRI Engine API Secret Key from kiriengine.app/api/keys to run photogrammetry:'),
+                                  const SizedBox(height: 14),
+                                  TextField(
+                                    controller: keyController,
+                                    obscureText: true,
+                                    style: const TextStyle(fontSize: 13),
+                                    decoration: const InputDecoration(
+                                      labelText:
+                                      'Secret Key (kiri_sk_...)',
+                                      prefixIcon: Icon(Icons.key,
+                                          color: Colors.purple),
+                                      border: OutlineInputBorder(),
                                     ),
-                                    actions: [
-                                      TextButton(
-                                          onPressed: () => Navigator.pop(ctx),
-                                          child: const Text('CANCEL')),
-                                      ElevatedButton(
-                                        style: ElevatedButton.styleFrom(
-                                            backgroundColor: Colors.purple,
-                                            foregroundColor: Colors.white),
-                                        onPressed: () => Navigator.pop(
-                                            ctx, keyController.text.trim()),
-                                        child: const Text('PROCEED'),
-                                      ),
-                                    ],
                                   ),
-                                );
+                                ],
+                              ),
+                              actions: [
+                                TextButton(
+                                    onPressed: () => Navigator.pop(ctx),
+                                    child: const Text('CANCEL')),
+                                ElevatedButton(
+                                  style: ElevatedButton.styleFrom(
+                                      backgroundColor: Colors.purple,
+                                      foregroundColor: Colors.white),
+                                  onPressed: () => Navigator.pop(
+                                      ctx, keyController.text.trim()),
+                                  child: const Text('PROCEED'),
+                                ),
+                              ],
+                            ),
+                          );
 
-                                if (userKey == null ||
-                                    userKey.isEmpty ||
-                                    userKey.contains('placeholder')) {
-                                  return;
-                                }
+                          if (userKey == null ||
+                              userKey.isEmpty ||
+                              userKey.contains('placeholder')) {
+                            return;
+                          }
 
-                                try {
-                                  setDialogState(() => generationStatus =
-                                      'Initializing Kiri...');
-                                  final service = KiriService(userKey);
-                                  final glbUrl = await service.generateModel(
-                                    File(pickedFile.path),
-                                    onStatusUpdate: (status) {
-                                      setDialogState(
-                                          () => generationStatus = status);
-                                    },
-                                  );
+                          try {
+                            setDialogState(() => generationStatus =
+                            'Initializing Kiri...');
+                            final service = KiriService(userKey);
+                            final glbUrl = await service.generateModel(
+                              File(pickedFile.path),
+                              onStatusUpdate: (status) {
+                                setDialogState(
+                                        () => generationStatus = status);
+                              },
+                            );
 
-                                  // Save history record
-                                  await InventoryData.saveTripoModel({
-                                    'name': nameController.text.isNotEmpty
-                                        ? nameController.text
-                                        : 'Kiri generated flower model',
-                                    'url': glbUrl,
-                                    'type': 'kiri_image_to_3d',
-                                    'userId': 'admin_uploader',
-                                  });
+                            await InventoryData.saveTripoModel({
+                              'name': nameController.text.isNotEmpty
+                                  ? nameController.text
+                                  : 'Kiri generated flower model',
+                              'url': glbUrl,
+                              'type': 'kiri_image_to_3d',
+                              'userId': 'admin_uploader',
+                            });
 
-                                  setDialogState(() {
-                                    modelController.text = glbUrl;
-                                    generationStatus = '';
-                                  });
-                                } catch (e) {
-                                  setDialogState(
-                                      () => generationStatus = 'Error!');
-                                  await Future.delayed(
-                                      const Duration(seconds: 3));
-                                  setDialogState(() => generationStatus = '');
+                            setDialogState(() {
+                              modelController.text = glbUrl;
+                              generationStatus = '';
+                            });
+                          } catch (e) {
+                            setDialogState(
+                                    () => generationStatus = 'Error!');
+                            await Future.delayed(
+                                const Duration(seconds: 3));
+                            setDialogState(() => generationStatus = '');
 
-                                  if (context.mounted) {
-                                    showDialog(
-                                      context: context,
-                                      builder: (ctx) => AlertDialog(
-                                        title: const Text(
-                                            'KIRI Generation Failsafe'),
-                                        content: Text(
-                                          'Error details: $e\n\n'
-                                          'Alternative (Adviser Plan A): Use Polycam, Luma, or Kiri on your mobile device to scan the flower, export .glb, host it, and paste its URL directly.',
-                                        ),
-                                        actions: [
-                                          TextButton(
-                                              onPressed: () =>
-                                                  Navigator.pop(ctx),
-                                              child: const Text('OK')),
-                                        ],
-                                      ),
-                                    );
-                                  }
-                                }
-                              }
-                            },
+                            if (context.mounted) {
+                              showDialog(
+                                context: context,
+                                builder: (ctx) => AlertDialog(
+                                  title: const Text(
+                                      'KIRI Generation Failsafe'),
+                                  content: Text(
+                                    'Error details: $e\n\n'
+                                        'Alternative (Adviser Plan A): Use Polycam, Luma, or Kiri on your mobile device to scan the flower, export .glb, host it, and paste its URL directly.',
+                                  ),
+                                  actions: [
+                                    TextButton(
+                                        onPressed: () =>
+                                            Navigator.pop(ctx),
+                                        child: const Text('OK')),
+                                  ],
+                                ),
+                              );
+                            }
+                          }
+                        }
+                      },
                     ),
                   ),
                 TextField(
@@ -325,7 +334,7 @@ class _InventoryPageState extends State<InventoryPage> {
                       helperText: 'Enter amount to ADD to current stock',
                       border: OutlineInputBorder(),
                       prefixIcon:
-                          Icon(Icons.add_business_rounded, color: Colors.green),
+                      Icon(Icons.add_business_rounded, color: Colors.green),
                     ),
                     keyboardType: TextInputType.number,
                   ),
@@ -426,6 +435,7 @@ class _InventoryPageState extends State<InventoryPage> {
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
     final isAdmin = widget.role == 'admin' || widget.role == 'super-admin';
+    final isDesktop = MediaQuery.of(context).size.width >= 850;
 
     return Scaffold(
       backgroundColor: theme.scaffoldBackgroundColor,
@@ -449,107 +459,161 @@ class _InventoryPageState extends State<InventoryPage> {
         backgroundColor: isDark ? Colors.black : const Color(0xFFF59E0B),
         foregroundColor: Colors.white,
       ),
-      body: StreamBuilder<List<Map<String, dynamic>>>(
-        stream: InventoryData.inventoryStream(),
-        builder: (context, snapshot) {
-          if (snapshot.hasError)
-            return Center(child: Text('Error: ${snapshot.error}'));
-          if (snapshot.connectionState == ConnectionState.waiting)
-            return const Center(child: CircularProgressIndicator());
+      drawer: isDesktop ? null : Drawer(child: AppSidebar(role: widget.role, currentPage: 'inventory')),
+      body: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (isDesktop) AppSidebar(role: widget.role, currentPage: 'inventory'),
+          Expanded(
+            child: StreamBuilder<List<Map<String, dynamic>>>(
+              stream: InventoryData.inventoryStream(),
+              builder: (context, snapshot) {
+                if (snapshot.hasError)
+                  return Center(child: Text('Error: ${snapshot.error}'));
+                if (snapshot.connectionState == ConnectionState.waiting)
+                  return const Center(child: CircularProgressIndicator());
 
-          final items = snapshot.data ?? [];
-          if (items.isEmpty) {
-            return Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const Icon(Icons.inventory_2_outlined,
-                      size: 60, color: Colors.grey),
-                  const SizedBox(height: 16),
-                  const Text('No items in this branch inventory',
-                      style: TextStyle(color: Colors.grey)),
-                  const SizedBox(height: 8),
-                ],
-              ),
-            );
-          }
+                final items = snapshot.data ?? [];
+                if (items.isEmpty) {
+                  return Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        const Icon(Icons.inventory_2_outlined,
+                            size: 60, color: Colors.grey),
+                        const SizedBox(height: 16),
+                        const Text('No items in this branch inventory',
+                            style: TextStyle(color: Colors.grey)),
+                        const SizedBox(height: 8),
+                      ],
+                    ),
+                  );
+                }
 
-          return ListView.builder(
-            padding: const EdgeInsets.all(16),
-            itemCount: items.length,
-            itemBuilder: (context, index) {
-              final item = items[index];
-              final has3D =
-                  item['model'] != null && item['model'].toString().isNotEmpty;
-              final isRecycled = item['name'] == 'Recycled Bouquet';
+                return ListView.builder(
+                  padding: const EdgeInsets.all(16),
+                  itemCount: items.length,
+                  itemBuilder: (context, index) {
+                    final item = items[index];
+                    final has3D = item['model'] != null &&
+                        item['model'].toString().isNotEmpty;
+                    final isRecycled = item['name'] == 'Recycled Bouquet';
+                    final stock = (item['stock'] ?? 0) as int;
+                    final status = _stockStatus(stock);
 
-              return Card(
-                elevation: isRecycled ? 2 : 0,
-                color: isRecycled ? Colors.green[50] : null,
-                child: ListTile(
-                  leading: item['image'] != null &&
-                          item['image'].toString().isNotEmpty
-                      ? Image.network(item['image'],
-                          width: 40,
-                          height: 40,
-                          fit: BoxFit.cover,
-                          errorBuilder: (_, __, ___) => const Icon(Icons.image))
-                      : const Icon(Icons.image),
-                  title: Row(
-                    children: [
-                      Text(item['name']),
-                      if (has3D) ...[
-                        const SizedBox(width: 8),
-                        const Icon(Icons.view_in_ar,
-                            size: 16, color: Colors.blue),
-                      ]
-                    ],
-                  ),
-                  subtitle: Text('Stock: ${item['stock']}'),
-                  trailing: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      IconButton(
-                        icon: const Icon(Icons.delete_sweep_rounded,
-                            color: Colors.orangeAccent, size: 20),
-                        onPressed: () {
-                          Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                                builder: (context) => SpoilageTrackerPage(
-                                    initialProductId: item['id'])),
-                          );
-                        },
-                        tooltip: 'Report Spoilage',
-                      ),
-                      if (isAdmin)
-                        IconButton(
-                          icon: const Icon(Icons.archive_outlined,
-                              color: Colors.redAccent, size: 20),
-                          onPressed: () =>
-                              _showArchiveConfirmDialog(context, item),
-                          tooltip: 'Archive Item',
+                    // FIXED: no more ListTile. ListTile pre-computes a
+                    // fixed row height from title/subtitle and then hands
+                    // trailing whatever space is left — if trailing needs
+                    // more, it silently overflows (the hazard-stripe
+                    // warning you saw). This custom Row/Column sizes
+                    // itself entirely from its own content, so there's no
+                    // pre-set height for anything to exceed.
+                    return Card(
+                      elevation: isRecycled ? 2 : 0,
+                      color: isRecycled
+                          ? (isDark ? Colors.green.withValues(alpha: 0.15) : Colors.green[50])
+                          : null,
+                      child: InkWell(
+                        onTap: () => _showItemDialog(item),
+                        onLongPress: !isAdmin ? null : () => _showArchiveConfirmDialog(context, item),
+                        borderRadius: BorderRadius.circular(12),
+                        child: Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              item['image'] != null && item['image'].toString().isNotEmpty
+                                  ? ClipRRect(
+                                borderRadius: BorderRadius.circular(8),
+                                child: Image.network(item['image'],
+                                    width: 44, height: 44, fit: BoxFit.cover,
+                                    errorBuilder: (_, __, ___) => const Icon(Icons.image)),
+                              )
+                                  : const Icon(Icons.image, size: 44),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Row(
+                                      children: [
+                                        Flexible(child: Text(item['name'], overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w600))),
+                                        if (has3D) ...[
+                                          const SizedBox(width: 6),
+                                          const Icon(Icons.view_in_ar, size: 15, color: Colors.blue),
+                                        ],
+                                      ],
+                                    ),
+                                    const SizedBox(height: 6),
+                                    Wrap(
+                                      spacing: 8,
+                                      runSpacing: 4,
+                                      crossAxisAlignment: WrapCrossAlignment.center,
+                                      children: [
+                                        Text('Stock: $stock', style: const TextStyle(fontSize: 12)),
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                                          decoration: BoxDecoration(color: status['bg'], borderRadius: BorderRadius.circular(10)),
+                                          child: Text(status['label'],
+                                              style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, letterSpacing: 0.3, color: status['fg'])),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Column(
+                                crossAxisAlignment: CrossAxisAlignment.end,
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text('₱${item['price']}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                                  const SizedBox(height: 6),
+                                  Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      InkWell(
+                                        onTap: () {
+                                          Navigator.push(
+                                            context,
+                                            MaterialPageRoute(builder: (context) => SpoilageTrackerPage(initialProductId: item['id'])),
+                                          );
+                                        },
+                                        child: const Padding(
+                                          padding: EdgeInsets.all(4),
+                                          child: Icon(Icons.delete_sweep_rounded, color: Colors.orangeAccent, size: 18),
+                                        ),
+                                      ),
+                                      if (isAdmin)
+                                        InkWell(
+                                          onTap: () => _showArchiveConfirmDialog(context, item),
+                                          child: const Padding(
+                                            padding: EdgeInsets.all(4),
+                                            child: Icon(Icons.archive_outlined, color: Colors.redAccent, size: 18),
+                                          ),
+                                        ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
                         ),
-                      Text('₱${item['price']}',
-                          style: const TextStyle(fontWeight: FontWeight.bold)),
-                    ],
-                  ),
-                  onTap: () => _showItemDialog(item),
-                  onLongPress: !isAdmin
-                      ? null
-                      : () => _showArchiveConfirmDialog(context, item),
-                ),
-              );
-            },
-          );
-        },
+                      ),
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+        ],
       ),
       floatingActionButton: isAdmin
           ? FloatingActionButton(
-              onPressed: () => _showItemDialog(),
-              backgroundColor: const Color(0xFFF59E0B),
-              child: const Icon(Icons.add, color: Colors.white),
-            )
+        onPressed: () => _showItemDialog(),
+        backgroundColor: const Color(0xFFF59E0B),
+        child: const Icon(Icons.add, color: Colors.white),
+      )
           : null,
     );
   }

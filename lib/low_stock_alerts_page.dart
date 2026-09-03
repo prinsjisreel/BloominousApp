@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:google_generative_ai/google_generative_ai.dart';
 import 'inventory_data.dart';
+import 'app_sidebar.dart';
 
 class LowStockAlertsPage extends StatefulWidget {
-  const LowStockAlertsPage({super.key});
+  final String role;
+  const LowStockAlertsPage({super.key, this.role = 'employee'});
 
   @override
   State<LowStockAlertsPage> createState() => _LowStockAlertsPageState();
@@ -69,6 +71,7 @@ class _LowStockAlertsPageState extends State<LowStockAlertsPage> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
+    final isDesktop = MediaQuery.of(context).size.width >= 850;
 
     return Scaffold(
       appBar: AppBar(
@@ -79,21 +82,29 @@ class _LowStockAlertsPageState extends State<LowStockAlertsPage> {
         backgroundColor: isDark ? Colors.black : Colors.white,
         elevation: 0,
       ),
-      body: StreamBuilder<List<Map<String, dynamic>>>(
-        stream: InventoryData.lowStockStream(),
-        builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
-          }
+      // NEW: sidebar drawer on mobile — same pattern as every other
+      // portal page. Setting `drawer` makes Scaffold auto-draw the
+      // hamburger icon in the existing AppBar above.
+      drawer: isDesktop ? null : Drawer(child: AppSidebar(role: widget.role, currentPage: 'alerts')),
+      body: Row(
+        children: [
+          if (isDesktop) AppSidebar(role: widget.role, currentPage: 'alerts'),
+          Expanded(
+            child: StreamBuilder<List<Map<String, dynamic>>>(
+              stream: InventoryData.lowStockStream(),
+              builder: (context, snapshot) {
+                if (snapshot.connectionState == ConnectionState.waiting) {
+                  return const Center(child: CircularProgressIndicator());
+                }
 
-          final items = snapshot.data ?? [];
+                final items = snapshot.data ?? [];
 
-          return Column(
-            children: [
-              Expanded(
-                child: items.isEmpty
-                    ? _buildEmptyState(isDark)
-                    : ListView.builder(
+                return Column(
+                  children: [
+                    Expanded(
+                      child: items.isEmpty
+                          ? _buildEmptyState(isDark)
+                          : ListView.builder(
                         padding: const EdgeInsets.all(20),
                         itemCount: items.length,
                         itemBuilder: (context, index) {
@@ -101,11 +112,14 @@ class _LowStockAlertsPageState extends State<LowStockAlertsPage> {
                           return _buildLowStockCard(item, isDark);
                         },
                       ),
-              ),
-              if (items.isNotEmpty) _buildAISuggestionSection(items, isDark),
-            ],
-          );
-        },
+                    ),
+                    if (items.isNotEmpty) _buildAISuggestionSection(items, isDark),
+                  ],
+                );
+              },
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -157,26 +171,36 @@ class _LowStockAlertsPageState extends State<LowStockAlertsPage> {
             ),
           ),
           const SizedBox(width: 16),
+          // FIXED: name and stock line now guard against overflow with
+          // ellipsis/maxLines, so a long product name can't push the
+          // Restock button off the card's edge on a narrow phone.
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
               children: [
                 Text(item['name'],
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
                         fontWeight: FontWeight.bold, fontSize: 16)),
                 const SizedBox(height: 4),
                 Text('Current Stock: ${item['stock']}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
                         color: Colors.red, fontWeight: FontWeight.bold)),
               ],
             ),
           ),
+          const SizedBox(width: 8),
           ElevatedButton(
             onPressed: () {},
             style: ElevatedButton.styleFrom(
               backgroundColor: Colors.pink.shade50,
               foregroundColor: Colors.pink,
               elevation: 0,
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
               shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(12)),
             ),
@@ -209,13 +233,20 @@ class _LowStockAlertsPageState extends State<LowStockAlertsPage> {
             children: [
               const Icon(Icons.auto_awesome, color: Colors.purple),
               const SizedBox(width: 12),
-              Text(
-                'SMART RESTOCKING',
-                style: TextStyle(
-                    fontWeight: FontWeight.w900,
-                    color: Colors.purple,
-                    fontSize: 12,
-                    letterSpacing: 1),
+              // FIXED: wrapped in Expanded — "SMART RESTOCKING" is short
+              // enough to rarely be an issue, but any future label change
+              // (or a device with enlarged system font size) now wraps
+              // safely instead of risking overflow next to the icon.
+              Expanded(
+                child: Text(
+                  'SMART RESTOCKING',
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                      fontWeight: FontWeight.w900,
+                      color: Colors.purple,
+                      fontSize: 12,
+                      letterSpacing: 1),
+                ),
               ),
             ],
           ),
@@ -248,12 +279,18 @@ class _LowStockAlertsPageState extends State<LowStockAlertsPage> {
             ),
             child: _isAnalyzing
                 ? const SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(
-                        color: Colors.white, strokeWidth: 2))
-                : const Text('Get AI Restock Suggestions',
-                    style: TextStyle(fontWeight: FontWeight.bold)),
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(
+                    color: Colors.white, strokeWidth: 2))
+            // FittedBox guard on the label, same pattern as the Save
+            // Thresholds button fix from earlier — never overflows
+            // its own button on a squeezed layout.
+                : const FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Text('Get AI Restock Suggestions',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+            ),
           ),
         ],
       ),

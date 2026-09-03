@@ -43,7 +43,6 @@ class _AuthPageState extends State<AuthPage> {
   bool _obscurePassword = true;
   bool _isSigningUp = false;
 
-  // --- COUNTDOWN STATE ---
   int _remainingLockoutSeconds = 0;
   bool _superAdminLocked = false;
   Timer? _lockoutTimer;
@@ -53,7 +52,6 @@ class _AuthPageState extends State<AuthPage> {
   final RegistrationRiskService _registrationRiskService = RegistrationRiskService();
   final EmailVerificationService _emailVerificationService = EmailVerificationService();
 
-  // Core Brand Color
   final Color _primaryGold = const Color(0xFFF39C12);
 
   @override
@@ -69,7 +67,6 @@ class _AuthPageState extends State<AuthPage> {
     super.dispose();
   }
 
-  // --- FRAUD & RATE LIMITING HELPERS ---
   Future<bool> _isRateLimited() async {
     final rateLimit = await _securityService.checkRateLimit();
     if (rateLimit['locked'] == true) {
@@ -147,9 +144,6 @@ class _AuthPageState extends State<AuthPage> {
           final userData = existingDoc.data() as Map<String, dynamic>;
           final oldDocId = existingDoc.id;
 
-          // 'password' stripped before writing — firestore.rules blocks
-          // any client create/update on `customers` that includes a
-          // 'password' key at all, regardless of its value.
           final sanitizedUserData = Map<String, dynamic>.from(userData)..remove('password');
 
           await _firestore.collection('customers').doc(user.uid).set({
@@ -179,12 +173,6 @@ class _AuthPageState extends State<AuthPage> {
     }
   }
 
-  /// Registration entry point — now matches web's register.php shape
-  /// exactly: validate fields, check for an existing account, then go
-  /// straight to _registerNewUser(). No pre-account OTP step; the real
-  /// email-ownership proof happens AFTER account creation via Firebase's
-  /// own verification link (see _registerNewUser() and
-  /// EmailVerificationPendingPage), same as web.
   Future<void> _handleContinue() async {
     final email = _emailController.text.trim().toLowerCase();
     if (email.isEmpty || !email.contains('@')) {
@@ -246,8 +234,6 @@ class _AuthPageState extends State<AuthPage> {
           ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Email already exists. Please sign in.')));
           return;
         }
-        // Straight to account creation — matches web's register.php,
-        // which never has a pre-account verification-code step either.
         await _registerNewUser();
       }
     } catch (e) {
@@ -438,10 +424,6 @@ class _AuthPageState extends State<AuthPage> {
     }
   }
 
-  /// Creates the account directly — matches register.php's real shape:
-  /// checks pass → createUserWithEmailAndPassword → write customer doc →
-  /// send verification link → show "check your inbox" page. No OTP
-  /// anywhere in this sequence, same as web.
   Future<void> _registerNewUser() async {
     final email = _emailController.text.trim().toLowerCase();
     final password = _passwordController.text.trim();
@@ -543,256 +525,273 @@ class _AuthPageState extends State<AuthPage> {
     final borderColor = isDark ? const Color(0xFF3F382F) : const Color(0xFFE0E0E0);
     final inputFillColor = isDark ? const Color(0xFF221D17) : Colors.white;
 
+    // NEW: card padding now scales with the actual screen width instead
+    // of a hardcoded 40px, so a narrow phone doesn't lose as much usable
+    // width to padding as a wide one. Same idea as the responsive
+    // dropdown grids from earlier in this project — read the real
+    // available space, then decide, instead of assuming one fixed number
+    // works everywhere.
+    final screenWidth = MediaQuery.of(context).size.width;
+    final horizontalCardPadding = screenWidth < 400 ? 20.0 : 40.0;
+
     return Scaffold(
       backgroundColor: bgColor,
-      body: Center(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 40.0),
-          child: Container(
-            constraints: const BoxConstraints(maxWidth: 450),
-            padding: const EdgeInsets.symmetric(horizontal: 40.0, vertical: 56.0),
-            decoration: BoxDecoration(
-              color: cardColor,
-              borderRadius: BorderRadius.circular(24),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withOpacity(isDark ? 0.4 : 0.04),
-                  blurRadius: 40,
-                  offset: const Offset(0, 10),
-                ),
-              ],
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                // --- BLOOM LOGO TEXT ---
-                Text(
-                  'B L O O M',
-                  textAlign: TextAlign.center,
-                  style: GoogleFonts.cormorantGaramond(
-                    fontSize: 32,
-                    fontWeight: FontWeight.bold,
-                    color: _primaryGold,
-                    letterSpacing: 4.0,
+      body: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 40.0),
+            child: Container(
+              constraints: const BoxConstraints(maxWidth: 450),
+              padding: EdgeInsets.symmetric(horizontal: horizontalCardPadding, vertical: 56.0),
+              decoration: BoxDecoration(
+                color: cardColor,
+                borderRadius: BorderRadius.circular(24),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(isDark ? 0.4 : 0.04),
+                    blurRadius: 40,
+                    offset: const Offset(0, 10),
                   ),
-                ),
-                const SizedBox(height: 24),
-
-                // --- HEADINGS ---
-                Text(
-                  _isSigningUp ? 'Create an Account' : 'Authenticated Access',
-                  textAlign: TextAlign.center,
-                  style: GoogleFonts.cormorantGaramond(
-                    fontSize: 34,
-                    color: textColor,
-                    fontWeight: FontWeight.w600,
-                    height: 1.1,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  _isSigningUp ? 'CUSTOMER REGISTRATION' : 'MANAGEMENT CONSOLE LOGIN',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    fontSize: 11,
-                    color: subTextColor,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 1.8,
-                  ),
-                ),
-                const SizedBox(height: 48),
-
-                // --- LOCKOUT WARNING UI ---
-                if (_superAdminLocked || _remainingLockoutSeconds > 0)
-                  Container(
-                    padding: const EdgeInsets.all(12),
-                    margin: const EdgeInsets.only(bottom: 24),
-                    decoration: BoxDecoration(
-                      color: Colors.red.withOpacity(isDark ? 0.15 : 0.05),
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: Colors.red.withOpacity(0.3)),
+                ],
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    'B L O O M',
+                    textAlign: TextAlign.center,
+                    style: GoogleFonts.cormorantGaramond(
+                      fontSize: 32,
+                      fontWeight: FontWeight.bold,
+                      color: _primaryGold,
+                      letterSpacing: 4.0,
                     ),
-                    child: Row(
-                      children: [
-                        const Icon(Icons.lock_clock, color: Colors.redAccent, size: 20),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Text(
-                            _superAdminLocked
-                                ? 'Account locked. Please coordinate with a Super Admin.'
-                                : 'Too many attempts. Please wait $_remainingLockoutSeconds seconds.',
-                            style: const TextStyle(color: Colors.redAccent, fontSize: 13, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 24),
+
+                  Text(
+                    _isSigningUp ? 'Create an Account' : 'Authenticated Access',
+                    textAlign: TextAlign.center,
+                    style: GoogleFonts.cormorantGaramond(
+                      fontSize: 34,
+                      color: textColor,
+                      fontWeight: FontWeight.w600,
+                      height: 1.1,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    _isSigningUp ? 'CUSTOMER REGISTRATION' : 'MANAGEMENT CONSOLE LOGIN',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: subTextColor,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 1.8,
+                    ),
+                  ),
+                  const SizedBox(height: 48),
+
+                  if (_superAdminLocked || _remainingLockoutSeconds > 0)
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      margin: const EdgeInsets.only(bottom: 24),
+                      decoration: BoxDecoration(
+                        color: Colors.red.withOpacity(isDark ? 0.15 : 0.05),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: Colors.red.withOpacity(0.3)),
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.lock_clock, color: Colors.redAccent, size: 20),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              _superAdminLocked
+                                  ? 'Account locked. Please coordinate with a Super Admin.'
+                                  : 'Too many attempts. Please wait $_remainingLockoutSeconds seconds.',
+                              style: const TextStyle(color: Colors.redAccent, fontSize: 13, fontWeight: FontWeight.bold),
+                            ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
-                  ),
 
-                // --- FORM FIELDS ---
-                if (_isSigningUp) ...[
-                  _buildTextField(
-                    controller: _firstNameController,
-                    hint: 'First Name',
-                    textColor: textColor,
-                    subTextColor: subTextColor,
-                    borderColor: borderColor,
-                    fillColor: inputFillColor,
-                  ),
-                  _buildTextField(
-                    controller: _middleNameController,
-                    hint: 'Middle Name',
-                    textColor: textColor,
-                    subTextColor: subTextColor,
-                    borderColor: borderColor,
-                    fillColor: inputFillColor,
-                  ),
-                  _buildTextField(
-                    controller: _lastNameController,
-                    hint: 'Last Name',
-                    textColor: textColor,
-                    subTextColor: subTextColor,
-                    borderColor: borderColor,
-                    fillColor: inputFillColor,
-                  ),
+                  if (_isSigningUp) ...[
+                    _buildTextField(
+                      controller: _firstNameController,
+                      hint: 'First Name',
+                      textColor: textColor,
+                      subTextColor: subTextColor,
+                      borderColor: borderColor,
+                      fillColor: inputFillColor,
+                    ),
+                    _buildTextField(
+                      controller: _middleNameController,
+                      hint: 'Middle Name',
+                      textColor: textColor,
+                      subTextColor: subTextColor,
+                      borderColor: borderColor,
+                      fillColor: inputFillColor,
+                    ),
+                    _buildTextField(
+                      controller: _lastNameController,
+                      hint: 'Last Name',
+                      textColor: textColor,
+                      subTextColor: subTextColor,
+                      borderColor: borderColor,
+                      fillColor: inputFillColor,
+                    ),
 
-                  // Birthday Picker
-                  GestureDetector(
-                    onTap: () async {
-                      final date = await showDatePicker(
-                        context: context,
-                        initialDate: DateTime(2000),
-                        firstDate: DateTime(1950),
-                        lastDate: DateTime.now(),
-                      );
-                      if (date != null) setState(() => _selectedBirthday = date);
-                    },
-                    child: Container(
+                    GestureDetector(
+                      onTap: () async {
+                        final date = await showDatePicker(
+                          context: context,
+                          initialDate: DateTime(2000),
+                          firstDate: DateTime(1950),
+                          lastDate: DateTime.now(),
+                        );
+                        if (date != null) setState(() => _selectedBirthday = date);
+                      },
+                      child: Container(
+                        margin: const EdgeInsets.only(bottom: 16),
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 18),
+                        decoration: BoxDecoration(
+                          color: inputFillColor,
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: borderColor, width: 1),
+                        ),
+                        child: Text(
+                          _selectedBirthday == null ? 'Select Birthday' : 'Birthday: ${_selectedBirthday!.toIso8601String().split('T')[0]}',
+                          style: TextStyle(color: _selectedBirthday == null ? subTextColor : textColor, fontSize: 15),
+                        ),
+                      ),
+                    ),
+
+                    Container(
                       margin: const EdgeInsets.only(bottom: 16),
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 18),
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
                       decoration: BoxDecoration(
                         color: inputFillColor,
                         borderRadius: BorderRadius.circular(12),
                         border: Border.all(color: borderColor, width: 1),
                       ),
-                      child: Text(
-                        _selectedBirthday == null ? 'Select Birthday' : 'Birthday: ${_selectedBirthday!.toIso8601String().split('T')[0]}',
-                        style: TextStyle(color: _selectedBirthday == null ? subTextColor : textColor, fontSize: 15),
+                      child: DropdownButtonHideUnderline(
+                        child: DropdownButton<String>(
+                          value: _selectedSex,
+                          isExpanded: true,
+                          dropdownColor: cardColor,
+                          icon: Icon(Icons.arrow_drop_down, color: subTextColor),
+                          style: TextStyle(color: textColor, fontSize: 15),
+                          items: const [
+                            DropdownMenuItem(value: 'Male', child: Text('Male')),
+                            DropdownMenuItem(value: 'Female', child: Text('Female')),
+                          ],
+                          onChanged: (val) => setState(() => _selectedSex = val!),
+                        ),
                       ),
                     ),
-                  ),
+                  ],
 
-                  // Sex Dropdown
-                  Container(
-                    margin: const EdgeInsets.only(bottom: 16),
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                    decoration: BoxDecoration(
-                      color: inputFillColor,
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: borderColor, width: 1),
-                    ),
-                    child: DropdownButtonHideUnderline(
-                      child: DropdownButton<String>(
-                        value: _selectedSex,
-                        isExpanded: true,
-                        dropdownColor: cardColor,
-                        icon: Icon(Icons.arrow_drop_down, color: subTextColor),
-                        style: TextStyle(color: textColor, fontSize: 15),
-                        items: const [
-                          DropdownMenuItem(value: 'Male', child: Text('Male')),
-                          DropdownMenuItem(value: 'Female', child: Text('Female')),
-                        ],
-                        onChanged: (val) => setState(() => _selectedSex = val!),
-                      ),
-                    ),
-                  ),
-                ],
-
-                _buildTextField(
-                  controller: _emailController,
-                  hint: 'Email Address',
-                  keyboardType: TextInputType.emailAddress,
-                  textColor: textColor,
-                  subTextColor: subTextColor,
-                  borderColor: borderColor,
-                  fillColor: inputFillColor,
-                ),
-
-                _buildTextField(
-                  controller: _passwordController,
-                  hint: 'Password',
-                  isPassword: true,
-                  obscureText: _obscurePassword,
-                  onToggleVisibility: () => setState(() => _obscurePassword = !_obscurePassword),
-                  textColor: textColor,
-                  subTextColor: subTextColor,
-                  borderColor: borderColor,
-                  fillColor: inputFillColor,
-                ),
-
-                if (_isSigningUp)
                   _buildTextField(
-                    controller: _confirmPasswordController,
-                    hint: 'Confirm Password',
-                    isPassword: true,
-                    obscureText: _obscurePassword,
+                    controller: _emailController,
+                    hint: 'Email Address',
+                    keyboardType: TextInputType.emailAddress,
                     textColor: textColor,
                     subTextColor: subTextColor,
                     borderColor: borderColor,
                     fillColor: inputFillColor,
                   ),
 
-                if (!_isSigningUp)
-                  Align(
-                    alignment: Alignment.centerRight,
-                    child: TextButton(
-                      onPressed: _forgotPassword,
-                      style: TextButton.styleFrom(
-                        padding: EdgeInsets.zero,
-                        minimumSize: const Size(50, 30),
-                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                      ),
-                      child: Text(
-                        'Forgot Password?',
-                        style: TextStyle(color: subTextColor, fontSize: 13, fontWeight: FontWeight.bold),
-                      ),
-                    ),
+                  _buildTextField(
+                    controller: _passwordController,
+                    hint: 'Password',
+                    isPassword: true,
+                    obscureText: _obscurePassword,
+                    onToggleVisibility: () => setState(() => _obscurePassword = !_obscurePassword),
+                    textColor: textColor,
+                    subTextColor: subTextColor,
+                    borderColor: borderColor,
+                    fillColor: inputFillColor,
                   ),
 
-                const SizedBox(height: 32),
-
-                _buildPrimaryButton(
-                  onPressed: (_isLoading || _superAdminLocked || _remainingLockoutSeconds > 0)
-                      ? null
-                      : (_isSigningUp ? _handleContinue : _loginWithPassword),
-                  text: _isSigningUp ? 'REGISTER' : 'LOGIN',
-                  isLoading: _isLoading,
-                ),
-
-                const SizedBox(height: 32),
-
-                // Toggle Register/Login
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Text(
-                      _isSigningUp ? "Already have an account?  " : "Don't have an account?  ",
-                      style: TextStyle(color: subTextColor, fontSize: 13, fontWeight: FontWeight.bold),
+                  if (_isSigningUp)
+                    _buildTextField(
+                      controller: _confirmPasswordController,
+                      hint: 'Confirm Password',
+                      isPassword: true,
+                      obscureText: _obscurePassword,
+                      textColor: textColor,
+                      subTextColor: subTextColor,
+                      borderColor: borderColor,
+                      fillColor: inputFillColor,
                     ),
-                    GestureDetector(
-                      onTap: () => setState(() {
-                        _isSigningUp = !_isSigningUp;
-                        _emailController.clear();
-                        _passwordController.clear();
-                      }),
-                      child: Text(
-                        _isSigningUp ? 'LOGIN HERE' : 'REGISTER HERE',
-                        style: TextStyle(color: textColor, fontSize: 13, fontWeight: FontWeight.bold),
+
+                  if (!_isSigningUp)
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: TextButton(
+                        onPressed: _forgotPassword,
+                        style: TextButton.styleFrom(
+                          padding: EdgeInsets.zero,
+                          minimumSize: const Size(50, 30),
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        ),
+                        child: Text(
+                          'Forgot Password?',
+                          style: TextStyle(color: subTextColor, fontSize: 13, fontWeight: FontWeight.bold),
+                        ),
                       ),
                     ),
-                  ],
-                ),
-              ],
+
+                  const SizedBox(height: 32),
+
+                  _buildPrimaryButton(
+                    onPressed: (_isLoading || _superAdminLocked || _remainingLockoutSeconds > 0)
+                        ? null
+                        : (_isSigningUp ? _handleContinue : _loginWithPassword),
+                    text: _isSigningUp ? 'REGISTER' : 'LOGIN',
+                    isLoading: _isLoading,
+                  ),
+
+                  const SizedBox(height: 32),
+
+                  // FIXED: previously a Row with mainAxisAlignment.center
+                  // and two full-width, un-wrapped Text widgets. On a
+                  // narrower device, "Don't have an account?  REGISTER
+                  // HERE" together didn't fit on one line, and neither
+                  // Text was allowed to shrink or wrap — that's exactly
+                  // the hazard-stripe overflow you saw. Wrap lays its
+                  // children left-to-right just like a Row, but the
+                  // moment a child doesn't fit on the current line, it
+                  // simply drops to a new line instead of demanding space
+                  // that isn't there. textAlign.center on each Text keeps
+                  // it looking centered even if it does wrap to two lines
+                  // on very narrow screens.
+                  Wrap(
+                    alignment: WrapAlignment.center,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      Text(
+                        _isSigningUp ? "Already have an account?  " : "Don't have an account?  ",
+                        style: TextStyle(color: subTextColor, fontSize: 13, fontWeight: FontWeight.bold),
+                      ),
+                      GestureDetector(
+                        onTap: () => setState(() {
+                          _isSigningUp = !_isSigningUp;
+                          _emailController.clear();
+                          _passwordController.clear();
+                        }),
+                        child: Text(
+                          _isSigningUp ? 'LOGIN HERE' : 'REGISTER HERE',
+                          style: TextStyle(color: textColor, fontSize: 13, fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
             ),
           ),
         ),
