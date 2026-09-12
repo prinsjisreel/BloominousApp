@@ -4,6 +4,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'inventory_data.dart';
 import 'app_sidebar.dart';
+import 'notification_bell.dart';
 
 class AdminDashboard extends StatefulWidget {
   final String role;
@@ -55,6 +56,36 @@ class _AdminDashboardState extends State<AdminDashboard> {
         }
       }
     }
+  }
+
+  bool _countsAsCompletedSale(Map<String, dynamic> o) {
+    String status = (o['status'] ?? '').toString();
+    if (status.isEmpty) {
+      final items = o['items'] as List?;
+      if (items != null && items.isNotEmpty && items[0] is Map) {
+        status = (items[0]['status'] ?? '').toString();
+      }
+    }
+    status = status.toLowerCase();
+    final delStatus = (o['delivery_status'] ?? '').toString().toLowerCase();
+    return status == 'completed' || status == 'delivered' || delStatus == 'delivered';
+  }
+
+  Map<String, int> _aggregateSales(List<Map<String, dynamic>> orders) {
+    final Map<String, int> salesMap = {};
+    for (final order in orders) {
+      if (!_countsAsCompletedSale(order)) continue;
+      final items = order['items'] as List?;
+      if (items == null) continue;
+      for (final item in items) {
+        if (item is! Map) continue;
+        final key = (item['id'] ?? item['name'] ?? 'Unknown').toString();
+        final qty = (item['qty'] ?? item['quantity'] ?? 0);
+        final parsedQty = qty is num ? qty.toInt() : 0;
+        salesMap[key] = (salesMap[key] ?? 0) + parsedQty;
+      }
+    }
+    return salesMap;
   }
 
   String _getFormattedDate() {
@@ -212,13 +243,35 @@ class _AdminDashboardState extends State<AdminDashboard> {
                         ),
                         const SizedBox(height: 16),
 
-                        Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            _buildPerformanceCard('Top 5 - Best Sellers', cardColor, borderColor, textColor, subTextColor, isDark),
-                            const SizedBox(height: 12),
-                            _buildPerformanceCard('Bottom 5 - Low Performers', cardColor, borderColor, textColor, subTextColor, isDark),
-                          ],
+                        StreamBuilder<List<Map<String, dynamic>>>(
+                          stream: InventoryData.ordersStream(),
+                          builder: (context, snapshot) {
+                            if (snapshot.connectionState == ConnectionState.waiting) {
+                              return Column(
+                                children: [
+                                  _buildPerformanceCard('Top 5 - Best Sellers', null, true, cardColor, borderColor, textColor, subTextColor, isDark),
+                                  const SizedBox(height: 12),
+                                  _buildPerformanceCard('Bottom 5 - Low Performers', null, true, cardColor, borderColor, textColor, subTextColor, isDark),
+                                ],
+                              );
+                            }
+
+                            final orders = snapshot.data ?? [];
+                            final salesMap = _aggregateSales(orders);
+                            final entries = salesMap.entries.toList();
+
+                            final bestSellers = [...entries]..sort((a, b) => b.value.compareTo(a.value));
+                            final lowPerformers = [...entries]..sort((a, b) => a.value.compareTo(b.value));
+
+                            return Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                _buildPerformanceCard('Top 5 - Best Sellers', bestSellers.take(5).toList(), false, cardColor, borderColor, textColor, subTextColor, isDark, barColor: const Color(0xFF2ECC71)),
+                                const SizedBox(height: 12),
+                                _buildPerformanceCard('Bottom 5 - Low Performers', lowPerformers.take(5).toList(), false, cardColor, borderColor, textColor, subTextColor, isDark, barColor: const Color(0xFFE91E63)),
+                              ],
+                            );
+                          },
                         ),
                       ],
                     ),
@@ -244,7 +297,6 @@ class _AdminDashboardState extends State<AdminDashboard> {
     );
   }
 
-  // --- Top Navigation Bar (dropdown crash-guarded + live profile data) ---
   Widget _buildTopBar(Color cardColor, Color textColor, Color subTextColor, Color borderColor, bool isDark, bool isSuperAdmin, User? user, String role, bool isAdmin) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -267,10 +319,6 @@ class _AdminDashboardState extends State<AdminDashboard> {
               builder: (context, snapshot) {
                 final branches = snapshot.data ?? [];
 
-                // Guard: DropdownButton crashes if `value` isn't found in
-                // `items`. _selectedBranchId can already hold a remembered
-                // branch ID before this stream has finished its first
-                // load — during that gap, `branches` is still empty.
                 final bool selectedExists =
                     _selectedBranchId != null &&
                         branches.any((b) => b['id'] == _selectedBranchId);
@@ -318,13 +366,11 @@ class _AdminDashboardState extends State<AdminDashboard> {
           ),
 
           const SizedBox(width: 12),
-          Icon(Icons.notifications_none_rounded, color: subTextColor, size: 20),
+          NotificationBell(iconColor: subTextColor),
           const SizedBox(width: 12),
           Container(height: 20, width: 1, color: borderColor),
           const SizedBox(width: 12),
 
-          // Live-listens to users/{uid} so name + photo here always
-          // matches whatever was last saved from ProfilePage.
           StreamBuilder<DocumentSnapshot>(
             stream: user != null
                 ? FirebaseFirestore.instance.collection('users').doc(user.uid).snapshots()
@@ -388,7 +434,6 @@ class _AdminDashboardState extends State<AdminDashboard> {
     );
   }
 
-  // --- Minimalist Stat Cards (overflow-proofed via LayoutBuilder+FittedBox) ---
   Widget _buildMinimalStatCardStream({
     required String title,
     required IconData icon,
@@ -461,14 +506,27 @@ class _AdminDashboardState extends State<AdminDashboard> {
     );
   }
 
-  // --- Top 5 / Bottom 5 Performance Cards (title overflow-guarded) ---
-  Widget _buildPerformanceCard(String title, Color cardColor, Color borderColor, Color textColor, Color subTextColor, bool isDark) {
+  Widget _buildPerformanceCard(
+      String title,
+      List<MapEntry<String, int>>? items,
+      bool isLoading,
+      Color cardColor,
+      Color borderColor,
+      Color textColor,
+      Color subTextColor,
+      bool isDark, {
+        Color barColor = const Color(0xFFF59E0B),
+      }) {
+    final int maxQty = (items != null && items.isNotEmpty)
+        ? items.map((e) => e.value).reduce((a, b) => a > b ? a : b)
+        : 1;
+
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
       decoration: BoxDecoration(
         color: cardColor,
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(20),
         border: Border.all(color: borderColor, width: 1.5),
         boxShadow: [
           if (!isDark)
@@ -479,41 +537,68 @@ class _AdminDashboardState extends State<AdminDashboard> {
             ),
         ],
       ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Expanded(
-            child: Text(
-              title,
-              style: GoogleFonts.cormorantGaramond(
-                fontSize: 18,
-                fontWeight: FontWeight.w600,
-                color: textColor,
-              ),
-              overflow: TextOverflow.ellipsis,
-              maxLines: 2,
+          Text(
+            title,
+            style: GoogleFonts.cormorantGaramond(
+              fontSize: 18,
+              fontWeight: FontWeight.w600,
+              color: textColor,
             ),
           ),
-          const SizedBox(width: 8),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-            decoration: BoxDecoration(
-              color: Colors.grey.withValues(alpha: 0.1),
-              borderRadius: BorderRadius.circular(20),
-              border: Border.all(
-                color: Colors.grey.withValues(alpha: 0.2),
-                width: 1,
-              ),
-            ),
-            child: Text(
-              'No Data',
-              style: TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
-                color: subTextColor,
-              ),
-            ),
-          ),
+          const SizedBox(height: 16),
+          if (isLoading)
+            const Center(child: Padding(padding: EdgeInsets.symmetric(vertical: 12), child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))))
+          else if (items == null || items.isEmpty)
+            Text('No sales data available yet.', style: TextStyle(fontSize: 12, color: subTextColor, fontStyle: FontStyle.italic))
+          else
+            ...items.map((entry) {
+              final percentage = maxQty == 0 ? 0.0 : entry.value / maxQty;
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 14),
+                child: Row(
+                  children: [
+                    SizedBox(
+                      width: 100,
+                      child: Text(
+                        entry.key,
+                        style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: subTextColor, letterSpacing: 0.2),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Container(
+                        height: 8,
+                        decoration: BoxDecoration(
+                          color: isDark ? const Color(0xFF222222) : const Color(0xFFF8F9FB),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: FractionallySizedBox(
+                          alignment: Alignment.centerLeft,
+                          widthFactor: percentage.clamp(0.0, 1.0),
+                          child: Container(
+                            decoration: BoxDecoration(color: barColor, borderRadius: BorderRadius.circular(8)),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    SizedBox(
+                      width: 30,
+                      child: Text(
+                        '${entry.value}',
+                        textAlign: TextAlign.right,
+                        style: TextStyle(fontSize: 11, fontWeight: FontWeight.w800, color: textColor),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }),
         ],
       ),
     );

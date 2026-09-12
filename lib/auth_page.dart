@@ -501,6 +501,7 @@ class _AuthPageState extends State<AuthPage> {
         await _registrationRiskService.recordScore(riskResult.scoreBump);
       }
 
+      // Triggers the Hostinger custom PHPMailer script over HTTP POST
       await _emailVerificationService.sendVerificationEmail();
 
       if (mounted) {
@@ -525,12 +526,6 @@ class _AuthPageState extends State<AuthPage> {
     final borderColor = isDark ? const Color(0xFF3F382F) : const Color(0xFFE0E0E0);
     final inputFillColor = isDark ? const Color(0xFF221D17) : Colors.white;
 
-    // NEW: card padding now scales with the actual screen width instead
-    // of a hardcoded 40px, so a narrow phone doesn't lose as much usable
-    // width to padding as a wide one. Same idea as the responsive
-    // dropdown grids from earlier in this project — read the real
-    // available space, then decide, instead of assuming one fixed number
-    // works everywhere.
     final screenWidth = MediaQuery.of(context).size.width;
     final horizontalCardPadding = screenWidth < 400 ? 20.0 : 40.0;
 
@@ -757,18 +752,6 @@ class _AuthPageState extends State<AuthPage> {
 
                   const SizedBox(height: 32),
 
-                  // FIXED: previously a Row with mainAxisAlignment.center
-                  // and two full-width, un-wrapped Text widgets. On a
-                  // narrower device, "Don't have an account?  REGISTER
-                  // HERE" together didn't fit on one line, and neither
-                  // Text was allowed to shrink or wrap — that's exactly
-                  // the hazard-stripe overflow you saw. Wrap lays its
-                  // children left-to-right just like a Row, but the
-                  // moment a child doesn't fit on the current line, it
-                  // simply drops to a new line instead of demanding space
-                  // that isn't there. textAlign.center on each Text keeps
-                  // it looking centered even if it does wrap to two lines
-                  // on very narrow screens.
                   Wrap(
                     alignment: WrapAlignment.center,
                     crossAxisAlignment: WrapCrossAlignment.center,

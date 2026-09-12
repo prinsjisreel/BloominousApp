@@ -43,6 +43,54 @@ class InventoryData {
     return _db.collection('product_ratings');
   }
 
+  static CollectionReference _notificationsCollection() {
+    return _db.collection('notifications');
+  }
+
+  static String _shortId(String id) => '#${(id.length > 8 ? id.substring(0, 8) : id).toUpperCase()}';
+
+  // --- Notification plumbing ---
+  static Future<void> createNotification({
+    required String title,
+    required String message,
+    String type = 'info',
+    String? branchId,
+  }) async {
+    await _notificationsCollection().add({
+      'title': title,
+      'message': message,
+      'type': type,
+      'branchId': branchId ?? selectedBranchId ?? 'main_branch',
+      'created_at': FieldValue.serverTimestamp(),
+      'read': false,
+    });
+  }
+
+  static Stream<List<Map<String, dynamic>>> notificationsStream({String? branchId}) {
+    final bid = branchId ?? selectedBranchId;
+    return _notificationsCollection()
+        .orderBy('created_at', descending: true)
+        .limit(50)
+        .snapshots()
+        .map((snap) {
+      final docs = snap.docs.map((d) => {...d.data() as Map<String, dynamic>, 'id': d.id}).toList();
+      if (bid == null || bid == 'all') return docs;
+      return docs.where((n) => n['branchId'] == bid || n['branchId'] == null).toList();
+    });
+  }
+
+  static Future<void> markNotificationRead(String id) async {
+    await _notificationsCollection().doc(id).update({'read': true});
+  }
+
+  static Future<void> markAllNotificationsRead(List<String> ids) async {
+    final batch = _db.batch();
+    for (final id in ids) {
+      batch.update(_notificationsCollection().doc(id), {'read': true});
+    }
+    await batch.commit();
+  }
+
   static Stream<List<Map<String, dynamic>>> inventoryStream(
       {String? branchId, String? category}) {
     final bid = branchId ?? (selectedBranchId ?? 'main_branch');
@@ -397,8 +445,19 @@ class InventoryData {
     return docRef.id;
   }
 
+  // Every caller of this shared method (order status updates from the
+  // admin/staff side) gets a branch-scoped notification automatically.
   static Future<void> updateOrderStatus(String orderId, String status) async {
     await _ordersCollection().doc(orderId).update({'status': status});
+
+    final orderSnap = await _ordersCollection().doc(orderId).get();
+    final branchIdForNotif = (orderSnap.data() as Map<String, dynamic>?)?['branchId'];
+    await createNotification(
+      title: status.toLowerCase() == 'cancelled' ? 'Order Cancelled' : 'Order Status Updated',
+      message: '${_shortId(orderId)} is now "$status".',
+      type: status.toLowerCase() == 'cancelled' ? 'warning' : 'info',
+      branchId: branchIdForNotif,
+    );
   }
 
   static Future<void> updateDeliveryStatus(
@@ -454,6 +513,18 @@ class InventoryData {
     }
 
     await _ordersCollection().doc(orderId).update(updateData);
+
+    // Notifies the assigned branch whenever a delivery's status changes —
+    // covers both the driver app and the admin Delivery Status monitor,
+    // since both call this same shared method.
+    final orderSnap = await _ordersCollection().doc(orderId).get();
+    final branchIdForNotif = (orderSnap.data() as Map<String, dynamic>?)?['branchId'];
+    await createNotification(
+      title: 'Delivery Status Updated',
+      message: '${_shortId(orderId)} is now "${isDelivered ? 'Delivered' : status.replaceAll('_', ' ')}".',
+      type: isDelivered ? 'success' : 'info',
+      branchId: branchIdForNotif,
+    );
   }
 
   static Future<void> updateDeliverySequence(
@@ -771,15 +842,6 @@ class InventoryData {
     );
   }
 
-  // --- NEW: lets a signed-in user edit their OWN name/birthday/sex
-  // fields, using the exact same field names createEmployee() writes.
-  // A merge-set means this never overwrites fields it wasn't given
-  // (role, branchId, email, createdAt all stay untouched) — only the
-  // specific keys passed in get updated. Since ProfilePage now reads
-  // this document via a live snapshots() listener rather than a
-  // one-time fetch, any write here (or, eventually, any write from the
-  // web admin side to this same document) shows up immediately without
-  // needing a manual refresh.
   static Future<void> updateOwnProfile(
       String uid, Map<String, dynamic> data) async {
     await _usersCollection().doc(uid).set(data, SetOptions(merge: true));

@@ -1,584 +1,342 @@
-import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:intl/intl.dart';
 import 'inventory_data.dart';
+import 'order_tracking_page.dart';
 
 class MyOrdersPage extends StatefulWidget {
-  final String userId;
   final String? email;
-  const MyOrdersPage({super.key, required this.userId, this.email});
+  // NEW: accepts an explicit userId, matching how customer_profile_page.dart
+  // already calls this widget (MyOrdersPage(userId: widget.customerId, ...)).
+  // Optional and additive — every other call site that only passes `email`
+  // is completely unaffected.
+  final String? userId;
+  const MyOrdersPage({super.key, this.email, this.userId});
 
   @override
   State<MyOrdersPage> createState() => _MyOrdersPageState();
 }
 
-class _MyOrdersPageState extends State<MyOrdersPage>
-    with SingleTickerProviderStateMixin {
-  late TabController _tabController;
+class _MyOrdersPageState extends State<MyOrdersPage> {
+  String _filterStatus = 'All';
 
-  @override
-  void initState() {
-    super.initState();
-    _tabController = TabController(length: 3, vsync: this);
-  }
+  final List<String> _filterOptions = [
+    'All',
+    'Pending',
+    'Processing',
+    'Shipped',
+    'Delivered',
+    'Cancelled'
+  ];
 
-  @override
-  void dispose() {
-    _tabController.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final isDark = theme.brightness == Brightness.dark;
-
-    return Scaffold(
-      backgroundColor:
-          isDark ? const Color(0xFF121212) : const Color(0xFFFFFDF7),
-      appBar: AppBar(
-        title: Text(
-          'MY ORDERS',
-          style: GoogleFonts.cormorantGaramond(
-            fontWeight: FontWeight.bold,
-            letterSpacing: 2.0,
-          ),
-        ),
-        backgroundColor: Colors.transparent,
-        elevation: 0,
-        centerTitle: true,
-        bottom: TabBar(
-          controller: _tabController,
-          labelColor: const Color(0xFFF4B400),
-          unselectedLabelColor: Colors.grey,
-          indicatorColor: const Color(0xFFF4B400),
-          tabs: const [
-            Tab(text: 'Active'),
-            Tab(text: 'Completed'),
-            Tab(text: 'Cancelled'),
-          ],
-        ),
-      ),
-      body: TabBarView(
-        controller: _tabController,
-        children: [
-          _buildOrdersList('active'),
-          _buildOrdersList('completed'),
-          _buildOrdersList('cancelled'),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildOrdersList(String type) {
-    return StreamBuilder<List<Map<String, dynamic>>>(
-      stream: InventoryData.getUserOrdersStream(
-          userId: widget.userId, email: widget.email),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return const Center(child: CircularProgressIndicator());
-        }
-        if (!snapshot.hasData || snapshot.data!.isEmpty) {
-          return Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(Icons.shopping_bag_outlined,
-                    size: 64, color: Colors.grey[300]),
-                const SizedBox(height: 16),
-                Text('No $type orders found.',
-                    style: TextStyle(color: Colors.grey[400])),
-              ],
-            ),
-          );
-        }
-
-        final allOrders = snapshot.data!;
-        final filteredOrders = allOrders.where((order) {
-          final status =
-              (order['status'] ?? 'pending').toString().toLowerCase();
-          if (status == 'delivered') {
-            // Move delivered to completed
-            if (type == 'completed') return true;
-            return false;
-          }
-
-          if (type == 'active') {
-            return status != 'completed' &&
-                status != 'cancelled' &&
-                status != 'delivered';
-          } else if (type == 'completed') {
-            return status == 'completed' || status == 'delivered';
-          } else {
-            return status == 'cancelled';
-          }
-        }).toList();
-
-        if (filteredOrders.isEmpty) {
-          return Center(
-              child: Text('No $type orders.',
-                  style: const TextStyle(color: Colors.grey)));
-        }
-
-        return ListView.builder(
-          padding: const EdgeInsets.all(16),
-          itemCount: filteredOrders.length,
-          itemBuilder: (context, index) {
-            return _buildOrderCard(filteredOrders[index]);
-          },
-        );
-      },
-    );
-  }
-
-  Widget _buildOrderCard(Map<String, dynamic> order) {
-    final status = order['status'] ?? 'pending';
-    final date = order['createdAt'] != null
-        ? (order['createdAt'] as dynamic).toDate()
-        : DateTime.now();
-    final formattedDate = DateFormat('MMM dd, yyyy').format(date);
-    final total =
-        (order['totalAmount'] ?? order['totalPrice'] ?? 0.0).toDouble();
-    final orderId = order['id']
-        .toString()
-        .toUpperCase()
-        .substring(0, min(8, order['id'].toString().length));
-    final items = (order['items'] as List<dynamic>?) ?? [];
-
-    // Determine the main display name
-    String mainItemName = "Generic Bouquet";
-    if (items.isNotEmpty) {
-      mainItemName = items.first['name'] ?? "Bouquet Arrangement";
-      if (items.length > 1) {
-        mainItemName += " (+${items.length - 1} more)";
-      }
-    } else if (order['orderType'] == 'CUSTOM_AR') {
-      mainItemName = "AR Custom Arrangement";
-    }
-
-    return Card(
-      margin: const EdgeInsets.only(bottom: 20),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-      elevation: 2,
-      child: Padding(
-        padding: const EdgeInsets.all(20.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'ORD-$orderId',
-                      style: const TextStyle(
-                          fontWeight: FontWeight.bold,
-                          fontSize: 12,
-                          color: Colors.grey),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      mainItemName,
-                      style: const TextStyle(
-                          fontWeight: FontWeight.bold, fontSize: 18),
-                    ),
-                    Text(
-                      'Placed on $formattedDate • ${order['paymentStatus'] == 'paid' ? "Paid" : "Unpaid"}',
-                      style: const TextStyle(fontSize: 12, color: Colors.grey),
-                    ),
-                  ],
-                ),
-                _buildStatusBadge(status),
-              ],
-            ),
-            const SizedBox(height: 24),
-
-            // Tracking Timeline
-            _buildTrackingTimeline(status),
-
-            const SizedBox(height: 24),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text(
-                  '₱${total.toStringAsFixed(2)}',
-                  style: const TextStyle(
-                      fontWeight: FontWeight.w900,
-                      fontSize: 20,
-                      color: Color(0xFFF4B400)),
-                ),
-                TextButton(
-                  onPressed: () => _showOrderDetails(order),
-                  child: const Text('View Details →',
-                      style: TextStyle(fontWeight: FontWeight.bold)),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildStatusBadge(String status) {
-    Color color;
-    String label;
-    final s = status.toLowerCase();
-
-    switch (s) {
+  Color _getStatusColor(String status) {
+    switch (status.toLowerCase()) {
       case 'pending':
-        color = Colors.orange;
-        label = 'PLANNED';
-        break;
-      case 'confirmed':
-        color = Colors.blue;
-        label = 'CONFIRMED';
-        break;
+        return Colors.orange;
       case 'processing':
-      case 'in_progress':
-        color = Colors.purple;
-        label = 'PRODUCTION';
-        break;
-      case 'out_for_delivery':
-        color = Colors.indigo;
-        label = 'SHIPPING';
-        break;
-      case 'completed':
+        return Colors.blue;
+      case 'shipped':
+      case 'in transit':
+        return Colors.purple;
       case 'delivered':
-        color = Colors.green;
-        label = 'DONE';
-        break;
+      case 'completed':
+        return Colors.green;
       case 'cancelled':
-        color = Colors.red;
-        label = 'CANCELLED';
-        break;
+        return Colors.red;
       default:
-        color = Colors.grey;
-        label = status.toUpperCase();
+        return Colors.grey;
     }
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.1),
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: Text(
-        label,
-        style: TextStyle(
-            color: color,
-            fontSize: 10,
-            fontWeight: FontWeight.bold,
-            letterSpacing: 0.5),
-      ),
-    );
   }
 
-  Widget _buildTrackingTimeline(String status) {
-    int currentStep = 0;
-    final s = status.toLowerCase();
-    if (s == 'pending') currentStep = 1;
-    if (s == 'confirmed') currentStep = 2;
-    if (s == 'processing' || s == 'in_progress') currentStep = 3;
-    if (s == 'out_for_delivery') currentStep = 4;
-    if (s == 'delivered' || s == 'completed') currentStep = 5;
-    if (s == 'cancelled') currentStep = 0;
-
-    return Column(
-      children: [
-        Row(
-          children: [
-            _buildTimelineNode('Placed', currentStep >= 1, true, false),
-            _buildTimelineNode('Confirmed', currentStep >= 2, false, false),
-            _buildTimelineNode('Production', currentStep >= 3, false, false),
-            _buildTimelineNode('Shipping', currentStep >= 4, false, false),
-            _buildTimelineNode('Done', currentStep >= 5, false, true),
-          ],
-        ),
-      ],
-    );
+  IconData _getStatusIcon(String status) {
+    switch (status.toLowerCase()) {
+      case 'pending':
+        return Icons.hourglass_empty_rounded;
+      case 'processing':
+        return Icons.settings_rounded;
+      case 'shipped':
+      case 'in transit':
+        return Icons.local_shipping_rounded;
+      case 'delivered':
+      case 'completed':
+        return Icons.check_circle_rounded;
+      case 'cancelled':
+        return Icons.cancel_rounded;
+      default:
+        return Icons.help_outline_rounded;
+    }
   }
 
-  Widget _buildTimelineNode(
-      String label, bool isCompleted, bool isFirst, bool isLast) {
-    return Expanded(
-      child: Column(
-        children: [
-          Row(
-            children: [
-              Expanded(
-                  child: Container(
-                      height: 2,
-                      color: isFirst
-                          ? Colors.transparent
-                          : (isCompleted
-                              ? const Color(0xFFF4B400)
-                              : Colors.grey[200]))),
-              Container(
-                width: 12,
-                height: 12,
-                decoration: BoxDecoration(
-                  color:
-                      isCompleted ? const Color(0xFFF4B400) : Colors.grey[200],
-                  shape: BoxShape.circle,
-                  border: isCompleted
-                      ? Border.all(
-                          color: const Color(0xFFF4B400).withOpacity(0.3),
-                          width: 4)
-                      : null,
-                ),
-              ),
-              Expanded(
-                  child: Container(
-                      height: 2,
-                      color: isLast
-                          ? Colors.transparent
-                          : (isCompleted
-                              ? const Color(0xFFF4B400)
-                              : Colors.grey[200]))),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Text(
-            label,
-            style: TextStyle(
-              fontSize: 8,
-              fontWeight: isCompleted ? FontWeight.bold : FontWeight.normal,
-              color: isCompleted ? const Color(0xFF121212) : Colors.grey,
-            ),
-          ),
-        ],
-      ),
-    );
+  int _initialTabFor(Map<String, dynamic> order) {
+    final status = (order['status'] ?? '').toString().toLowerCase();
+    final paymentStatus = (order['paymentStatus'] ?? '').toString().toLowerCase();
+    final paymentMethod = (order['payment_method'] ?? order['paymentMethod'] ?? '')
+        .toString()
+        .toLowerCase();
+
+    if (status == 'delivered' || status == 'completed') return 3;
+    if (status == 'shipped' || status == 'out_for_delivery') return 2;
+
+    final isOnlinePayment = paymentMethod == 'gcash' ||
+        paymentMethod == 'maya' ||
+        paymentMethod == 'paymaya' ||
+        paymentMethod == 'paymongo';
+    final paymentUnresolved =
+        paymentStatus.contains('pending') || paymentStatus.contains('awaiting');
+
+    if (isOnlinePayment && paymentUnresolved) return 0;
+    return 1;
   }
 
-  void _showOrderDetails(Map<String, dynamic> order) {
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (context) => Container(
-        height: MediaQuery.of(context).size.height * 0.7,
-        decoration: const BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.vertical(top: Radius.circular(30)),
-        ),
-        padding: const EdgeInsets.all(32),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Center(
-                child: Container(
-                    width: 40,
-                    height: 4,
-                    decoration: BoxDecoration(
-                        color: Colors.black12,
-                        borderRadius: BorderRadius.all(Radius.circular(2))))),
-            const SizedBox(height: 32),
-            const Text('ORDER DETAILS',
-                style: TextStyle(
-                    fontWeight: FontWeight.w900,
-                    letterSpacing: 2,
-                    fontSize: 16)),
-            const SizedBox(height: 24),
-            Expanded(
-              child: ListView(
-                children: [
-                  _buildDetailRow(
-                      'Recipient', order['recipientName'] ?? 'Customer'),
-                  _buildDetailRow('Phone', order['recipientPhone'] ?? 'N/A'),
-                  _buildDetailRow(
-                      'Address', order['deliveryAddress'] ?? 'No address'),
-                  _buildDetailRow('Payment',
-                      (order['paymentMethod'] ?? 'COD').toUpperCase()),
-                  _buildDetailRow(
-                      'Order Time',
-                      DateFormat('MMM dd, yyyy - hh:mm a').format(
-                          order['createdAt'] != null
-                              ? (order['createdAt'] as dynamic).toDate()
-                              : DateTime.now())),
-                  const Divider(height: 48),
-                  const Text('ITEMS',
-                      style: TextStyle(
-                          fontWeight: FontWeight.bold,
-                          fontSize: 12,
-                          color: Colors.grey)),
-                  const SizedBox(height: 16),
-                  ...((order['items'] as List<dynamic>?) ?? [])
-                      .map((item) => Padding(
-                            padding: const EdgeInsets.only(bottom: 12),
-                            child: Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                Text('${item['name']} x${item['qty'] ?? 1}'),
-                                Text(
-                                    '₱${((item['price'] ?? 0.0) * (item['qty'] ?? 1)).toStringAsFixed(2)}'),
-                              ],
-                            ),
-                          ))
-                      .toList(),
-                  if (order['deliveryFee'] != null)
-                    _buildDetailRow('Delivery Fee',
-                        '₱${(order['deliveryFee'] as num).toStringAsFixed(2)}'),
-                  if ((order['proofOfDeliveryPhoto'] ?? order['podPhotoUrl']) !=
-                          null &&
-                      ((order['proofOfDeliveryPhoto'] ?? order['podPhotoUrl'])
-                              as String)
-                          .isNotEmpty) ...[
-                    const Divider(height: 36),
-                    const Row(
-                      children: [
-                        Icon(Icons.verified, color: Colors.green, size: 18),
-                        SizedBox(width: 6),
-                        Text('PROOF OF DELIVERY (POD)',
-                            style: TextStyle(
-                                fontWeight: FontWeight.bold,
-                                fontSize: 13,
-                                color: Colors.green)),
-                      ],
-                    ),
-                    const SizedBox(height: 10),
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(12),
-                      child: Container(
-                        height: 160,
-                        width: double.infinity,
-                        color: Colors.black12,
-                        child: _buildImageFromBase64OrUrl(
-                            (order['proofOfDeliveryPhoto'] ??
-                                order['podPhotoUrl']) as String),
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    _buildDetailRow(
-                        'Received By',
-                        order['podRecipient'] ??
-                            order['recipientName'] ??
-                            'Customer'),
-                    if (order['courierName'] != null ||
-                        order['driverName'] != null)
-                      _buildDetailRow('Courier / Driver',
-                          order['courierName'] ?? order['driverName']),
-                  ],
-                  const Divider(height: 48),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Text('TOTAL',
-                          style: TextStyle(
-                              fontWeight: FontWeight.bold, fontSize: 18)),
-                      Text(
-                        '₱${(order['totalAmount'] ?? 0.0).toStringAsFixed(2)}',
-                        style: const TextStyle(
-                            fontWeight: FontWeight.w900,
-                            fontSize: 24,
-                            color: Color(0xFFF4B400)),
-                      ),
-                    ],
-                  ),
-                  if (order['status'] == 'pending')
-                    Padding(
-                      padding: const EdgeInsets.only(top: 32.0),
-                      child: SizedBox(
-                        width: double.infinity,
-                        child: OutlinedButton(
-                          onPressed: () => _confirmCancelOrder(order['id']),
-                          style: OutlinedButton.styleFrom(
-                            foregroundColor: Colors.red,
-                            side: const BorderSide(color: Colors.red),
-                            padding: const EdgeInsets.symmetric(vertical: 16),
-                            shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(12)),
-                          ),
-                          child: const Text('CANCEL ORDER',
-                              style: TextStyle(fontWeight: FontWeight.bold)),
-                        ),
-                      ),
-                    ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
+  Future<void> _cancelOrder(String orderId) async {
+    try {
+      await FirebaseFirestore.instance.collection('orders').doc(orderId).update({
+        'status': 'cancelled',
+        'cancelledAt': FieldValue.serverTimestamp(),
+      });
+
+      final orderSnap = await FirebaseFirestore.instance.collection('orders').doc(orderId).get();
+      final orderData = orderSnap.data();
+      final branchIdForNotif = orderData?['branchId'];
+      final shortId = '#${(orderId.length > 8 ? orderId.substring(0, 8) : orderId).toUpperCase()}';
+      final customerName = (orderData?['customer_name'] ?? orderData?['customerName'] ?? 'A customer').toString();
+
+      await InventoryData.createNotification(
+        title: 'Order Cancellation Requested',
+        message: '$customerName cancelled order $shortId.',
+        type: 'warning',
+        branchId: branchIdForNotif,
+      );
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Order cancelled successfully'), backgroundColor: Colors.green),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error cancelling order: $e'), backgroundColor: Colors.red),
+        );
+      }
+    }
   }
 
-  void _confirmCancelOrder(String orderId) {
+  void _showCancelConfirmation(String orderId) {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Cancel Order?'),
-        content: const Text(
-            'Are you sure you want to cancel this order? This action cannot be undone.'),
+        content: const Text('Are you sure you want to cancel this order? This action cannot be undone.'),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(context), child: const Text('NO')),
-          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('No, Keep Order'),
+          ),
+          ElevatedButton(
             onPressed: () {
-              InventoryData.updateOrderStatus(orderId, 'cancelled');
-              Navigator.pop(context); // Close dialog
-              Navigator.pop(context); // Close bottom sheet
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                    content: Text('Order cancelled successfully'),
-                    backgroundColor: Colors.red),
-              );
+              Navigator.pop(context);
+              _cancelOrder(orderId);
             },
-            child:
-                const Text('YES, CANCEL', style: TextStyle(color: Colors.red)),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red, foregroundColor: Colors.white),
+            child: const Text('Yes, Cancel'),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildImageFromBase64OrUrl(String strData) {
-    try {
-      if (strData.startsWith('data:image') || strData.contains(';base64,')) {
-        final base64Str = strData.split(',').last;
-        final bytes = base64Decode(base64Str);
-        return Image.memory(bytes, fit: BoxFit.cover);
-      } else if (strData.startsWith('http://') ||
-          strData.startsWith('https://')) {
-        return Image.network(strData,
-            fit: BoxFit.cover,
-            errorBuilder: (c, e, s) =>
-                const Icon(Icons.broken_image, size: 40));
-      } else {
-        final bytes = base64Decode(strData);
-        return Image.memory(bytes, fit: BoxFit.cover);
-      }
-    } catch (e) {
-      return Container(
-        color: Colors.grey[800],
-        child: const Center(
-            child: Icon(Icons.broken_image, color: Colors.white54)),
-      );
-    }
-  }
+  @override
+  Widget build(BuildContext context) {
+    final user = FirebaseAuth.instance.currentUser;
+    // NEW: explicit widget.userId (if the caller provided one) wins;
+    // otherwise falls back to the signed-in Firebase user, exactly as
+    // before. This means customer_profile_page.dart's
+    // MyOrdersPage(userId: widget.customerId) now actually filters by
+    // that specific customer ID instead of erroring at compile time.
+    final effectiveUserId = widget.userId ?? user?.uid;
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
 
-  Widget _buildDetailRow(String label, String value) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8.0),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(label,
-              style: const TextStyle(
-                  fontSize: 10,
-                  color: Colors.grey,
-                  fontWeight: FontWeight.bold)),
-          Text(value,
-              style:
-                  const TextStyle(fontSize: 14, fontWeight: FontWeight.w500)),
-        ],
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('My Orders'),
+        backgroundColor: isDark ? Colors.black : Colors.white,
+        foregroundColor: isDark ? Colors.white : Colors.black,
+        elevation: 0,
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(50),
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: Row(
+              children: _filterOptions.map((status) {
+                final isSelected = _filterStatus == status;
+                return Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                  child: ChoiceChip(
+                    label: Text(status),
+                    selected: isSelected,
+                    onSelected: (val) => setState(() => _filterStatus = status),
+                    selectedColor: const Color(0xFFF59E0B),
+                    labelStyle: TextStyle(
+                      color: isSelected ? Colors.white : (isDark ? Colors.white70 : Colors.black87),
+                      fontWeight: FontWeight.w600,
+                      fontSize: 12,
+                    ),
+                    backgroundColor: isDark ? Colors.grey[900] : Colors.grey[100],
+                  ),
+                );
+              }).toList(),
+            ),
+          ),
+        ),
+      ),
+      body: StreamBuilder<List<Map<String, dynamic>>>(
+        stream: InventoryData.getUserOrdersStream(userId: effectiveUserId, email: widget.email),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Center(child: CircularProgressIndicator(color: Color(0xFFF59E0B)));
+          }
+          if (snapshot.hasError) {
+            return Center(child: Text('Error: ${snapshot.error}'));
+          }
+
+          var orders = snapshot.data ?? [];
+
+          if (_filterStatus != 'All') {
+            orders = orders.where((o) {
+              final status = (o['status'] ?? '').toString().toLowerCase();
+              return status == _filterStatus.toLowerCase();
+            }).toList();
+          }
+
+          if (orders.isEmpty) {
+            return Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.receipt_long_outlined, size: 64, color: Colors.grey[400]),
+                  const SizedBox(height: 16),
+                  Text('No orders found', style: TextStyle(color: Colors.grey[600], fontSize: 16)),
+                ],
+              ),
+            );
+          }
+
+          return ListView.builder(
+            padding: const EdgeInsets.all(16),
+            itemCount: orders.length,
+            itemBuilder: (context, index) {
+              final order = orders[index];
+              final orderId = order['id'];
+              final status = (order['status'] ?? 'pending').toString();
+              final items = (order['items'] as List?) ?? [];
+              final total = (order['total_price'] ?? order['totalAmount'] ?? 0.0).toDouble();
+              final rawDate = order['createdAt'] ?? order['created_at'];
+              final date = rawDate is Timestamp ? rawDate.toDate() : DateTime.now();
+              final canCancel = status.toLowerCase() == 'pending';
+
+              return Container(
+                margin: const EdgeInsets.only(bottom: 16),
+                decoration: BoxDecoration(
+                  color: isDark ? Colors.grey[900] : Colors.white,
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: Colors.grey.withValues(alpha: 0.15)),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text('Order #${orderId.toString().substring(0, 8).toUpperCase()}',
+                                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+                              Text(DateFormat('MMM d, yyyy').format(date),
+                                  style: TextStyle(fontSize: 12, color: Colors.grey[500])),
+                            ],
+                          ),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                            decoration: BoxDecoration(
+                              color: _getStatusColor(status).withValues(alpha: 0.12),
+                              borderRadius: BorderRadius.circular(20),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(_getStatusIcon(status), size: 14, color: _getStatusColor(status)),
+                                const SizedBox(width: 4),
+                                Text(status.toUpperCase(),
+                                    style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: _getStatusColor(status))),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const Divider(height: 1),
+                    Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: items.take(2).map((item) {
+                          return Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 4),
+                            child: Text('${item['name'] ?? 'Item'} x${item['qty'] ?? 1}',
+                                style: TextStyle(fontSize: 13, color: isDark ? Colors.grey[300] : Colors.grey[700])),
+                          );
+                        }).toList(),
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text('₱${total.toStringAsFixed(2)}',
+                              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Color(0xFFF59E0B))),
+                          Row(
+                            children: [
+                              if (canCancel)
+                                TextButton(
+                                  onPressed: () => _showCancelConfirmation(orderId),
+                                  style: TextButton.styleFrom(foregroundColor: Colors.red),
+                                  child: const Text('Cancel'),
+                                ),
+                              const SizedBox(width: 8),
+                              OutlinedButton(
+                                onPressed: () {
+                                  Navigator.push(
+                                    context,
+                                    MaterialPageRoute(
+                                      builder: (context) => OrderTrackingPage(
+                                        customerId: effectiveUserId ?? '',
+                                        initialTabIndex: _initialTabFor(order),
+                                      ),
+                                    ),
+                                  );
+                                },
+                                child: const Text('Track Order'),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            },
+          );
+        },
       ),
     );
   }
-
-  int min(int a, int b) => a < b ? a : b;
 }

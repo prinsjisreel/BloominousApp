@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'change_password_page.dart';
 import 'shop_location_page.dart';
 import 'main.dart';
@@ -15,6 +16,17 @@ class SettingsPage extends StatefulWidget {
 
 class _SettingsPageState extends State<SettingsPage> {
   bool _notificationsEnabled = true;
+
+  // --- NEW: writes the chosen theme to on-device storage the instant it
+  // changes. shared_preferences persists independently of Firebase Auth
+  // — it survives a full app close/reopen AND a logout, since nothing in
+  // the sign-out flow touches this storage. This is the "save" half of
+  // theme persistence; the "load on startup" half needs a matching read
+  // in main.dart before runApp(), which isn't wired in yet.
+  Future<void> _persistTheme(bool isDark) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('isDarkMode', isDark);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -38,15 +50,6 @@ class _SettingsPageState extends State<SettingsPage> {
         backgroundColor: Colors.transparent,
         elevation: 0,
         centerTitle: true,
-        // FIXED: removed the leading back-arrow IconButton that called
-        // Navigator.pop(context). Settings is reached from AppSidebar via
-        // pushReplacement, which SWAPS the screen instead of stacking a
-        // new one on top — there was never a previous route underneath
-        // for that pop to return to. Popping an empty stack doesn't
-        // crash, but leaves nothing valid to render, which is exactly
-        // the black screen you saw. Removing `leading` entirely lets the
-        // Scaffold auto-draw the hamburger menu icon instead (since
-        // `drawer` is now set below), matching every other sidebar page.
       ),
       drawer: isDesktop ? null : Drawer(child: AppSidebar(role: widget.role, currentPage: 'settings')),
       body: Row(
@@ -110,6 +113,7 @@ class _SettingsPageState extends State<SettingsPage> {
                     setState(() {
                       themeNotifier.value = val ? ThemeMode.dark : ThemeMode.light;
                     });
+                    _persistTheme(val);
                   },
                 ),
                 const SizedBox(height: 32),

@@ -8,6 +8,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
 import 'inventory_data.dart';
 import 'app_sidebar.dart';
+import 'notification_bell.dart';
 
 class ProfilePage extends StatefulWidget {
   final String role;
@@ -22,11 +23,6 @@ class _ProfilePageState extends State<ProfilePage> {
   bool _isUpdating = false;
   bool _isUploadingPhoto = false;
 
-  // --- NEW: picks an image, uploads it to Firebase Storage under a
-  // per-user path, then saves the resulting download URL onto the SAME
-  // users/{uid} document the name fields already live on — via
-  // updateOwnProfile(), so this reuses the exact merge-write pattern
-  // already in place rather than inventing a second save path. ---
   Future<void> _pickAndUploadPhoto(String uid) async {
     final picker = ImagePicker();
     final picked = await picker.pickImage(source: ImageSource.gallery, maxWidth: 800, imageQuality: 80);
@@ -270,12 +266,6 @@ class _ProfilePageState extends State<ProfilePage> {
                               ),
                               child: Column(
                                 children: [
-                                  // NEW: tappable avatar. Shows the uploaded
-                                  // photo if one exists; otherwise falls back
-                                  // to the initial-letter circle, same as
-                                  // before. A small camera badge + loading
-                                  // spinner make it clear this is an action,
-                                  // not just decoration.
                                   GestureDetector(
                                     onTap: _isUploadingPhoto ? null : () => _pickAndUploadPhoto(uid),
                                     child: Stack(
@@ -387,6 +377,11 @@ class _ProfilePageState extends State<ProfilePage> {
                                 subtitle: 'Update your login security',
                                 onTap: _showChangePasswordDialog,
                               ),
+                            // FIXED: was a placeholder snackbar ("coming
+                            // soon") — now opens the exact same live
+                            // notification panel as the top-bar bell icon,
+                            // via the shared openNotificationsSheet()
+                            // function.
                             _buildActionCard(
                               cardColor: cardColor,
                               borderColor: borderColor,
@@ -394,12 +389,8 @@ class _ProfilePageState extends State<ProfilePage> {
                               subTextColor: subTextColor,
                               icon: Icons.notifications_none_outlined,
                               title: 'Notifications',
-                              subtitle: 'Manage alerts',
-                              onTap: () {
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  const SnackBar(content: Text('Notifications settings coming soon')),
-                                );
-                              },
+                              subtitle: 'View recent business updates',
+                              onTap: () => openNotificationsSheet(context),
                             ),
                             const SizedBox(height: 24),
                             SizedBox(

@@ -2,12 +2,9 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'package:firebase_auth/firebase_auth.dart';
 
-/// Calls send_verification_email.php — identical contract to what
-/// register.php and index.php's "Resend verification email" button
-/// already use on web: POST with a Bearer ID token, no body. Same
-/// platform-agnostic shape as record_email_risk.php, so this is reused
-/// as-is rather than needing a separate mobile endpoint.
+/// Calls send_verification_email.php — POST with a Bearer ID token.
 class EmailVerificationService {
+  // IMPORTANT: Ensure this matches your exact Hostinger domain.
   static const String _endpoint =
       'https://honeydew-duck-132160.hostingersite.com/send_verification_email.php';
 
