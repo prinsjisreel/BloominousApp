@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'dart:async';
 import 'admin_dashboard.dart';
 import 'delivery_dashboard.dart';
@@ -78,6 +79,56 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
   }
   // -------------------------------------
 
+  /// New-device visibility for the admin portal, matching the soft
+  /// notification-only approach already used for flagged customer
+  /// accounts (see set_session.php) — this NEVER blocks login. A
+  /// staff/admin account's own known devices are tracked separately
+  /// from `banned_devices`, which exists for CUSTOMER fraud and has
+  /// nothing to do with credential-theft risk on a trusted account.
+  ///
+  /// The very first login after this feature ships gets treated as
+  /// baseline setup (no alert, just starts tracking) — otherwise every
+  /// existing staff account would trigger a false alarm the next time
+  /// they log in, purely because they'd never had a device recorded
+  /// before.
+  Future<void> _checkAndTrackDevice(String uid, String displayEmail) async {
+    try {
+      final deviceHash = await _securityService.getDeviceHash();
+      final userDoc =
+      await FirebaseFirestore.instance.collection('users').doc(uid).get();
+      final data = userDoc.data();
+      final rawHashes = data?['deviceHashes'];
+      final hasNoDeviceHistoryYet = rawHashes == null;
+      final knownHashes = rawHashes is List
+          ? rawHashes.map((e) => e.toString()).toList()
+          : <String>[];
+      final isRecognized = knownHashes.contains(deviceHash);
+
+      if (!isRecognized && !hasNoDeviceHistoryYet) {
+        await FirebaseFirestore.instance.collection('notifications').add({
+          'title': 'Staff Login — New Device',
+          'message':
+          '$displayEmail logged into the admin portal from a device not previously seen on this account.',
+          'type': 'fraud',
+          'branchId': data?['branchId'],
+          'created_at': FieldValue.serverTimestamp(),
+          'read': false,
+        });
+      }
+
+      if (!isRecognized) {
+        await FirebaseFirestore.instance.collection('users').doc(uid).update({
+          'deviceHashes': FieldValue.arrayUnion([deviceHash]),
+        });
+      }
+    } catch (e) {
+      // Best-effort, same philosophy as every other fraud-adjacent
+      // logging call in this project — a tracking failure must never
+      // stop a legitimate staff member from getting into the dashboard.
+      debugPrint('Device tracking failed (login still proceeds): $e');
+    }
+  }
+
   Future<void> _login() async {
     if (!_formKey.currentState!.validate()) return;
     if (await _isRateLimited()) return; // Blocks the call entirely while locked out
@@ -120,6 +171,12 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
         // Successful, authorized login — clear the strike counter.
         await _securityService.resetAttempts();
 
+        // New-device visibility check — runs for every authorized
+        // portal role (admin, super-admin, staff, employee, delivery),
+        // since this is the one shared login point for all of them.
+        await _checkAndTrackDevice(
+            credential.user!.uid, emailController.text.trim());
+
         if (mounted) {
           if (role == 'delivery') {
             Navigator.pushReplacement(
@@ -139,6 +196,7 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
         }
       }
     } on FirebaseAuthException catch (e) {
+      setState(() => isLoading = false);
       await _securityService.recordFailedAttempt();
       await _isRateLimited();
 
@@ -171,8 +229,7 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
         );
       }
     } catch (e) {
-      await _securityService.recordFailedAttempt();
-      await _isRateLimited();
+      setState(() => isLoading = false);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('An unexpected error occurred: $e')),
@@ -511,128 +568,6 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
         ),
         contentPadding:
         const EdgeInsets.symmetric(vertical: 18, horizontal: 20),
-      ),
-    );
-  }
-
-  void _showAdminSetupDialog() {
-    final adminEmail = TextEditingController();
-    final adminPass = TextEditingController();
-    final adminName = TextEditingController();
-    final adminId = TextEditingController(text: 'ADMIN-001');
-    bool isCreating = false;
-
-    showDialog(
-      context: context,
-      builder: (context) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          shape:
-          RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-          title: const Text('Initial Admin Setup',
-              style: TextStyle(fontWeight: FontWeight.bold)),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Text(
-                  'Use this only for the very first administrator account.',
-                  style: TextStyle(fontSize: 12, color: Colors.grey),
-                ),
-                const SizedBox(height: 20),
-                TextField(
-                  controller: adminName,
-                  decoration: InputDecoration(
-                    labelText: 'Full Name',
-                    border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12)),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: adminEmail,
-                  decoration: InputDecoration(
-                    labelText: 'Email',
-                    border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12)),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: adminPass,
-                  obscureText: true,
-                  decoration: InputDecoration(
-                    labelText: 'Password',
-                    border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12)),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: adminId,
-                  decoration: InputDecoration(
-                    labelText: 'Employee ID',
-                    border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12)),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('CANCEL', style: TextStyle(color: Colors.grey)),
-            ),
-            if (isCreating)
-              const Padding(
-                padding: EdgeInsets.symmetric(horizontal: 20),
-                child: CircularProgressIndicator(strokeWidth: 2),
-              )
-            else
-              ElevatedButton(
-                onPressed: () async {
-                  if (adminEmail.text.isEmpty ||
-                      adminPass.text.isEmpty ||
-                      adminName.text.isEmpty) {
-                    return;
-                  }
-                  setDialogState(() => isCreating = true);
-                  try {
-                    final cred = await FirebaseAuth.instance
-                        .createUserWithEmailAndPassword(
-                      email: adminEmail.text.trim(),
-                      password: adminPass.text.trim(),
-                    );
-                    if (cred.user != null) {
-                      await InventoryData.createNewEmployee(
-                        uid: cred.user!.uid,
-                        firstName: adminName.text,
-                        email: adminEmail.text,
-                        employeeId: adminId.text,
-                        role: 'admin',
-                      );
-                    }
-                    if (mounted) Navigator.pop(context);
-                  } catch (e) {
-                    if (mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: Text('Setup failed: $e')),
-                      );
-                    }
-                  } finally {
-                    setDialogState(() => isCreating = false);
-                  }
-                },
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF121212),
-                  foregroundColor: const Color(0xFFF4B400),
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(10)),
-                ),
-                child: const Text('CREATE ADMIN'),
-              ),
-          ],
-        ),
       ),
     );
   }

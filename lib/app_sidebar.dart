@@ -20,6 +20,8 @@ import 'fraud_analytics_page.dart';
 import 'sales_anomalies_page.dart';
 import 'delivery_status_page.dart';
 import 'invoice_portal_page.dart';
+import 'admin_audit_log_page.dart';
+import 'override_codes_page.dart';
 
 class AppSidebar extends StatelessWidget {
   final String role;
@@ -121,6 +123,12 @@ class AppSidebar extends StatelessWidget {
                   _item(context, 'Invoice Portal', Icons.receipt_long, 'invoice', InvoicePortalPage(role: role), isDark, textColor),
                   _item(context, 'Pre-Orders', Icons.calendar_today, 'preorders', PreordersPage(role: role), isDark, textColor, isHidden: !isAdmin),
                   _item(context, 'Fraud Analytics', Icons.security, 'fraud', FraudAnalyticsPage(role: role), isDark, textColor, isHidden: !isAdmin),
+                  _item(context, 'Admin Activity Log', Icons.fact_check, 'audit_log', AdminAuditLogPage(role: role), isDark, textColor, isHidden: !isAdmin),
+                  // New — mobile equivalent of override_codes.php. Shares
+                  // the exact same Firestore collections as web, so a
+                  // batch generated on either platform shows up live on
+                  // the other.
+                  _item(context, 'Override Codes', Icons.vpn_key, 'override_codes', OverrideCodesPage(role: role), isDark, textColor, isHidden: !isAdmin),
                   _item(context, 'Sales Anomalies', Icons.warning_amber, 'anomalies', SalesAnomaliesPage(role: role), isDark, textColor, isHidden: !isAdmin),
                   _item(context, 'Inventory', Icons.inventory_2, 'inventory', InventoryPage(role: role), isDark, textColor),
                   _item(context, 'Freshness Matrix', Icons.health_and_safety, 'freshness', FreshnessMatrixPage(role: role), isDark, textColor),

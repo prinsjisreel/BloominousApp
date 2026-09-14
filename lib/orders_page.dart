@@ -8,6 +8,7 @@ import 'dart:math';
 import 'inventory_data.dart';
 import 'app_sidebar.dart';
 import 'invoice_portal_page.dart';
+import 'override_code_service.dart';
 
 class OrdersPage extends StatefulWidget {
   final String role;
@@ -24,6 +25,16 @@ class _OrdersPageState extends State<OrdersPage> {
 
   String? _selectedBranchId;
   String? _branchName = 'Loading...';
+
+  final OverrideCodeService _overrideCodeService = OverrideCodeService();
+
+  // Daily walk-in cancellation threshold before an override code is
+  // required — scoped PER BRANCH, so it's a shared pool across every
+  // employee working there that day, not an individual quota. Catches
+  // patterns spread across colluding staff, matching how a real manager
+  // oversees a whole shift's void activity, not one cashier in
+  // isolation.
+  static const int _dailyCancelLimit = 3;
 
   @override
   void initState() {
@@ -92,6 +103,276 @@ class _OrdersPageState extends State<OrdersPage> {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Failed to update status: $e')),
         );
+      }
+    }
+  }
+
+  /// Counts today's WALK-IN cancellations for a specific branch, computed
+  /// entirely client-side from the order list the page already has
+  /// loaded — deliberately avoids a separate Firestore query that would
+  /// need a composite index (branchId + type + status + a date range on
+  /// cancelledAt all at once).
+  int _countTodaysWalkInCancellations(List<Map<String, dynamic>> walkInOrders, String? branchId) {
+    final now = DateTime.now();
+    final startOfToday = DateTime(now.year, now.month, now.day);
+
+    return walkInOrders.where((o) {
+      final status = (o['status'] ?? '').toString().toUpperCase();
+      if (status != 'CANCELLED') return false;
+
+      if (branchId != null && (o['branchId']?.toString() ?? '') != branchId) return false;
+
+      final rawCancelledAt = o['cancelledAt'];
+      DateTime? cancelledAt;
+      if (rawCancelledAt is Timestamp) {
+        cancelledAt = rawCancelledAt.toDate();
+      } else if (rawCancelledAt is String) {
+        cancelledAt = DateTime.tryParse(rawCancelledAt);
+      }
+      if (cancelledAt == null) return false;
+
+      return !cancelledAt.isBefore(startOfToday);
+    }).length;
+  }
+
+  /// Entry point for the walk-in "CANCEL" button. Below the daily limit,
+  /// cancels immediately after a plain confirmation — same as before. At
+  /// or above the limit, requires a valid single-use override code
+  /// first, verified server-side (see verify_override_code.php) so the
+  /// code itself is never exposed to this app directly.
+  Future<void> _handleCancelWalkIn(
+      String orderId,
+      Map<String, dynamic> order,
+      int todaysCancelCount,
+      ) async {
+    final branchId = (order['branchId'] ?? _selectedBranchId ?? '').toString();
+
+    if (todaysCancelCount < _dailyCancelLimit) {
+      final confirmed = await _showSimpleConfirm(
+        title: 'Cancel this order?',
+        message: 'This action cannot be undone.',
+      );
+      if (confirmed) await _finalizeCancellation(orderId);
+      return;
+    }
+
+    // At/above the daily limit — require an override code.
+    final code = await _showOverrideCodeDialog(todaysCancelCount);
+    if (code == null || code.trim().isEmpty) return;
+
+    if (branchId.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No branch context available for this order.')),
+        );
+      }
+      return;
+    }
+
+    final result = await _overrideCodeService.verifyAndBurn(
+      branchId: branchId,
+      code: code.trim(),
+      orderId: orderId,
+    );
+
+    if (!result.success) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(result.message ?? 'Could not verify code. Please try again.')),
+        );
+      }
+      return;
+    }
+
+    if (!result.valid) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(result.message ?? 'Invalid or already-used override code.'),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+      }
+      return;
+    }
+
+    await _finalizeCancellation(orderId);
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Override accepted. Order cancelled.'),
+          backgroundColor: Colors.green,
+        ),
+      );
+    }
+  }
+
+  Future<void> _finalizeCancellation(String orderId) async {
+    try {
+      await FirebaseFirestore.instance.collection('orders').doc(orderId).set({
+        'status': 'CANCELLED',
+        'updatedAt': FieldValue.serverTimestamp(),
+        // cancelledAt specifically (separate from updatedAt, which any
+        // future edit would overwrite) is what the daily-limit count
+        // above filters on.
+        'cancelledAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to cancel order: $e')),
+        );
+      }
+    }
+  }
+
+  Future<bool> _showSimpleConfirm({required String title, required String message}) async {
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(title),
+        content: Text(message),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('KEEP ORDER')),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red, foregroundColor: Colors.white),
+            child: const Text('CANCEL ORDER'),
+          ),
+        ],
+      ),
+    );
+    return result ?? false;
+  }
+
+  Future<String?> _showOverrideCodeDialog(int todaysCancelCount) async {
+    final controller = TextEditingController();
+    return showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Manager Override Required'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'This branch has reached $todaysCancelCount walk-in cancellations today. '
+                  'A single-use override code from an admin is required to continue.',
+              style: const TextStyle(fontSize: 13),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: controller,
+              textCapitalization: TextCapitalization.characters,
+              decoration: const InputDecoration(
+                labelText: 'Override Code',
+                hintText: 'e.g. A1B2C3D4',
+                border: OutlineInputBorder(),
+              ),
+              autofocus: true,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, null), child: const Text('CANCEL')),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, controller.text),
+            child: const Text('VERIFY & CANCEL'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Admin-only: generate a fresh batch of 8 single-use codes for a
+  /// branch, and see how many are currently unused. Direct Firestore
+  /// access is fine here — firestore.rules already restricts
+  /// override_codes to isAdmin(), and this IS an admin.
+  void _showManageOverrideCodesDialog(String branchId, String branchLabel) {
+    showDialog(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          return AlertDialog(
+            title: Text('Override Codes — $branchLabel'),
+            content: SizedBox(
+              width: 360,
+              child: StreamBuilder<QuerySnapshot>(
+                stream: FirebaseFirestore.instance
+                    .collection('override_codes')
+                    .where('branchId', isEqualTo: branchId)
+                    .where('used', isEqualTo: false)
+                    .snapshots(),
+                builder: (context, snapshot) {
+                  final unusedDocs = snapshot.data?.docs ?? [];
+                  return Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '${unusedDocs.length} unused code(s) remaining.',
+                        style: const TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                      const SizedBox(height: 12),
+                      if (unusedDocs.isNotEmpty)
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: unusedDocs.map((d) {
+                            final data = d.data() as Map<String, dynamic>;
+                            return Chip(label: Text(data['code']?.toString() ?? '??????'));
+                          }).toList(),
+                        ),
+                      const SizedBox(height: 16),
+                      ElevatedButton.icon(
+                        icon: const Icon(Icons.refresh),
+                        label: const Text('GENERATE NEW BATCH OF 8'),
+                        onPressed: () => _generateNewCodeBatch(branchId),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        'Generating a new batch does NOT invalidate existing unused codes — it adds 8 more.',
+                        style: TextStyle(fontSize: 11, color: Colors.grey[600]),
+                      ),
+                    ],
+                  );
+                },
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(context), child: const Text('CLOSE')),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _generateNewCodeBatch(String branchId) async {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I — avoids visual mixups when read aloud
+    final rng = Random.secure();
+
+    try {
+      final batch = FirebaseFirestore.instance.batch();
+      for (int i = 0; i < 8; i++) {
+        final code = List.generate(8, (_) => chars[rng.nextInt(chars.length)]).join();
+        final ref = FirebaseFirestore.instance.collection('override_codes').doc();
+        batch.set(ref, {
+          'branchId': branchId,
+          'code': code,
+          'used': false,
+          'createdAt': FieldValue.serverTimestamp(),
+        });
+      }
+      await batch.commit();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('8 new override codes generated.'), backgroundColor: Colors.green),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed to generate codes: $e')));
       }
     }
   }
@@ -166,6 +447,13 @@ class _OrdersPageState extends State<OrdersPage> {
                   liquidityPipeline += (o['totalAmount'] ?? o['totalPrice'] ?? o['total_amount'] ?? o['total_price'] ?? 0.0).toDouble();
                 }
 
+                // Today's walk-in cancellation count for the CURRENTLY
+                // relevant branch — used both to decide whether the
+                // override dialog is needed, and to show a small warning
+                // banner once the branch is approaching the limit.
+                final relevantBranchId = _selectedBranchId;
+                final todaysCancelCount = _countTodaysWalkInCancellations(walkInOrders, relevantBranchId);
+
                 return CustomScrollView(
                   slivers: [
                     if (!isDesktop)
@@ -183,6 +471,13 @@ class _OrdersPageState extends State<OrdersPage> {
                           ),
                         ),
                         actions: [
+                          if (isAdmin && relevantBranchId != null)
+                            IconButton(
+                              icon: const Icon(Icons.vpn_key_outlined),
+                              tooltip: 'Manage Override Codes',
+                              onPressed: () => _showManageOverrideCodesDialog(
+                                  relevantBranchId, _branchName ?? 'This Branch'),
+                            ),
                           IconButton(
                             icon: const Icon(Icons.receipt_long_rounded),
                             tooltip: 'Invoice Portal',
@@ -232,34 +527,48 @@ class _OrdersPageState extends State<OrdersPage> {
                                       ),
                                     ],
                                   ),
-                                  SizedBox(
-                                    width: 260,
-                                    height: 42,
-                                    child: TextField(
-                                      controller: _filterController,
-                                      onChanged: (val) => setState(() => _searchFilter = val),
-                                      style: TextStyle(fontSize: 13, color: textColor),
-                                      decoration: InputDecoration(
-                                        hintText: 'Filter Manifests...',
-                                        hintStyle: TextStyle(fontSize: 12, color: subTextColor),
-                                        prefixIcon: Icon(Icons.search, size: 18, color: subTextColor),
-                                        contentPadding: EdgeInsets.zero,
-                                        filled: true,
-                                        fillColor: isDark ? const Color(0xFF222222) : const Color(0xFFF1F5F9),
-                                        border: OutlineInputBorder(
-                                          borderRadius: BorderRadius.circular(12),
-                                          borderSide: BorderSide(color: borderColor),
+                                  Row(
+                                    children: [
+                                      if (isAdmin && relevantBranchId != null)
+                                        Padding(
+                                          padding: const EdgeInsets.only(right: 12),
+                                          child: OutlinedButton.icon(
+                                            icon: const Icon(Icons.vpn_key_outlined, size: 16),
+                                            label: const Text('Override Codes'),
+                                            onPressed: () => _showManageOverrideCodesDialog(
+                                                relevantBranchId, _branchName ?? 'This Branch'),
+                                          ),
                                         ),
-                                        enabledBorder: OutlineInputBorder(
-                                          borderRadius: BorderRadius.circular(12),
-                                          borderSide: BorderSide(color: borderColor),
-                                        ),
-                                        focusedBorder: OutlineInputBorder(
-                                          borderRadius: BorderRadius.circular(12),
-                                          borderSide: const BorderSide(color: Color(0xFFF59E0B)),
+                                      SizedBox(
+                                        width: 260,
+                                        height: 42,
+                                        child: TextField(
+                                          controller: _filterController,
+                                          onChanged: (val) => setState(() => _searchFilter = val),
+                                          style: TextStyle(fontSize: 13, color: textColor),
+                                          decoration: InputDecoration(
+                                            hintText: 'Filter Manifests...',
+                                            hintStyle: TextStyle(fontSize: 12, color: subTextColor),
+                                            prefixIcon: Icon(Icons.search, size: 18, color: subTextColor),
+                                            contentPadding: EdgeInsets.zero,
+                                            filled: true,
+                                            fillColor: isDark ? const Color(0xFF222222) : const Color(0xFFF1F5F9),
+                                            border: OutlineInputBorder(
+                                              borderRadius: BorderRadius.circular(12),
+                                              borderSide: BorderSide(color: borderColor),
+                                            ),
+                                            enabledBorder: OutlineInputBorder(
+                                              borderRadius: BorderRadius.circular(12),
+                                              borderSide: BorderSide(color: borderColor),
+                                            ),
+                                            focusedBorder: OutlineInputBorder(
+                                              borderRadius: BorderRadius.circular(12),
+                                              borderSide: const BorderSide(color: Color(0xFFF59E0B)),
+                                            ),
+                                          ),
                                         ),
                                       ),
-                                    ),
+                                    ],
                                   ),
                                 ],
                               ),
@@ -295,6 +604,33 @@ class _OrdersPageState extends State<OrdersPage> {
                                 ],
                               ),
                             ),
+
+                            if (_selectedTab == 1 && todaysCancelCount >= _dailyCancelLimit) ...[
+                              const SizedBox(height: 16),
+                              Container(
+                                width: double.infinity,
+                                padding: const EdgeInsets.all(12),
+                                decoration: BoxDecoration(
+                                  color: Colors.red.withOpacity(isDark ? 0.15 : 0.08),
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(color: Colors.red.withOpacity(0.3)),
+                                ),
+                                child: Row(
+                                  children: [
+                                    const Icon(Icons.lock_clock, color: Colors.redAccent, size: 18),
+                                    const SizedBox(width: 10),
+                                    Expanded(
+                                      child: Text(
+                                        'This branch has hit $todaysCancelCount walk-in cancellations today. Further cancellations need a manager override code.',
+                                        style: const TextStyle(
+                                            fontSize: 12, color: Colors.redAccent, fontWeight: FontWeight.bold),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+
                             const SizedBox(height: 20),
 
                             Row(
@@ -626,7 +962,13 @@ class _OrdersPageState extends State<OrdersPage> {
                                                                     ),
                                                                     const SizedBox(width: 8),
                                                                     OutlinedButton(
-                                                                      onPressed: () => _updateOrderStatus(orderId, 'CANCELLED'),
+                                                                      // Routed through the new limit-aware handler
+                                                                      // instead of calling _updateOrderStatus
+                                                                      // directly — this is the only line that
+                                                                      // actually changes the CANCEL button's
+                                                                      // behavior.
+                                                                      onPressed: () => _handleCancelWalkIn(
+                                                                          orderId, order, todaysCancelCount),
                                                                       style: OutlinedButton.styleFrom(
                                                                         foregroundColor: Colors.redAccent,
                                                                         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -682,7 +1024,6 @@ class _OrdersPageState extends State<OrdersPage> {
     );
   }
 
-  // --- Top Navigation Bar (dropdown crash-guarded + live profile data) ---
   Widget _buildTopBar(Color cardColor, Color textColor, Color subTextColor, Color borderColor, bool isDark, bool isSuperAdmin, User? user, String role, bool isAdmin) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -820,7 +1161,6 @@ class _OrdersPageState extends State<OrdersPage> {
     );
   }
 
-  // --- Shared Metric Component ---
   Widget _buildMetricBox(
       String label,
       String value,
@@ -896,7 +1236,6 @@ class _OrdersPageState extends State<OrdersPage> {
     );
   }
 
-  // --- Shared Tab Button ---
   Widget _buildTabBtn({
     required int index,
     required String label,
