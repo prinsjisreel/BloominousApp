@@ -22,9 +22,6 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
   bool _obscurePassword = true;
   bool _rememberMe = false;
 
-  // --- Fraud/Lockout state (mirrors AuthPage's customer-side logic,
-  // but scoped separately so a customer's failed attempts never lock
-  // out this admin/employee portal, and vice versa) ---
   final DeviceSecurityService _securityService =
   DeviceSecurityService(scope: 'employee');
   int _remainingLockoutSeconds = 0;
@@ -34,18 +31,17 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
   @override
   void initState() {
     super.initState();
-    _isRateLimited(); // Check on screen open in case this device is already locked out
+    _isRateLimited();
   }
 
   @override
   void dispose() {
-    _lockoutTimer?.cancel(); // prevent setState-after-dispose crash / leak
+    _lockoutTimer?.cancel();
     emailController.dispose();
     passwordController.dispose();
     super.dispose();
   }
 
-  // --- FRAUD & RATE LIMITING HELPERS ---
   Future<bool> _isRateLimited() async {
     final rateLimit = await _securityService.checkRateLimit();
     if (rateLimit['locked'] == true) {
@@ -77,20 +73,7 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
       });
     }
   }
-  // -------------------------------------
 
-  /// New-device visibility for the admin portal, matching the soft
-  /// notification-only approach already used for flagged customer
-  /// accounts (see set_session.php) — this NEVER blocks login. A
-  /// staff/admin account's own known devices are tracked separately
-  /// from `banned_devices`, which exists for CUSTOMER fraud and has
-  /// nothing to do with credential-theft risk on a trusted account.
-  ///
-  /// The very first login after this feature ships gets treated as
-  /// baseline setup (no alert, just starts tracking) — otherwise every
-  /// existing staff account would trigger a false alarm the next time
-  /// they log in, purely because they'd never had a device recorded
-  /// before.
   Future<void> _checkAndTrackDevice(String uid, String displayEmail) async {
     try {
       final deviceHash = await _securityService.getDeviceHash();
@@ -122,16 +105,13 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
         });
       }
     } catch (e) {
-      // Best-effort, same philosophy as every other fraud-adjacent
-      // logging call in this project — a tracking failure must never
-      // stop a legitimate staff member from getting into the dashboard.
       debugPrint('Device tracking failed (login still proceeds): $e');
     }
   }
 
   Future<void> _login() async {
     if (!_formKey.currentState!.validate()) return;
-    if (await _isRateLimited()) return; // Blocks the call entirely while locked out
+    if (await _isRateLimited()) return;
 
     setState(() => isLoading = true);
     try {
@@ -144,8 +124,8 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
         final role = await InventoryData.getUserRole(credential.user!.uid);
         if (role == null || role == 'customer') {
           await FirebaseAuth.instance.signOut();
-          await _securityService.recordFailedAttempt(); // A customer probing the admin portal still counts as a strike
-          await _isRateLimited(); // refresh countdown UI immediately
+          await _securityService.recordFailedAttempt();
+          await _isRateLimited();
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
@@ -168,12 +148,8 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
           return;
         }
 
-        // Successful, authorized login — clear the strike counter.
         await _securityService.resetAttempts();
 
-        // New-device visibility check — runs for every authorized
-        // portal role (admin, super-admin, staff, employee, delivery),
-        // since this is the one shared login point for all of them.
         await _checkAndTrackDevice(
             credential.user!.uid, emailController.text.trim());
 
@@ -248,6 +224,12 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
       return;
     }
 
+    // Previously unprotected — every other sensitive action on this
+    // page (login, login failure) goes through this same rate limiter.
+    // This button was the one gap letting someone hammer password-reset
+    // emails at any address with zero throttling.
+    if (await _isRateLimited()) return;
+
     try {
       await FirebaseAuth.instance.sendPasswordResetEmail(
         email: emailController.text.trim(),
@@ -261,6 +243,8 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
         );
       }
     } catch (e) {
+      await _securityService.recordFailedAttempt();
+      await _isRateLimited();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red),
@@ -294,7 +278,6 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  // Logo Container
                   Container(
                     width: 100,
                     height: 100,
@@ -332,7 +315,6 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
                   ),
                   const SizedBox(height: 40),
 
-                  // Login Card
                   Container(
                     padding: const EdgeInsets.all(24),
                     decoration: BoxDecoration(
@@ -409,7 +391,6 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
                             },
                           ),
 
-                          // --- LOCKOUT WARNING UI ---
                           if (_superAdminLocked || _remainingLockoutSeconds > 0)
                             Container(
                               width: double.infinity,
@@ -441,7 +422,6 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
                                 ],
                               ),
                             ),
-                          // ---------------------------------------------------------------
 
                           const SizedBox(height: 12),
                           Row(

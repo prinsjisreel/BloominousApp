@@ -293,16 +293,7 @@ class _AuthPageState extends State<AuthPage> {
       } catch (authError) {
         final query = await _firestore.collection('customers').where('email', isEqualTo: email).limit(1).get();
         if (query.docs.isNotEmpty) {
-          final userData = query.docs.first.data();
-          final storedPassword = userData['password'];
-          if (storedPassword == password) {
-            userCredential = await FirebaseAuth.instance.createUserWithEmailAndPassword(
-              email: email,
-              password: password,
-            );
-          } else {
-            throw Exception('Incorrect password.');
-          }
+          throw Exception('Incorrect password. If this is an older account, please use "Forgot Password?" to reset it securely.');
         } else {
           throw Exception('Account not found. Please click "REGISTER HERE" to sign up.');
         }
@@ -501,8 +492,34 @@ class _AuthPageState extends State<AuthPage> {
         await _registrationRiskService.recordScore(riskResult.scoreBump);
       }
 
-      // Triggers the Hostinger custom PHPMailer script over HTTP POST
-      await _emailVerificationService.sendVerificationEmail();
+      // Tries the branded custom email FIRST (via
+      // send_verification_email.php), and only falls back to Firebase's
+      // own native sendEmailVerification() if that fails for ANY
+      // reason — network error, non-success response, or a stale
+      // CDN-cached reply we can't yet be certain is fixed (Hostinger's
+      // forced CDN on this temporary subdomain was confirmed via
+      // canary-string testing to serve stale responses from this exact
+      // endpoint; the no-cache header fix in bloom_json_response() may
+      // or may not be enough on its own). This guarantees the customer
+      // always gets SOME verification email either way.
+      bool primarySucceeded = false;
+      try {
+        final result = await _emailVerificationService.sendVerificationEmail();
+        primarySucceeded = result.success;
+        if (!result.success) {
+          debugPrint('Custom verification email failed (${result.message}) — falling back to Firebase native.');
+        }
+      } catch (verifyError) {
+        debugPrint('Custom verification email threw an exception — falling back to Firebase native: $verifyError');
+      }
+
+      if (!primarySucceeded) {
+        try {
+          await userCredential.user!.sendEmailVerification();
+        } catch (fallbackError) {
+          debugPrint('Firebase native sendEmailVerification also failed: $fallbackError');
+        }
+      }
 
       if (mounted) {
         Navigator.pushReplacement(
@@ -526,255 +543,246 @@ class _AuthPageState extends State<AuthPage> {
     final borderColor = isDark ? const Color(0xFF3F382F) : const Color(0xFFE0E0E0);
     final inputFillColor = isDark ? const Color(0xFF221D17) : Colors.white;
 
-    final screenWidth = MediaQuery.of(context).size.width;
-    final horizontalCardPadding = screenWidth < 400 ? 20.0 : 40.0;
-
     return Scaffold(
       backgroundColor: bgColor,
-      body: SafeArea(
-        child: Center(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 40.0),
-            child: Container(
-              constraints: const BoxConstraints(maxWidth: 450),
-              padding: EdgeInsets.symmetric(horizontal: horizontalCardPadding, vertical: 56.0),
-              decoration: BoxDecoration(
-                color: cardColor,
-                borderRadius: BorderRadius.circular(24),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withOpacity(isDark ? 0.4 : 0.04),
-                    blurRadius: 40,
-                    offset: const Offset(0, 10),
+      body: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 40.0),
+          child: Container(
+            constraints: const BoxConstraints(maxWidth: 450),
+            padding: const EdgeInsets.symmetric(horizontal: 40.0, vertical: 56.0),
+            decoration: BoxDecoration(
+              color: cardColor,
+              borderRadius: BorderRadius.circular(24),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(isDark ? 0.4 : 0.04),
+                  blurRadius: 40,
+                  offset: const Offset(0, 10),
+                ),
+              ],
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  'B L O O M',
+                  textAlign: TextAlign.center,
+                  style: GoogleFonts.cormorantGaramond(
+                    fontSize: 32,
+                    fontWeight: FontWeight.bold,
+                    color: _primaryGold,
+                    letterSpacing: 4.0,
                   ),
-                ],
-              ),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Text(
-                    'B L O O M',
-                    textAlign: TextAlign.center,
-                    style: GoogleFonts.cormorantGaramond(
-                      fontSize: 32,
-                      fontWeight: FontWeight.bold,
-                      color: _primaryGold,
-                      letterSpacing: 4.0,
-                    ),
+                ),
+                const SizedBox(height: 24),
+                Text(
+                  _isSigningUp ? 'Create an Account' : 'Authenticated Access',
+                  textAlign: TextAlign.center,
+                  style: GoogleFonts.cormorantGaramond(
+                    fontSize: 34,
+                    color: textColor,
+                    fontWeight: FontWeight.w600,
+                    height: 1.1,
                   ),
-                  const SizedBox(height: 24),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  _isSigningUp ? 'CUSTOMER REGISTRATION' : 'MANAGEMENT CONSOLE LOGIN',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: subTextColor,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.8,
+                  ),
+                ),
+                const SizedBox(height: 48),
 
-                  Text(
-                    _isSigningUp ? 'Create an Account' : 'Authenticated Access',
-                    textAlign: TextAlign.center,
-                    style: GoogleFonts.cormorantGaramond(
-                      fontSize: 34,
-                      color: textColor,
-                      fontWeight: FontWeight.w600,
-                      height: 1.1,
+                if (_superAdminLocked || _remainingLockoutSeconds > 0)
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    margin: const EdgeInsets.only(bottom: 24),
+                    decoration: BoxDecoration(
+                      color: Colors.red.withOpacity(isDark ? 0.15 : 0.05),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.red.withOpacity(0.3)),
                     ),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    _isSigningUp ? 'CUSTOMER REGISTRATION' : 'MANAGEMENT CONSOLE LOGIN',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: subTextColor,
-                      fontWeight: FontWeight.w700,
-                      letterSpacing: 1.8,
-                    ),
-                  ),
-                  const SizedBox(height: 48),
-
-                  if (_superAdminLocked || _remainingLockoutSeconds > 0)
-                    Container(
-                      padding: const EdgeInsets.all(12),
-                      margin: const EdgeInsets.only(bottom: 24),
-                      decoration: BoxDecoration(
-                        color: Colors.red.withOpacity(isDark ? 0.15 : 0.05),
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: Colors.red.withOpacity(0.3)),
-                      ),
-                      child: Row(
-                        children: [
-                          const Icon(Icons.lock_clock, color: Colors.redAccent, size: 20),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: Text(
-                              _superAdminLocked
-                                  ? 'Account locked. Please coordinate with a Super Admin.'
-                                  : 'Too many attempts. Please wait $_remainingLockoutSeconds seconds.',
-                              style: const TextStyle(color: Colors.redAccent, fontSize: 13, fontWeight: FontWeight.bold),
-                            ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.lock_clock, color: Colors.redAccent, size: 20),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            _superAdminLocked
+                                ? 'Account locked. Please coordinate with a Super Admin.'
+                                : 'Too many attempts. Please wait $_remainingLockoutSeconds seconds.',
+                            style: const TextStyle(color: Colors.redAccent, fontSize: 13, fontWeight: FontWeight.bold),
                           ),
-                        ],
-                      ),
-                    ),
-
-                  if (_isSigningUp) ...[
-                    _buildTextField(
-                      controller: _firstNameController,
-                      hint: 'First Name',
-                      textColor: textColor,
-                      subTextColor: subTextColor,
-                      borderColor: borderColor,
-                      fillColor: inputFillColor,
-                    ),
-                    _buildTextField(
-                      controller: _middleNameController,
-                      hint: 'Middle Name',
-                      textColor: textColor,
-                      subTextColor: subTextColor,
-                      borderColor: borderColor,
-                      fillColor: inputFillColor,
-                    ),
-                    _buildTextField(
-                      controller: _lastNameController,
-                      hint: 'Last Name',
-                      textColor: textColor,
-                      subTextColor: subTextColor,
-                      borderColor: borderColor,
-                      fillColor: inputFillColor,
-                    ),
-
-                    GestureDetector(
-                      onTap: () async {
-                        final date = await showDatePicker(
-                          context: context,
-                          initialDate: DateTime(2000),
-                          firstDate: DateTime(1950),
-                          lastDate: DateTime.now(),
-                        );
-                        if (date != null) setState(() => _selectedBirthday = date);
-                      },
-                      child: Container(
-                        margin: const EdgeInsets.only(bottom: 16),
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 18),
-                        decoration: BoxDecoration(
-                          color: inputFillColor,
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: borderColor, width: 1),
                         ),
-                        child: Text(
-                          _selectedBirthday == null ? 'Select Birthday' : 'Birthday: ${_selectedBirthday!.toIso8601String().split('T')[0]}',
-                          style: TextStyle(color: _selectedBirthday == null ? subTextColor : textColor, fontSize: 15),
-                        ),
-                      ),
+                      ],
                     ),
+                  ),
 
-                    Container(
+                if (_isSigningUp) ...[
+                  _buildTextField(
+                    controller: _firstNameController,
+                    hint: 'First Name',
+                    textColor: textColor,
+                    subTextColor: subTextColor,
+                    borderColor: borderColor,
+                    fillColor: inputFillColor,
+                  ),
+                  _buildTextField(
+                    controller: _middleNameController,
+                    hint: 'Middle Name',
+                    textColor: textColor,
+                    subTextColor: subTextColor,
+                    borderColor: borderColor,
+                    fillColor: inputFillColor,
+                  ),
+                  _buildTextField(
+                    controller: _lastNameController,
+                    hint: 'Last Name',
+                    textColor: textColor,
+                    subTextColor: subTextColor,
+                    borderColor: borderColor,
+                    fillColor: inputFillColor,
+                  ),
+                  GestureDetector(
+                    onTap: () async {
+                      final date = await showDatePicker(
+                        context: context,
+                        initialDate: DateTime(2000),
+                        firstDate: DateTime(1950),
+                        lastDate: DateTime.now(),
+                      );
+                      if (date != null) setState(() => _selectedBirthday = date);
+                    },
+                    child: Container(
                       margin: const EdgeInsets.only(bottom: 16),
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 18),
                       decoration: BoxDecoration(
                         color: inputFillColor,
                         borderRadius: BorderRadius.circular(12),
                         border: Border.all(color: borderColor, width: 1),
                       ),
-                      child: DropdownButtonHideUnderline(
-                        child: DropdownButton<String>(
-                          value: _selectedSex,
-                          isExpanded: true,
-                          dropdownColor: cardColor,
-                          icon: Icon(Icons.arrow_drop_down, color: subTextColor),
-                          style: TextStyle(color: textColor, fontSize: 15),
-                          items: const [
-                            DropdownMenuItem(value: 'Male', child: Text('Male')),
-                            DropdownMenuItem(value: 'Female', child: Text('Female')),
-                          ],
-                          onChanged: (val) => setState(() => _selectedSex = val!),
-                        ),
+                      child: Text(
+                        _selectedBirthday == null ? 'Select Birthday' : 'Birthday: ${_selectedBirthday!.toIso8601String().split('T')[0]}',
+                        style: TextStyle(color: _selectedBirthday == null ? subTextColor : textColor, fontSize: 15),
+                      ),
+                    ),
+                  ),
+                  Container(
+                    margin: const EdgeInsets.only(bottom: 16),
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: inputFillColor,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: borderColor, width: 1),
+                    ),
+                    child: DropdownButtonHideUnderline(
+                      child: DropdownButton<String>(
+                        value: _selectedSex,
+                        isExpanded: true,
+                        dropdownColor: cardColor,
+                        icon: Icon(Icons.arrow_drop_down, color: subTextColor),
+                        style: TextStyle(color: textColor, fontSize: 15),
+                        items: const [
+                          DropdownMenuItem(value: 'Male', child: Text('Male')),
+                          DropdownMenuItem(value: 'Female', child: Text('Female')),
+                        ],
+                        onChanged: (val) => setState(() => _selectedSex = val!),
+                      ),
+                    ),
+                  ),
+                ],
+
+                _buildTextField(
+                  controller: _emailController,
+                  hint: 'Email Address',
+                  keyboardType: TextInputType.emailAddress,
+                  textColor: textColor,
+                  subTextColor: subTextColor,
+                  borderColor: borderColor,
+                  fillColor: inputFillColor,
+                ),
+
+                _buildTextField(
+                  controller: _passwordController,
+                  hint: 'Password',
+                  isPassword: true,
+                  obscureText: _obscurePassword,
+                  onToggleVisibility: () => setState(() => _obscurePassword = !_obscurePassword),
+                  textColor: textColor,
+                  subTextColor: subTextColor,
+                  borderColor: borderColor,
+                  fillColor: inputFillColor,
+                ),
+
+                if (_isSigningUp)
+                  _buildTextField(
+                    controller: _confirmPasswordController,
+                    hint: 'Confirm Password',
+                    isPassword: true,
+                    obscureText: _obscurePassword,
+                    textColor: textColor,
+                    subTextColor: subTextColor,
+                    borderColor: borderColor,
+                    fillColor: inputFillColor,
+                  ),
+
+                if (!_isSigningUp)
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton(
+                      onPressed: _forgotPassword,
+                      style: TextButton.styleFrom(
+                        padding: EdgeInsets.zero,
+                        minimumSize: const Size(50, 30),
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      child: Text(
+                        'Forgot Password?',
+                        style: TextStyle(color: subTextColor, fontSize: 13, fontWeight: FontWeight.bold),
+                      ),
+                    ),
+                  ),
+
+                const SizedBox(height: 32),
+
+                _buildPrimaryButton(
+                  onPressed: (_isLoading || _superAdminLocked || _remainingLockoutSeconds > 0)
+                      ? null
+                      : (_isSigningUp ? _handleContinue : _loginWithPassword),
+                  text: _isSigningUp ? 'REGISTER' : 'LOGIN',
+                  isLoading: _isLoading,
+                ),
+
+                const SizedBox(height: 32),
+
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Text(
+                      _isSigningUp ? "Already have an account?  " : "Don't have an account?  ",
+                      style: TextStyle(color: subTextColor, fontSize: 13, fontWeight: FontWeight.bold),
+                    ),
+                    GestureDetector(
+                      onTap: () => setState(() {
+                        _isSigningUp = !_isSigningUp;
+                        _emailController.clear();
+                        _passwordController.clear();
+                      }),
+                      child: Text(
+                        _isSigningUp ? 'LOGIN HERE' : 'REGISTER HERE',
+                        style: TextStyle(color: textColor, fontSize: 13, fontWeight: FontWeight.bold),
                       ),
                     ),
                   ],
-
-                  _buildTextField(
-                    controller: _emailController,
-                    hint: 'Email Address',
-                    keyboardType: TextInputType.emailAddress,
-                    textColor: textColor,
-                    subTextColor: subTextColor,
-                    borderColor: borderColor,
-                    fillColor: inputFillColor,
-                  ),
-
-                  _buildTextField(
-                    controller: _passwordController,
-                    hint: 'Password',
-                    isPassword: true,
-                    obscureText: _obscurePassword,
-                    onToggleVisibility: () => setState(() => _obscurePassword = !_obscurePassword),
-                    textColor: textColor,
-                    subTextColor: subTextColor,
-                    borderColor: borderColor,
-                    fillColor: inputFillColor,
-                  ),
-
-                  if (_isSigningUp)
-                    _buildTextField(
-                      controller: _confirmPasswordController,
-                      hint: 'Confirm Password',
-                      isPassword: true,
-                      obscureText: _obscurePassword,
-                      textColor: textColor,
-                      subTextColor: subTextColor,
-                      borderColor: borderColor,
-                      fillColor: inputFillColor,
-                    ),
-
-                  if (!_isSigningUp)
-                    Align(
-                      alignment: Alignment.centerRight,
-                      child: TextButton(
-                        onPressed: _forgotPassword,
-                        style: TextButton.styleFrom(
-                          padding: EdgeInsets.zero,
-                          minimumSize: const Size(50, 30),
-                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                        ),
-                        child: Text(
-                          'Forgot Password?',
-                          style: TextStyle(color: subTextColor, fontSize: 13, fontWeight: FontWeight.bold),
-                        ),
-                      ),
-                    ),
-
-                  const SizedBox(height: 32),
-
-                  _buildPrimaryButton(
-                    onPressed: (_isLoading || _superAdminLocked || _remainingLockoutSeconds > 0)
-                        ? null
-                        : (_isSigningUp ? _handleContinue : _loginWithPassword),
-                    text: _isSigningUp ? 'REGISTER' : 'LOGIN',
-                    isLoading: _isLoading,
-                  ),
-
-                  const SizedBox(height: 32),
-
-                  Wrap(
-                    alignment: WrapAlignment.center,
-                    crossAxisAlignment: WrapCrossAlignment.center,
-                    children: [
-                      Text(
-                        _isSigningUp ? "Already have an account?  " : "Don't have an account?  ",
-                        style: TextStyle(color: subTextColor, fontSize: 13, fontWeight: FontWeight.bold),
-                      ),
-                      GestureDetector(
-                        onTap: () => setState(() {
-                          _isSigningUp = !_isSigningUp;
-                          _emailController.clear();
-                          _passwordController.clear();
-                        }),
-                        child: Text(
-                          _isSigningUp ? 'LOGIN HERE' : 'REGISTER HERE',
-                          style: TextStyle(color: textColor, fontSize: 13, fontWeight: FontWeight.bold),
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
+                ),
+              ],
             ),
           ),
         ),

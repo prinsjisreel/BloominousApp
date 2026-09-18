@@ -4,6 +4,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:intl/intl.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'inventory_data.dart';
 import 'app_sidebar.dart';
@@ -19,16 +20,6 @@ class PreordersPage extends StatefulWidget {
 class _PreordersPageState extends State<PreordersPage> {
   final FirebaseFirestore _db = FirebaseFirestore.instance;
 
-  // --- FIXED: reservations live at branches/{branchId}/reservations, not
-  // a flat top-level 'reservations' collection. That's why the earlier
-  // version hit permission-denied — it was querying a path with no
-  // matching rule, which falls through to the global deny-all.
-  //
-  // When a specific branch is selected: query that branch's subcollection
-  // directly. When viewing "All Branches" (branchId == null, super-admin
-  // only): use a collectionGroup query, which searches every subcollection
-  // named 'reservations' anywhere in the database in one request — the
-  // correct tool for "give me this data across every branch at once."
   Stream<List<Map<String, dynamic>>> _reservationsStream() {
     final branchId = InventoryData.selectedBranchId;
 
@@ -38,13 +29,6 @@ class _PreordersPageState extends State<PreordersPage> {
 
     return query.orderBy('created_at', descending: true).snapshots().map(
           (snap) => snap.docs.map((d) {
-        // doc.reference.parent is the 'reservations' subcollection;
-        // .parent again is the specific branch DOCUMENT that owns it.
-        // Capturing that branch ID here means every write action below
-        // (approve/decline/advance/cancel) knows exactly which
-        // branches/{id}/reservations/{docId} path to write back to,
-        // even when this list came from a cross-branch collectionGroup
-        // query where no single branchId was assumed up front.
         final branchIdFromPath = d.reference.parent.parent?.id ?? '';
         return {...d.data(), 'id': d.id, '_branchId': branchIdFromPath};
       }).toList(),
@@ -53,6 +37,304 @@ class _PreordersPageState extends State<PreordersPage> {
 
   DocumentReference<Map<String, dynamic>> _reservationRef(String branchId, String id) {
     return _db.collection('branches').doc(branchId).collection('reservations').doc(id);
+  }
+
+  String _formatDateStr(DateTime d) =>
+      '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+
+  Future<void> _callCustomer(String phone) async {
+    final uri = Uri(scheme: 'tel', path: phone);
+    final launched = await launchUrl(uri);
+    if (!launched && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not open dialer for $phone')),
+      );
+    }
+  }
+
+  // --- Reservation Settings (GLOBAL, not per-branch) ---
+
+  // FIXED: defaults to 1 instead of null when the config doc doesn't
+  // exist yet or has no value saved -- "unlimited" is no longer a valid
+  // state anywhere in this feature. A brand-new install, before the
+  // owner ever opens this settings sheet, now behaves as "max 1
+  // reservation per day" rather than accidentally allowing unlimited
+  // bookings by default.
+  Stream<int> _maxDailyCapacityStream() {
+    return _db.collection('settings').doc('reservation_config').snapshots().map(
+          (doc) => (doc.data()?['maxDailyCapacity'] as int?) ?? 1,
+    );
+  }
+
+  // FIXED: added error handling + user feedback. Previously a failed
+  // write here (permission issue, network drop, anything) produced
+  // zero visible feedback -- the sheet just looked like nothing
+  // happened, which is exactly the symptom reported. Also removed the
+  // "leave blank for unlimited" behavior -- blank input now saves as 1,
+  // the enforced minimum, not null/unlimited.
+  Future<void> _saveMaxDailyCapacity(String rawValue) async {
+    final parsed = int.tryParse(rawValue.trim());
+    final value = (parsed == null || parsed < 1) ? 1 : parsed;
+    try {
+      await _db.collection('settings').doc('reservation_config').set({
+        'maxDailyCapacity': value,
+        'updated_at': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Saved: max $value reservation(s) per day'), backgroundColor: const Color(0xFF10B981)),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not save: $e'), backgroundColor: Colors.red),
+        );
+      }
+    }
+  }
+
+  // Already global/branch-independent -- top-level 'blocked_dates'
+  // collection, no branchId anywhere in this query. A blocked date
+  // shows here and blocks bookings regardless of which branch (or "All
+  // Branches") is currently selected elsewhere in the app.
+  Stream<List<Map<String, dynamic>>> _blockedDatesStream() {
+    final todayStr = _formatDateStr(DateTime.now());
+    return _db.collection('blocked_dates').snapshots().map((snap) {
+      final docs = snap.docs
+          .map((d) => {...d.data(), 'date': d.id})
+          .where((d) => (d['date'] as String).compareTo(todayStr) >= 0)
+          .toList();
+      docs.sort((a, b) => (a['date'] as String).compareTo(b['date'] as String));
+      return docs;
+    });
+  }
+
+  // FIXED: wrapped in try/catch with explicit success/failure feedback --
+  // this was the actual bug. A silent failure here (e.g. a rules-publish
+  // delay, a stale connection) previously left no trace at all, making
+  // it look like "blocking a date does nothing."
+  Future<void> _blockDate(DateTime date) async {
+    final dateStr = _formatDateStr(date);
+    try {
+      await _db.collection('blocked_dates').doc(dateStr).set({
+        'isBlocked': true,
+        'blocked_at': FieldValue.serverTimestamp(),
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('${DateFormat('MMM d, yyyy').format(date)} is now blocked'), backgroundColor: const Color(0xFF10B981)),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not block this date: $e'), backgroundColor: Colors.red),
+        );
+      }
+    }
+  }
+
+  Future<void> _unblockDate(String dateStr) async {
+    try {
+      await _db.collection('blocked_dates').doc(dateStr).delete();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Date unblocked'), backgroundColor: Color(0xFF10B981)),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not unblock this date: $e'), backgroundColor: Colors.red),
+        );
+      }
+    }
+  }
+
+  void _showReservationSettings(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) {
+        return DraggableScrollableSheet(
+          initialChildSize: 0.75,
+          minChildSize: 0.5,
+          maxChildSize: 0.95,
+          expand: false,
+          builder: (context, scrollController) {
+            final cardColor = isDark ? const Color(0xFF1A1A1A) : Colors.white;
+            final textColor = isDark ? Colors.white : const Color(0xFF1E293B);
+            final subTextColor = isDark ? Colors.grey[400]! : Colors.grey[600]!;
+            final borderColor = isDark ? const Color(0xFF2A2A2A) : Colors.grey.withValues(alpha: 0.2);
+
+            return Container(
+              decoration: BoxDecoration(color: cardColor, borderRadius: const BorderRadius.vertical(top: Radius.circular(24))),
+              child: Column(
+                children: [
+                  const SizedBox(height: 12),
+                  Container(
+                    width: 40,
+                    height: 4,
+                    decoration: BoxDecoration(color: Colors.grey.withValues(alpha: 0.3), borderRadius: BorderRadius.circular(2)),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('Reservation Settings', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: textColor)),
+                        Text('Applies to all branches — booking availability is set once, business-wide.',
+                            style: TextStyle(fontSize: 11, color: subTextColor)),
+                      ],
+                    ),
+                  ),
+                  Expanded(
+                    child: ListView(
+                      controller: scrollController,
+                      padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
+                      children: [
+                        // --- Section 1: max reservations per day (global, minimum 1) ---
+                        Text('MAX RESERVATIONS PER DAY', style: TextStyle(fontSize: 10, fontWeight: FontWeight.w800, color: subTextColor, letterSpacing: 0.5)),
+                        const SizedBox(height: 8),
+                        StreamBuilder<int>(
+                          stream: _maxDailyCapacityStream(),
+                          builder: (context, snap) {
+                            // Rebuilds the controller's starting text whenever
+                            // the live value changes -- since this stream
+                            // now always resolves to a real int (default 1),
+                            // the field is never blank/ambiguous.
+                            final current = snap.data ?? 1;
+                            final controller = TextEditingController(text: current.toString());
+                            return Row(
+                              children: [
+                                Expanded(
+                                  child: TextField(
+                                    controller: controller,
+                                    keyboardType: TextInputType.number,
+                                    decoration: InputDecoration(
+                                      labelText: 'Minimum 1',
+                                      isDense: true,
+                                      filled: true,
+                                      fillColor: isDark ? const Color(0xFF262626) : const Color(0xFFFAFAFA),
+                                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                ElevatedButton(
+                                  onPressed: () => _saveMaxDailyCapacity(controller.text),
+                                  style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFF59E0B), foregroundColor: Colors.white),
+                                  child: const Text('SAVE'),
+                                ),
+                              ],
+                            );
+                          },
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          'Caps how many reservations can be booked on any single day, counted across every branch combined. There is no unlimited option — the minimum is 1.',
+                          style: TextStyle(fontSize: 10.5, color: subTextColor, fontStyle: FontStyle.italic),
+                        ),
+
+                        const SizedBox(height: 28),
+                        Divider(color: borderColor),
+                        const SizedBox(height: 16),
+
+                        // --- Section 2: blocked dates (global, no capacity here) ---
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Expanded(
+                              child: Text('UNAVAILABLE DATES', style: TextStyle(fontSize: 10, fontWeight: FontWeight.w800, color: subTextColor, letterSpacing: 0.5)),
+                            ),
+                            TextButton.icon(
+                              onPressed: () async {
+                                final picked = await showDatePicker(
+                                  context: context,
+                                  initialDate: DateTime.now(),
+                                  firstDate: DateTime.now(),
+                                  lastDate: DateTime.now().add(const Duration(days: 365)),
+                                );
+                                if (picked != null) await _blockDate(picked);
+                              },
+                              icon: const Icon(Icons.block, size: 14),
+                              label: const Text('Block a Date', style: TextStyle(fontSize: 12)),
+                              style: TextButton.styleFrom(foregroundColor: Colors.red),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'Dates marked here cannot be selected by customers at all, regardless of the daily cap above. Shown here for every branch — this list is not filtered by branch selection.',
+                          style: TextStyle(fontSize: 10.5, color: subTextColor, fontStyle: FontStyle.italic),
+                        ),
+                        const SizedBox(height: 12),
+                        StreamBuilder<List<Map<String, dynamic>>>(
+                          stream: _blockedDatesStream(),
+                          builder: (context, snap) {
+                            if (snap.hasError) {
+                              return Padding(
+                                padding: const EdgeInsets.symmetric(vertical: 16),
+                                child: Text('Could not load blocked dates: ${snap.error}',
+                                    style: const TextStyle(fontSize: 12, color: Colors.red)),
+                              );
+                            }
+                            if (snap.connectionState == ConnectionState.waiting) {
+                              return const Padding(
+                                padding: EdgeInsets.symmetric(vertical: 16),
+                                child: Center(child: CircularProgressIndicator(color: Color(0xFFF59E0B))),
+                              );
+                            }
+                            final blocked = snap.data ?? [];
+                            if (blocked.isEmpty) {
+                              return Padding(
+                                padding: const EdgeInsets.symmetric(vertical: 16),
+                                child: Text('No dates are currently blocked.', style: TextStyle(fontSize: 12, color: subTextColor)),
+                              );
+                            }
+                            return Column(
+                              children: blocked.map((b) {
+                                final dateStr = b['date'] as String;
+                                final parsed = DateTime.tryParse(dateStr);
+                                final label = parsed != null ? DateFormat('MMM d, yyyy (EEE)').format(parsed) : dateStr;
+                                return Container(
+                                  margin: const EdgeInsets.only(bottom: 8),
+                                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                                  decoration: BoxDecoration(
+                                    color: Colors.red.withValues(alpha: 0.06),
+                                    borderRadius: BorderRadius.circular(12),
+                                    border: Border.all(color: borderColor),
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      const Icon(Icons.block, size: 16, color: Colors.red),
+                                      const SizedBox(width: 10),
+                                      Expanded(child: Text(label, style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: textColor))),
+                                      TextButton(
+                                        onPressed: () => _unblockDate(dateStr),
+                                        child: const Text('Unblock', style: TextStyle(fontSize: 11, color: Colors.red)),
+                                      ),
+                                    ],
+                                  ),
+                                );
+                              }).toList(),
+                            );
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
   }
 
   Future<bool> _confirm(String title, String message, Color color) async {
@@ -74,22 +356,22 @@ class _PreordersPageState extends State<PreordersPage> {
     return result ?? false;
   }
 
-  Future<void> _approveBooking(String branchId, String id) async {
+  Future<void> _reserveBooking(String branchId, String id) async {
     final ok = await _confirm(
-      'Approve Event Booking?',
+      'Reserve This Booking?',
       'It will move into the fulfillment pipeline.',
       Colors.blue,
     );
     if (!ok) return;
     try {
       await _reservationRef(branchId, id).update({
-        'status': 'Approved',
+        'status': 'Reserved',
         'approved_by': FirebaseAuth.instance.currentUser?.email ?? 'Admin',
         'updated_at': FieldValue.serverTimestamp(),
       });
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Approval blocked: $e')));
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Reservation blocked: $e')));
       }
     }
   }
@@ -130,9 +412,9 @@ class _PreordersPageState extends State<PreordersPage> {
 
   Future<void> _advanceStatus(String branchId, String id, String currentStatus) async {
     String next = 'Confirmed & Sourcing';
-    if (currentStatus == 'Approved') next = 'Confirmed & Sourcing';
+    if (currentStatus == 'Reserved') next = 'Confirmed & Sourcing';
     if (currentStatus == 'Confirmed & Sourcing') next = 'Ready for Pickup';
-    if (currentStatus == 'Ready for Pickup') next = 'Completed';
+    if (currentStatus == 'Ready for Pickup') next = 'Fulfilled';
 
     final ok = await _confirm(
       'Advance Booking State?',
@@ -170,13 +452,13 @@ class _PreordersPageState extends State<PreordersPage> {
 
   Map<String, dynamic> _statusMeta(String? status) {
     switch (status) {
-      case 'Approved':
+      case 'Reserved':
         return {'color': Colors.blue[800], 'bg': Colors.blue.withValues(alpha: 0.12), 'action': 'Begin Sourcing'};
       case 'Confirmed & Sourcing':
         return {'color': Colors.teal[700], 'bg': Colors.teal.withValues(alpha: 0.12), 'action': 'Flag as Ready for Pickup'};
       case 'Ready for Pickup':
-        return {'color': Colors.blueGrey[700], 'bg': Colors.blueGrey.withValues(alpha: 0.12), 'action': 'Handover / Complete Order'};
-      case 'Completed':
+        return {'color': Colors.blueGrey[700], 'bg': Colors.blueGrey.withValues(alpha: 0.12), 'action': 'Mark as Fulfilled'};
+      case 'Fulfilled':
         return {'color': Colors.green[700], 'bg': Colors.green.withValues(alpha: 0.12), 'action': null};
       case 'Declined':
         return {'color': Colors.red[700], 'bg': Colors.red.withValues(alpha: 0.12), 'action': null};
@@ -244,10 +526,17 @@ class _PreordersPageState extends State<PreordersPage> {
                             icon: Icon(Icons.menu, color: textColor),
                             onPressed: () => Scaffold.of(ctx).openDrawer(),
                           )),
-                          Text(
-                            'Pre-Orders',
-                            style: GoogleFonts.cormorantGaramond(
-                                color: textColor, fontWeight: FontWeight.bold, fontSize: 22),
+                          Expanded(
+                            child: Text(
+                              'Pre-Orders',
+                              style: GoogleFonts.cormorantGaramond(
+                                  color: textColor, fontWeight: FontWeight.bold, fontSize: 22),
+                            ),
+                          ),
+                          IconButton(
+                            icon: Icon(Icons.settings_outlined, color: textColor),
+                            tooltip: 'Reservation Settings',
+                            onPressed: () => _showReservationSettings(context),
                           ),
                         ],
                       ),
@@ -258,18 +547,40 @@ class _PreordersPageState extends State<PreordersPage> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(
-                            'Event Organizer & Reservations',
-                            style: GoogleFonts.cormorantGaramond(
-                              fontSize: isDesktop ? 32 : 24,
-                              fontWeight: FontWeight.bold,
-                              color: textColor,
-                            ),
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            'Live monitoring of event reservations submitted through the app\'s AI Visual Stylist — review, approve, and track fulfillment.',
-                            style: TextStyle(fontSize: 12, color: subTextColor),
+                          Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      'Event Organizer & Reservations',
+                                      style: GoogleFonts.cormorantGaramond(
+                                        fontSize: isDesktop ? 32 : 24,
+                                        fontWeight: FontWeight.bold,
+                                        color: textColor,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      'Live monitoring of event reservations submitted through the app\'s AI Visual Stylist — review, reserve, and track fulfillment.',
+                                      style: TextStyle(fontSize: 12, color: subTextColor),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              if (isDesktop)
+                                OutlinedButton.icon(
+                                  onPressed: () => _showReservationSettings(context),
+                                  icon: const Icon(Icons.settings_outlined, size: 16),
+                                  label: const Text('Reservation Settings'),
+                                  style: OutlinedButton.styleFrom(
+                                    foregroundColor: const Color(0xFFF59E0B),
+                                    side: const BorderSide(color: Color(0xFFF59E0B)),
+                                  ),
+                                ),
+                            ],
                           ),
                           const SizedBox(height: 24),
 
@@ -354,6 +665,10 @@ class _PreordersPageState extends State<PreordersPage> {
     final recommendedFlowers = (data['recommended_flowers'] is List)
         ? (data['recommended_flowers'] as List).map((e) => e.toString()).toList()
         : <String>[];
+
+    final depositRequired = data['deposit_required'];
+    final totalAmount = data['total_amount'];
+    final paymentMethod = (data['payment_method'] ?? '').toString();
 
     final rawFulfillment = data['fulfillment_date'];
     String targetDateStr = 'N/A';
@@ -480,12 +795,50 @@ class _PreordersPageState extends State<PreordersPage> {
                 ),
                 if (customerPhone.isNotEmpty) ...[
                   const SizedBox(height: 2),
-                  Row(
-                    children: [
-                      Icon(Icons.phone, size: 11, color: subTextColor),
-                      const SizedBox(width: 4),
-                      Text(customerPhone, style: TextStyle(fontSize: 11, color: subTextColor, fontWeight: FontWeight.w600)),
-                    ],
+                  InkWell(
+                    onTap: () => _callCustomer(customerPhone),
+                    borderRadius: BorderRadius.circular(6),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 2),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.phone, size: 11, color: Colors.blue[600]),
+                          const SizedBox(width: 4),
+                          Text(customerPhone,
+                              style: TextStyle(
+                                  fontSize: 11,
+                                  color: Colors.blue[600],
+                                  fontWeight: FontWeight.w700,
+                                  decoration: TextDecoration.underline)),
+                          const SizedBox(width: 4),
+                          Icon(Icons.call, size: 12, color: Colors.blue[600]),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+                if (depositRequired != null) ...[
+                  const SizedBox(height: 10),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF59E0B).withValues(alpha: 0.1),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.payments_outlined, size: 12, color: Color(0xFFF59E0B)),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            'Budget: ₱${(totalAmount ?? 0).toStringAsFixed(0)} · Deposit: ₱${(depositRequired as num).toStringAsFixed(0)}${paymentMethod.isNotEmpty ? ' via $paymentMethod' : ''}',
+                            style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w700, color: Color(0xFFF59E0B)),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ],
                 const SizedBox(height: 14),
@@ -535,12 +888,14 @@ class _PreordersPageState extends State<PreordersPage> {
                   ],
                 ),
                 const SizedBox(height: 4),
-                // NEW: since a super-admin viewing "All Branches" now sees
-                // reservations pulled from many different branches at once
-                // via the collectionGroup query, showing which branch each
-                // card belongs to avoids ambiguity that didn't exist before.
-                Text('Branch: $branchId',
-                    style: TextStyle(fontSize: 10, color: subTextColor, fontStyle: FontStyle.italic)),
+                FutureBuilder<Map<String, dynamic>?>(
+                  future: InventoryData.getBranchDetails(branchId),
+                  builder: (context, snap) {
+                    final name = snap.data?['name'] ?? branchId;
+                    return Text('Branch: $name',
+                        style: TextStyle(fontSize: 10, color: subTextColor, fontStyle: FontStyle.italic));
+                  },
+                ),
                 const SizedBox(height: 16),
 
                 if (isPendingReview)
@@ -548,9 +903,9 @@ class _PreordersPageState extends State<PreordersPage> {
                     children: [
                       Expanded(
                         child: ElevatedButton.icon(
-                          onPressed: () => _approveBooking(branchId, id),
-                          icon: const Icon(Icons.check, size: 14),
-                          label: const Text('Approve', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                          onPressed: () => _reserveBooking(branchId, id),
+                          icon: const Icon(Icons.event_available, size: 14),
+                          label: const Text('Reserve', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
                           style: ElevatedButton.styleFrom(
                             backgroundColor: const Color(0xFFF59E0B),
                             foregroundColor: Colors.white,
@@ -588,7 +943,7 @@ class _PreordersPageState extends State<PreordersPage> {
                     child: const Text('DECLINED',
                         style: TextStyle(fontSize: 11, fontWeight: FontWeight.w800, color: Colors.red)),
                   )
-                else if (status != 'Completed')
+                else if (status != 'Fulfilled')
                     SizedBox(
                       width: double.infinity,
                       child: OutlinedButton(
@@ -612,7 +967,7 @@ class _PreordersPageState extends State<PreordersPage> {
                         borderRadius: BorderRadius.circular(10),
                       ),
                       alignment: Alignment.center,
-                      child: const Text('ORDER CLOSED',
+                      child: const Text('FULFILLED',
                           style: TextStyle(fontSize: 11, fontWeight: FontWeight.w800, color: Colors.green)),
                     ),
               ],

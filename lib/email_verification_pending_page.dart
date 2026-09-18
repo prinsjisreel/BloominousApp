@@ -6,6 +6,11 @@ import 'email_verification_service.dart';
 import 'customer_profile_page.dart';
 import 'auth_page.dart';
 
+/// Blocking gate shown after email/password registration, and re-shown
+/// on every login attempt, until the customer's Firebase emailVerified
+/// flag is true. Tries the branded custom email FIRST, falling back to
+/// Firebase's native sendEmailVerification() if that fails — same
+/// defensive reasoning as _registerNewUser() in auth_page.dart.
 class EmailVerificationPendingPage extends StatefulWidget {
   final String customerId;
   const EmailVerificationPendingPage({super.key, required this.customerId});
@@ -22,20 +27,11 @@ class _EmailVerificationPendingPageState
   bool _isChecking = false;
   int _resendCooldown = 0;
   Timer? _cooldownTimer;
-
-  // Background poll — the actual "feels automatic" piece. The person
-  // clicks the emailed link in their browser (verify_email.php handles
-  // that entirely on its own, no app involvement needed — see its own
-  // comment: applyActionCode doesn't require a signed-in session, since
-  // the oobCode itself proves email ownership). This timer just quietly
-  // asks Firebase "has that happened yet?" every few seconds so the app
-  // notices without the person having to remember to tap anything.
   Timer? _pollTimer;
 
   @override
   void initState() {
     super.initState();
-    WidgetsBindingObserver;
     WidgetsBinding.instance.addObserver(this);
     _startPolling();
   }
@@ -50,10 +46,6 @@ class _EmailVerificationPendingPageState
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // The most likely moment verification actually happened is right
-    // when the person switches back into the app after tapping the link
-    // in their email/browser — check immediately on resume rather than
-    // waiting for the next scheduled poll tick.
     if (state == AppLifecycleState.resumed) {
       _silentCheckVerified();
     }
@@ -66,11 +58,8 @@ class _EmailVerificationPendingPageState
     });
   }
 
-  /// Same check as the manual button, but without the loading spinner or
-  /// error snackbar — a background poll failing quietly (still
-  /// unverified) is completely normal and shouldn't interrupt anyone.
   Future<void> _silentCheckVerified() async {
-    if (_isChecking) return; // don't overlap with a manual check
+    if (_isChecking) return;
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return;
 
@@ -88,8 +77,7 @@ class _EmailVerificationPendingPageState
         );
       }
     } catch (e) {
-      // Fail silently — a transient reload() error during a background
-      // poll isn't worth surfacing; the next tick tries again anyway.
+      // Fail silently — the next poll tick tries again.
     }
   }
 
@@ -108,18 +96,60 @@ class _EmailVerificationPendingPageState
     });
   }
 
+  /// Tries the branded custom email first (send_verification_email.php).
+  /// If that fails for ANY reason — thrown exception, or a
+  /// success:false result — falls back to Firebase Auth's own native
+  /// sendEmailVerification(), which runs entirely on Google's
+  /// infrastructure and bypasses Hostinger/PHP/CDN. This guarantees the
+  /// person always gets SOME verification email.
   Future<void> _resend() async {
     setState(() => _isResending = true);
-    final ok = await _service.sendVerificationEmail();
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Failed: No signed-in user found.')),
+        );
+        setState(() => _isResending = false);
+      }
+      return;
+    }
+
+    bool primarySucceeded = false;
+    String? primaryMessage;
+    try {
+      final result = await _service.sendVerificationEmail();
+      primarySucceeded = result.success;
+      primaryMessage = result.message;
+    } catch (e) {
+      primaryMessage = e.toString();
+    }
+
+    if (!primarySucceeded) {
+      try {
+        await user.sendEmailVerification();
+        primarySucceeded = true; // fallback succeeded
+      } catch (fallbackError) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text('Failed: ${primaryMessage ?? fallbackError.toString()}'),
+            backgroundColor: Colors.redAccent,
+            duration: const Duration(seconds: 6),
+          ));
+          setState(() => _isResending = false);
+        }
+        return;
+      }
+    }
+
     if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(ok
-            ? 'Verification email sent! Check your inbox.'
-            : 'Could not send email right now. Please try again shortly.'),
-        backgroundColor: ok ? Colors.green : Colors.redAccent,
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Verification email sent! Check your inbox.'),
+        backgroundColor: Colors.green,
+        duration: Duration(seconds: 6),
       ));
       setState(() => _isResending = false);
-      if (ok) _startCooldown();
+      _startCooldown();
     }
   }
 
@@ -206,8 +236,6 @@ class _EmailVerificationPendingPageState
                     fontSize: 13, color: isDark ? Colors.grey[400] : Colors.grey[700]),
               ),
               const SizedBox(height: 20),
-              // Subtle "still watching" indicator so the auto-check
-              // doesn't feel like it's doing nothing while they wait.
               Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [

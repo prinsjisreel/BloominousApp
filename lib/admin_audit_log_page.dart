@@ -18,10 +18,6 @@ class _AdminAuditLogPageState extends State<AdminAuditLogPage> {
   final TextEditingController _searchController = TextEditingController();
   String _searchQuery = '';
 
-  // 'All', 'Admin', or 'Staff'. Only meaningful (and only shown) for
-  // super-admin's full-log view — a plain admin already only ever sees
-  // their own single-actor entries under Option B, so a role filter
-  // there would just be trivially "one role, always."
   String _roleFilter = 'All';
 
   static const Set<String> _adminRoles = {'admin', 'super-admin'};
@@ -34,6 +30,12 @@ class _AdminAuditLogPageState extends State<AdminAuditLogPage> {
     'walkin_cancel_override': 'WALK-IN OVERRIDE USED',
     'create_employee_account': 'ACCOUNT CREATED',
     'update_employee_role': 'ROLE/BRANCH CHANGED',
+    'order_status_change': 'ORDER STATUS CHANGE',
+    'pos_sale_completed': 'POS SALE',
+    'inventory_item_updated': 'ITEM UPDATED',
+    'inventory_item_created': 'ITEM CREATED',
+    'inventory_stock_added': 'STOCK ADDED',
+    'inventory_item_archived': 'ITEM ARCHIVED',
   };
 
   static const Map<String, Color> _actionColors = {
@@ -43,6 +45,12 @@ class _AdminAuditLogPageState extends State<AdminAuditLogPage> {
     'walkin_cancel_override': Color(0xFF7C3AED),
     'create_employee_account': Color(0xFF2563EB),
     'update_employee_role': Color(0xFFB45309),
+    'order_status_change': Color(0xFF6B7280),
+    'pos_sale_completed': Color(0xFF059669),
+    'inventory_item_updated': Color(0xFFCA8A04),
+    'inventory_item_created': Color(0xFF0891B2),
+    'inventory_stock_added': Color(0xFF16A34A),
+    'inventory_item_archived': Color(0xFF991B1B),
   };
 
   bool _matchesRoleFilter(String actorRole) {
@@ -166,9 +174,6 @@ class _AdminAuditLogPageState extends State<AdminAuditLogPage> {
                     ),
                   ),
                 ),
-                // Only meaningful for super-admin's full-log view — a
-                // plain admin's own entries are all the same role
-                // (theirs), so the filter would have nothing to do.
                 if (isSuperAdmin)
                   Padding(
                     padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),

@@ -5,6 +5,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:model_viewer_plus/model_viewer_plus.dart';
 import 'package:camera/camera.dart';
 import 'dart:math' as math;
+import 'dart:ui'; // Added for Glassmorphism blur effects
 import 'inventory_data.dart';
 import 'payment_service.dart';
 import 'delivery_details_page.dart';
@@ -94,7 +95,7 @@ class _BuilderPageState extends State<BuilderPage> {
   String _getCurrentModel() {
     if (_manualModelSelection != null) {
       final item = _selectedItems.firstWhere(
-        (i) => i['name'] == _manualModelSelection,
+            (i) => i['name'] == _manualModelSelection,
         orElse: () => <String, dynamic>{},
       );
       if (item.containsKey('model') && item['model'].toString().isNotEmpty) {
@@ -119,7 +120,7 @@ class _BuilderPageState extends State<BuilderPage> {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content:
-              Text('Please log in first to proceed with your bouquet order.'),
+          Text('Please log in first to proceed with your bouquet order.'),
           backgroundColor: Color(0xFFF59E0B),
           duration: Duration(seconds: 3),
         ),
@@ -145,9 +146,9 @@ class _BuilderPageState extends State<BuilderPage> {
         builder: (context) => DeliveryDetailsPage(
           cartItems: _selectedItems
               .map((item) => {
-                    ...item,
-                    'qty': 1,
-                  })
+            ...item,
+            'qty': 1,
+          })
               .toList(),
           cartTotal: _total,
           occasion: 'Custom AR Bouquet',
@@ -168,7 +169,7 @@ class _BuilderPageState extends State<BuilderPage> {
       _cameras = await availableCameras();
       if (_cameras != null && _cameras!.isNotEmpty) {
         final backCamera = _cameras!.firstWhere(
-          (camera) => camera.lensDirection == CameraLensDirection.back,
+              (camera) => camera.lensDirection == CameraLensDirection.back,
           orElse: () => _cameras!.first,
         );
         _cameraController = CameraController(
@@ -233,9 +234,9 @@ class _BuilderPageState extends State<BuilderPage> {
     itemGroups.forEach((name, count) {
       final proto = itemPrototypes[name]!;
       String src =
-          (proto['model'] != null && proto['model'].toString().isNotEmpty)
-              ? proto['model']
-              : (_modelMapping[name] ?? _modelMapping['Red Rose']!);
+      (proto['model'] != null && proto['model'].toString().isNotEmpty)
+          ? proto['model']
+          : (_modelMapping[name] ?? _modelMapping['Red Rose']!);
 
       // Limit to 6 visible of each flower type to avoid heavy resources but show fullness
       int limit = count > 6 ? 6 : count;
@@ -347,7 +348,7 @@ class _BuilderPageState extends State<BuilderPage> {
       double modelWidth = 350.0;
       double modelHeight = 380.0;
       double heightFactor =
-          0.78; // generous default crop factor to show top portions cleanly without cutting heads
+      0.78; // generous default crop factor to show top portions cleanly without cutting heads
       String cameraTarget = "0m 0.08m 0m";
       String cameraOrbit = "0deg 75deg 90%";
       double verticalOffset = 0.0;
@@ -364,11 +365,11 @@ class _BuilderPageState extends State<BuilderPage> {
         modelHeight = 380.0;
         heightFactor = 0.82;
         cameraTarget =
-            "0m 0.09m 0m"; // Center focus on flower head & upper stem
+        "0m 0.09m 0m"; // Center focus on flower head & upper stem
         cameraOrbit =
-            "0deg 75deg 88%"; // Balanced fit so bloom is fully visible at top
+        "0deg 75deg 88%"; // Balanced fit so bloom is fully visible at top
         verticalOffset =
-            18.0; // Lower flower down so head is fully shown & roots buried in wrapper
+        18.0; // Lower flower down so head is fully shown & roots buried in wrapper
       } else if (isSunflower) {
         modelWidth = 350.0;
         modelHeight = 380.0;
@@ -412,13 +413,13 @@ class _BuilderPageState extends State<BuilderPage> {
           top: top,
           child: Transform.rotate(
             angle:
-                theta, // tilt the model matching its exact direction from stem base
+            theta, // tilt the model matching its exact direction from stem base
             child: SizedBox(
               width: modelWidth,
               height: cropHeight,
               child: ModelViewer(
                 key:
-                    ValueKey('model_${name}_${itemIndex}_${i}_${_isArEnabled}'),
+                ValueKey('model_${name}_${itemIndex}_${i}_${_isArEnabled}'),
                 src: src,
                 ar: i == 0 && _isArEnabled,
                 autoRotate: i == 0,
@@ -439,6 +440,31 @@ class _BuilderPageState extends State<BuilderPage> {
     return Stack(
       clipBehavior: Clip.none,
       children: layers,
+    );
+  }
+
+  // Aesthetic Glassmorphism Base for all floating panels
+  Widget _buildAestheticPanel({required Widget child}) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(24),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 15, sigmaY: 15),
+        child: Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: isDark ? Colors.black.withOpacity(0.4) : Colors.white.withOpacity(0.65),
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(
+                color: isDark ? Colors.white.withOpacity(0.1) : Colors.white.withOpacity(0.5),
+                width: 1.5),
+            boxShadow: [
+              BoxShadow(color: Colors.black.withOpacity(0.1), blurRadius: 15)
+            ],
+          ),
+          child: child,
+        ),
+      ),
     );
   }
 
@@ -466,37 +492,46 @@ class _BuilderPageState extends State<BuilderPage> {
             _buildModelLayer()
           else
             Positioned(
-              bottom: 60, // Unified bottom placement
-              left: 0,
-              right: _isMenuOpen && _showPanel ? 320 : 0,
+              top: 100, // Pushed down to clear the top logo bar
+              bottom: 100, // Pushed up to clear AR toggles
+              left: 16,
+              // Dynamically adjust right padding based on device width and panel state to prevent squishing
+              right: _isMenuOpen && _showPanel
+                  ? (MediaQuery.of(context).size.width < 600 ? 300 : 370)
+                  : 16,
               child: Center(
-                child: SizedBox(
-                  width: 320,
-                  height: 440,
-                  child: Stack(
-                    clipBehavior: Clip.none,
-                    children: [
-                      // Layer 1: Back Wrapper (Outer fanning sheets)
-                      if (_showWrapper)
-                        IgnorePointer(
-                          child: CustomPaint(
-                            size: const Size(320, 440),
-                            painter: BouquetBackWrapperPainter(),
+                // The FittedBox ensures the 320x440 wrapper AND the 3D models
+                // scale up or down proportionally on ANY screen size
+                child: FittedBox(
+                  fit: BoxFit.contain,
+                  child: SizedBox(
+                    width: 320,
+                    height: 440,
+                    child: Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        // Layer 1: Back Wrapper (Outer fanning sheets)
+                        if (_showWrapper)
+                          IgnorePointer(
+                            child: CustomPaint(
+                              size: const Size(320, 440),
+                              painter: BouquetBackWrapperPainter(),
+                            ),
                           ),
-                        ),
 
-                      // Layer 2: Harmonized flowers (nested inside)
-                      _buildModelLayer(),
+                        // Layer 2: Harmonized flowers (nested inside)
+                        _buildModelLayer(),
 
-                      // Layer 3: Front Wrapper (White collar tissue, handle, crimson bow)
-                      if (_showWrapper)
-                        IgnorePointer(
-                          child: CustomPaint(
-                            size: const Size(320, 440),
-                            painter: BouquetFrontWrapperPainter(),
+                        // Layer 3: Front Wrapper (White collar tissue, handle, crimson bow)
+                        if (_showWrapper)
+                          IgnorePointer(
+                            child: CustomPaint(
+                              size: const Size(320, 440),
+                              painter: BouquetFrontWrapperPainter(),
+                            ),
                           ),
-                        ),
-                    ],
+                      ],
+                    ),
                   ),
                 ),
               ),
@@ -515,7 +550,7 @@ class _BuilderPageState extends State<BuilderPage> {
                   Text(
                     'bloomypro',
                     style: GoogleFonts.cormorantGaramond(
-                      fontSize: 24, // Smaller
+                      fontSize: 24,
                       fontWeight: FontWeight.bold,
                       color: const Color(0xFFF59E0B),
                     ),
@@ -524,11 +559,11 @@ class _BuilderPageState extends State<BuilderPage> {
                     Row(
                       children: [
                         const Icon(Icons.chat_bubble_outline,
-                            color: Colors.grey, size: 16),
+                            color: Colors.white70, size: 16),
                         const SizedBox(width: 8),
                         Text('Support',
                             style: GoogleFonts.inter(
-                                color: Colors.grey, fontSize: 11)),
+                                color: Colors.white70, fontSize: 11)),
                       ],
                     ),
                 ],
@@ -542,22 +577,26 @@ class _BuilderPageState extends State<BuilderPage> {
             top: 0,
             bottom: 0,
             width: MediaQuery.of(context).size.width < 600 ? 50 : 70,
-            child: Container(
-              color: const Color(0xFF4A5C66)
-                  .withOpacity(0.9), // Slightly translucent
-              child: Column(
-                children: [
-                  const SizedBox(height: 30),
-                  _buildSidebarIcon(Icons.close,
-                      isAction: true, onTap: () => Navigator.pop(context)),
-                  const Spacer(),
-                  _buildSidebarIcon(Icons.visibility_off_outlined,
-                      onTap: () => setState(() => _showPanel = !_showPanel)),
-                  _buildSidebarIcon(Icons.settings_outlined),
-                  _buildSidebarIcon(Icons.layers_outlined),
-                  _buildSidebarIcon(Icons.share_outlined),
-                  const SizedBox(height: 30),
-                ],
+            child: ClipRRect(
+              child: BackdropFilter(
+                filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+                child: Container(
+                  color: const Color(0xFF4A5C66).withOpacity(0.6), // Glassmorphism sidebar
+                  child: Column(
+                    children: [
+                      const SizedBox(height: 30),
+                      _buildSidebarIcon(Icons.close,
+                          isAction: true, onTap: () => Navigator.pop(context)),
+                      const Spacer(),
+                      _buildSidebarIcon(Icons.visibility_off_outlined,
+                          onTap: () => setState(() => _showPanel = !_showPanel)),
+                      _buildSidebarIcon(Icons.settings_outlined),
+                      _buildSidebarIcon(Icons.layers_outlined),
+                      _buildSidebarIcon(Icons.share_outlined),
+                      const SizedBox(height: 30),
+                    ],
+                  ),
+                ),
               ),
             ),
           ),
@@ -566,18 +605,15 @@ class _BuilderPageState extends State<BuilderPage> {
           if (_isMenuOpen && _showPanel)
             Positioned(
               right: MediaQuery.of(context).size.width < 600 ? 10 : 20,
-              top: 100,
+              top: 80,
               bottom: 20,
               width: MediaQuery.of(context).size.width < 600 ? 280 : 350,
               child: Column(
                 children: [
-                  // AI Flower Generator
                   _buildAISection(),
                   const SizedBox(height: 12),
-                  // Flower List
                   Expanded(child: _buildFlowerSelection()),
                   const SizedBox(height: 12),
-                  // Order Summary
                   _buildSummaryPanel(),
                 ],
               ),
@@ -586,65 +622,66 @@ class _BuilderPageState extends State<BuilderPage> {
           // 5. AR TRACKING INDICATOR & TOGGLE
           Positioned(
             bottom: 120,
-            left: 20,
+            left: MediaQuery.of(context).size.width < 600 ? 60 : 90,
             child: GestureDetector(
               onTap: () => setState(() => _isArEnabled = !_isArEnabled),
-              child: Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                decoration: BoxDecoration(
-                  color: _isArEnabled
-                      ? Colors.black.withOpacity(0.7)
-                      : Colors.white.withOpacity(0.9),
-                  borderRadius: BorderRadius.circular(25),
-                  border: Border.all(
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(25),
+                child: BackdropFilter(
+                  filter: ImageFilter.blur(sigmaX: 8, sigmaY: 8),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                    decoration: BoxDecoration(
                       color: _isArEnabled
-                          ? Colors.green
-                          : Colors.grey.withOpacity(0.5),
-                      width: 1.5),
-                  boxShadow: [
-                    BoxShadow(
-                        color: Colors.black.withOpacity(0.1), blurRadius: 8)
-                  ],
-                ),
-                child: Row(
-                  children: [
-                    Container(
-                      width: 12,
-                      height: 12,
-                      decoration: BoxDecoration(
-                        color: _isArEnabled
-                            ? const Color(0xFF4CAF50)
-                            : Colors.grey,
-                        shape: BoxShape.circle,
-                        boxShadow: [
-                          if (_isArEnabled)
-                            BoxShadow(
-                                color: Colors.green.withOpacity(0.5),
-                                blurRadius: 4,
-                                spreadRadius: 1)
-                        ],
-                      ),
+                          ? Colors.black.withOpacity(0.4)
+                          : Colors.white.withOpacity(0.4),
+                      borderRadius: BorderRadius.circular(25),
+                      border: Border.all(
+                          color: _isArEnabled
+                              ? Colors.greenAccent
+                              : Colors.white.withOpacity(0.5),
+                          width: 1.5),
                     ),
-                    const SizedBox(width: 10),
-                    Text(
-                      _isArEnabled ? 'AR IS ON' : 'AR IS OFF',
-                      style: TextStyle(
-                          color: _isArEnabled ? Colors.white : Colors.black87,
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                          letterSpacing: 0.5),
+                    child: Row(
+                      children: [
+                        Container(
+                          width: 12,
+                          height: 12,
+                          decoration: BoxDecoration(
+                            color: _isArEnabled
+                                ? const Color(0xFF4CAF50)
+                                : Colors.grey[800],
+                            shape: BoxShape.circle,
+                            boxShadow: [
+                              if (_isArEnabled)
+                                BoxShadow(
+                                    color: Colors.greenAccent.withOpacity(0.8),
+                                    blurRadius: 8,
+                                    spreadRadius: 2)
+                            ],
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Text(
+                          _isArEnabled ? 'AR IS ON' : 'AR IS OFF',
+                          style: TextStyle(
+                              color: _isArEnabled ? Colors.white : Colors.black87,
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold,
+                              letterSpacing: 0.5),
+                        ),
+                      ],
                     ),
-                  ],
+                  ),
                 ),
               ),
             ),
           ),
 
-          // 6. TOGGLE INTERFACE BUTTON (Visibility Control)
+          // 6. TOGGLE INTERFACE BUTTON
           Positioned(
             bottom: 180,
-            right: _isMenuOpen && _showPanel ? 340 : 20,
+            right: _isMenuOpen && _showPanel ? (MediaQuery.of(context).size.width < 600 ? 300 : 380) : 20,
             child: FloatingActionButton.small(
               heroTag: 'toggle_ui',
               backgroundColor: Colors.white.withOpacity(0.95),
@@ -657,7 +694,7 @@ class _BuilderPageState extends State<BuilderPage> {
           // 7. TOGGLE WRAPPER COVER BUTTON
           Positioned(
             bottom: 240,
-            right: _isMenuOpen && _showPanel ? 340 : 20,
+            right: _isMenuOpen && _showPanel ? (MediaQuery.of(context).size.width < 600 ? 300 : 380) : 20,
             child: FloatingActionButton.small(
               heroTag: 'toggle_wrapper',
               backgroundColor: _showWrapper
@@ -677,8 +714,7 @@ class _BuilderPageState extends State<BuilderPage> {
   Widget _buildSidebarIcon(IconData icon,
       {bool isAction = false, VoidCallback? onTap}) {
     return Padding(
-      padding:
-          const EdgeInsets.symmetric(vertical: 12), // Tighter vertical spacing
+      padding: const EdgeInsets.symmetric(vertical: 12),
       child: IconButton(
         icon: Icon(icon, color: Colors.white, size: 24),
         onPressed: onTap ?? () {},
@@ -686,23 +722,15 @@ class _BuilderPageState extends State<BuilderPage> {
         constraints: const BoxConstraints(),
         style: isAction
             ? IconButton.styleFrom(
-                padding: const EdgeInsets.all(8),
-                backgroundColor: const Color(0xFFF59E0B))
+            padding: const EdgeInsets.all(8),
+            backgroundColor: const Color(0xFFF59E0B))
             : null,
       ),
     );
   }
 
   Widget _buildAISection() {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.95),
-        borderRadius: BorderRadius.circular(20),
-        boxShadow: [
-          BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10)
-        ],
-      ),
+    return _buildAestheticPanel(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -714,16 +742,14 @@ class _BuilderPageState extends State<BuilderPage> {
                 style: GoogleFonts.inter(
                     fontSize: 10,
                     fontWeight: FontWeight.bold,
-                    color: Colors.purple,
+                    color: Colors.purple[700],
                     letterSpacing: 1.5),
               ),
               IconButton(
-                icon: Icon(_isAISectionMinimized ? Icons.add : Icons.remove,
-                    size: 14),
+                icon: Icon(_isAISectionMinimized ? Icons.add : Icons.remove, size: 14),
                 padding: EdgeInsets.zero,
                 constraints: const BoxConstraints(),
-                onPressed: () => setState(
-                    () => _isAISectionMinimized = !_isAISectionMinimized),
+                onPressed: () => setState(() => _isAISectionMinimized = !_isAISectionMinimized),
               ),
             ],
           ),
@@ -736,12 +762,10 @@ class _BuilderPageState extends State<BuilderPage> {
                 hintText: 'e.g., Neon Rose',
                 hintStyle: const TextStyle(color: Colors.grey, fontSize: 13),
                 filled: true,
-                fillColor: Colors.grey[100],
-                contentPadding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                fillColor: Colors.white.withOpacity(0.5),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                 border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(10),
-                    borderSide: BorderSide.none),
+                    borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
               ),
             ),
           ],
@@ -751,15 +775,7 @@ class _BuilderPageState extends State<BuilderPage> {
   }
 
   Widget _buildFlowerSelection() {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.95),
-        borderRadius: BorderRadius.circular(20),
-        boxShadow: [
-          BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10)
-        ],
-      ),
+    return _buildAestheticPanel(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -771,16 +787,14 @@ class _BuilderPageState extends State<BuilderPage> {
                 style: GoogleFonts.inter(
                     fontSize: 10,
                     fontWeight: FontWeight.bold,
-                    color: Colors.grey,
+                    color: Colors.black87,
                     letterSpacing: 1.2),
               ),
               IconButton(
-                icon: Icon(_isFlowersMinimized ? Icons.add : Icons.remove,
-                    size: 14),
+                icon: Icon(_isFlowersMinimized ? Icons.add : Icons.remove, size: 14),
                 padding: EdgeInsets.zero,
                 constraints: const BoxConstraints(),
-                onPressed: () =>
-                    setState(() => _isFlowersMinimized = !_isFlowersMinimized),
+                onPressed: () => setState(() => _isFlowersMinimized = !_isFlowersMinimized),
               ),
             ],
           ),
@@ -791,8 +805,7 @@ class _BuilderPageState extends State<BuilderPage> {
                 stream: InventoryData.inventoryStream(),
                 builder: (context, snapshot) {
                   if (snapshot.connectionState == ConnectionState.waiting) {
-                    return const Center(
-                        child: CircularProgressIndicator(strokeWidth: 2));
+                    return const Center(child: CircularProgressIndicator(strokeWidth: 2));
                   }
 
                   final flowers = snapshot.data ?? [];
@@ -802,17 +815,10 @@ class _BuilderPageState extends State<BuilderPage> {
                       child: Column(
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
-                          const Icon(Icons.inventory_2_outlined,
-                              color: Colors.grey, size: 24),
+                          const Icon(Icons.inventory_2_outlined, color: Colors.grey, size: 24),
                           const SizedBox(height: 8),
                           Text('No flowers found',
-                              style: GoogleFonts.inter(
-                                  fontSize: 12, color: Colors.grey)),
-                          TextButton(
-                            onPressed: () => setState(() {}),
-                            child: const Text('Retry',
-                                style: TextStyle(fontSize: 10)),
-                          )
+                              style: GoogleFonts.inter(fontSize: 12, color: Colors.grey)),
                         ],
                       ),
                     );
@@ -820,6 +826,7 @@ class _BuilderPageState extends State<BuilderPage> {
 
                   return ListView.builder(
                     itemCount: flowers.length,
+                    padding: EdgeInsets.zero,
                     itemBuilder: (context, index) {
                       final f = flowers[index];
                       final count = _getItemCount(f['id']);
@@ -831,38 +838,34 @@ class _BuilderPageState extends State<BuilderPage> {
                               width: 40,
                               height: 40,
                               decoration: BoxDecoration(
-                                color: Colors.grey[100],
+                                color: Colors.white.withOpacity(0.5),
                                 borderRadius: BorderRadius.circular(8),
                                 image: DecorationImage(
-                                    image: NetworkImage(f['image'] ?? ''),
-                                    fit: BoxFit.cover),
+                                    image: NetworkImage(f['image'] ?? ''), fit: BoxFit.cover),
                               ),
                             ),
                             const SizedBox(width: 12),
                             Expanded(
                               child: GestureDetector(
-                                onTap: () => setState(
-                                    () => _manualModelSelection = f['name']),
+                                onTap: () => setState(() => _manualModelSelection = f['name']),
                                 child: Container(
-                                  color: Colors
-                                      .transparent, // Make entire area tappable
+                                  color: Colors.transparent,
                                   child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
+                                    crossAxisAlignment: CrossAxisAlignment.start,
                                     children: [
                                       Text(f['name'],
                                           style: GoogleFonts.inter(
                                               fontWeight: FontWeight.bold,
                                               fontSize: 12,
-                                              color: _manualModelSelection ==
-                                                      f['name']
-                                                  ? const Color(0xFFF59E0B)
-                                                  : Colors.black),
+                                              color: _manualModelSelection == f['name']
+                                                  ? const Color(0xFFD97706)
+                                                  : Colors.black87),
                                           maxLines: 1),
                                       Text('₱${f['price']}',
                                           style: GoogleFonts.cormorantGaramond(
-                                              color: const Color(0xFFF59E0B),
-                                              fontSize: 12)),
+                                              color: const Color(0xFFD97706),
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 13)),
                                     ],
                                   ),
                                 ),
@@ -870,15 +873,12 @@ class _BuilderPageState extends State<BuilderPage> {
                             ),
                             Row(
                               children: [
-                                _buildCounterBtn(
-                                    Icons.remove, () => _removeItem(f['id'])),
+                                _buildCounterBtn(Icons.remove, () => _removeItem(f['id'])),
                                 Padding(
-                                  padding:
-                                      const EdgeInsets.symmetric(horizontal: 8),
+                                  padding: const EdgeInsets.symmetric(horizontal: 8),
                                   child: Text('$count',
                                       style: const TextStyle(
-                                          fontWeight: FontWeight.bold,
-                                          fontSize: 12)),
+                                          fontWeight: FontWeight.bold, fontSize: 12)),
                                 ),
                                 _buildCounterBtn(Icons.add, () => _addItem(f)),
                               ],
@@ -897,50 +897,22 @@ class _BuilderPageState extends State<BuilderPage> {
     );
   }
 
-  Widget _buildCounterBtn(IconData icon, VoidCallback onTap) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.all(4),
-        decoration: BoxDecoration(
-          color: Colors.cyan[50],
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: Icon(icon, size: 16, color: Colors.cyan),
-      ),
-    );
-  }
-
   Widget _buildSummaryPanel() {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.95),
-        borderRadius: BorderRadius.circular(20),
-        boxShadow: [
-          BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10)
-        ],
-      ),
+    return _buildAestheticPanel(
       child: Column(
         children: [
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text('Total',
-                  style: const TextStyle(color: Colors.grey, fontSize: 14)),
+              const Text('Total', style: TextStyle(color: Colors.black87, fontSize: 14)),
               Text('₱${_total.toStringAsFixed(2)}',
-                  style: GoogleFonts.inter(
-                      fontWeight: FontWeight.bold, fontSize: 14)),
+                  style: GoogleFonts.inter(fontWeight: FontWeight.bold, fontSize: 15)),
               IconButton(
-                icon: Icon(
-                    _isSummaryMinimized
-                        ? Icons.keyboard_arrow_up
-                        : Icons.keyboard_arrow_down,
+                icon: Icon(_isSummaryMinimized ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
                     size: 18),
                 padding: EdgeInsets.zero,
                 constraints: const BoxConstraints(),
-                onPressed: () =>
-                    setState(() => _isSummaryMinimized = !_isSummaryMinimized),
+                onPressed: () => setState(() => _isSummaryMinimized = !_isSummaryMinimized),
               ),
             ],
           ),
@@ -954,12 +926,10 @@ class _BuilderPageState extends State<BuilderPage> {
                   backgroundColor: const Color(0xFFF59E0B),
                   foregroundColor: Colors.white,
                   padding: const EdgeInsets.symmetric(vertical: 12),
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12)),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                 ),
                 child: const Text('CHECKOUT',
-                    style: TextStyle(
-                        fontWeight: FontWeight.bold, letterSpacing: 1.1)),
+                    style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.1)),
               ),
             ),
           ],
@@ -968,17 +938,16 @@ class _BuilderPageState extends State<BuilderPage> {
     );
   }
 
-  Widget _summaryRow(String label, double amount) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Text(label, style: const TextStyle(color: Colors.grey, fontSize: 12)),
-          Text('₱${amount.toStringAsFixed(2)}',
-              style:
-                  const TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
-        ],
+  Widget _buildCounterBtn(IconData icon, VoidCallback onTap) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.all(4),
+        decoration: BoxDecoration(
+          color: Colors.white.withOpacity(0.8),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Icon(icon, size: 16, color: const Color(0xFFF59E0B)),
       ),
     );
   }

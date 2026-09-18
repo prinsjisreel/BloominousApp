@@ -5,6 +5,7 @@ import 'inventory_data.dart';
 import 'spoilage_tracker_page.dart';
 import 'kiri_service.dart';
 import 'app_sidebar.dart';
+import 'admin_audit_service.dart';
 
 class InventoryPage extends StatefulWidget {
   final String role;
@@ -36,6 +37,13 @@ class _InventoryPageState extends State<InventoryPage> {
     final stockController =
     TextEditingController(text: isEditing ? item['stock'].toString() : '');
     String? selectedCategory = isEditing ? item['category'] : 'Flowers';
+
+    // Captured BEFORE any edits, so a save can log "changed from X to Y"
+    // instead of just the new value — same reasoning as
+    // manage_employees_page.dart's role-change logging: you can't say
+    // what changed after you've already overwritten the old value.
+    final double? originalPrice = isEditing ? (item['price'] as num?)?.toDouble() : null;
+    final int? originalStock = isEditing ? (item['stock'] as num?)?.toInt() : null;
 
     final List<String> categories = [
       'Flowers',
@@ -349,11 +357,13 @@ class _InventoryPageState extends State<InventoryPage> {
             if (isAdmin)
               ElevatedButton(
                 onPressed: () async {
+                  final newPrice = double.tryParse(priceController.text) ?? 0.0;
+                  final newStock = int.tryParse(stockController.text) ?? 0;
                   final data = {
                     'name': nameController.text,
                     'code': codeController.text,
-                    'price': double.tryParse(priceController.text) ?? 0.0,
-                    'stock': int.tryParse(stockController.text) ?? 0,
+                    'price': newPrice,
+                    'stock': newStock,
                     'category': selectedCategory,
                     'model': modelController.text,
                     'image': imageController.text,
@@ -361,8 +371,37 @@ class _InventoryPageState extends State<InventoryPage> {
                   };
                   if (isEditing) {
                     await InventoryData.updateProduct(item['id'], data);
+
+                    // Logs price/stock edits specifically — this is the
+                    // classic insider-fraud vector in retail (mark a
+                    // price down, buy it yourself, mark it back up), so
+                    // the details always state old → new even when
+                    // unchanged, rather than only logging when something
+                    // moved.
+                    await AdminAuditService.logAction(
+                      action: 'inventory_item_updated',
+                      targetUid: item['id'],
+                      targetEmail: null,
+                      details:
+                      '"${nameController.text}" — Price: ₱${originalPrice?.toStringAsFixed(2) ?? '?'} → ₱${newPrice.toStringAsFixed(2)}, '
+                          'Stock: ${originalStock ?? '?'} → $newStock.',
+                    );
                   } else {
                     await InventoryData.addProduct(data);
+
+                    await AdminAuditService.logAction(
+                      action: 'inventory_item_created',
+                      // addProduct's return type isn't visible from this
+                      // file, so the product's own code/name is used as
+                      // the target identifier rather than assuming an ID
+                      // comes back.
+                      targetUid: codeController.text.isNotEmpty
+                          ? codeController.text
+                          : nameController.text,
+                      targetEmail: null,
+                      details:
+                      'Created "${nameController.text}" at ₱${newPrice.toStringAsFixed(2)}, initial stock $newStock.',
+                    );
                   }
                   if (mounted) Navigator.pop(context);
                 },
@@ -390,6 +429,15 @@ class _InventoryPageState extends State<InventoryPage> {
 
                   await InventoryData.updateProduct(
                       item['id'], {'stock': newStock});
+
+                  await AdminAuditService.logAction(
+                    action: 'inventory_stock_added',
+                    targetUid: item['id'],
+                    targetEmail: null,
+                    details:
+                    'Added $amount unit(s) to "${item['name']}" ($currentStock → $newStock).',
+                  );
+
                   if (mounted) Navigator.pop(context);
 
                   ScaffoldMessenger.of(context).showSnackBar(
@@ -421,6 +469,14 @@ class _InventoryPageState extends State<InventoryPage> {
           TextButton(
             onPressed: () async {
               await InventoryData.deleteProduct(item['id']);
+
+              await AdminAuditService.logAction(
+                action: 'inventory_item_archived',
+                targetUid: item['id'],
+                targetEmail: null,
+                details: 'Archived "${item['name']}".',
+              );
+
               if (mounted) Navigator.pop(context);
             },
             child: const Text('ARCHIVE', style: TextStyle(color: Colors.red)),
@@ -501,13 +557,6 @@ class _InventoryPageState extends State<InventoryPage> {
                     final stock = (item['stock'] ?? 0) as int;
                     final status = _stockStatus(stock);
 
-                    // FIXED: no more ListTile. ListTile pre-computes a
-                    // fixed row height from title/subtitle and then hands
-                    // trailing whatever space is left — if trailing needs
-                    // more, it silently overflows (the hazard-stripe
-                    // warning you saw). This custom Row/Column sizes
-                    // itself entirely from its own content, so there's no
-                    // pre-set height for anything to exceed.
                     return Card(
                       elevation: isRecycled ? 2 : 0,
                       color: isRecycled

@@ -9,6 +9,7 @@ import 'inventory_data.dart';
 import 'app_sidebar.dart';
 import 'invoice_portal_page.dart';
 import 'override_code_service.dart';
+import 'admin_audit_service.dart';
 
 class OrdersPage extends StatefulWidget {
   final String role;
@@ -88,6 +89,19 @@ class _OrdersPageState extends State<OrdersPage> {
         'status': newStatus,
         'updatedAt': FieldValue.serverTimestamp(),
       }, SetOptions(merge: true));
+
+      // General accountability logging — separate from
+      // _handleCancelWalkIn's override-specific logging below, which
+      // only fires for cancellations BEYOND the daily limit. This
+      // covers every routine status change: confirms, in-limit
+      // cancellations, online order status updates — everything that
+      // was previously invisible to any review process.
+      await AdminAuditService.logAction(
+        action: 'order_status_change',
+        targetUid: orderId,
+        targetEmail: null,
+        details: 'Order status changed to "$newStatus".',
+      );
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -217,6 +231,18 @@ class _OrdersPageState extends State<OrdersPage> {
         // above filters on.
         'cancelledAt': FieldValue.serverTimestamp(),
       }, SetOptions(merge: true));
+
+      // Matches _updateOrderStatus's own logging — cancellations that
+      // route through this path (whether under or over the daily limit)
+      // still get the same general order_status_change record, in
+      // addition to walkin_cancel_override's own entry when the
+      // override path was used.
+      await AdminAuditService.logAction(
+        action: 'order_status_change',
+        targetUid: orderId,
+        targetEmail: null,
+        details: 'Order status changed to "CANCELLED".',
+      );
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -962,11 +988,6 @@ class _OrdersPageState extends State<OrdersPage> {
                                                                     ),
                                                                     const SizedBox(width: 8),
                                                                     OutlinedButton(
-                                                                      // Routed through the new limit-aware handler
-                                                                      // instead of calling _updateOrderStatus
-                                                                      // directly — this is the only line that
-                                                                      // actually changes the CANCEL button's
-                                                                      // behavior.
                                                                       onPressed: () => _handleCancelWalkIn(
                                                                           orderId, order, todaysCancelCount),
                                                                       style: OutlinedButton.styleFrom(

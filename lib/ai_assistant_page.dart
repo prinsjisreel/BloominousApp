@@ -11,12 +11,15 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'api_keys.dart';
 import 'gemini_service.dart';
 import 'builder_page.dart';
 import 'product_catalog_page.dart';
 import 'inventory_data.dart';
+import 'payment_service.dart';
+import 'auth_page.dart';
 
 class AIAssistantPage extends StatefulWidget {
   const AIAssistantPage({super.key});
@@ -29,28 +32,19 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     with SingleTickerProviderStateMixin {
   late TabController _tabController;
 
-  // Visual Assistant State
   File? _selectedImage;
   Uint8List? _imageBytes;
   bool _isAnalyzingImage = false;
   Map<String, dynamic>? _visualResult;
   final TextEditingController _visualNoteController = TextEditingController();
 
-  // Gemini API Direct Photo Edit & Synthesis State
   Uint8List? _aiSynthesizedImageBytes;
   bool _isSynthesizingAiImage = false;
   final TextEditingController _customApiPromptController =
   TextEditingController();
 
-  // True only when a REAL AI-generated image (Gemini or Stability AI) was
-  // produced -- false when generation failed and we're only showing the
-  // free Canvas-drawn placeholder (or nothing at all). The flower
-  // description/theme text AND the Pexels reference photos are both gated
-  // on this flag so nothing is ever shown that doesn't match what's
-  // actually on screen.
   bool _aiImageGenerationSucceeded = false;
 
-  // Reservation Submission State
   final TextEditingController _firstNameController = TextEditingController();
   final TextEditingController _middleNameController = TextEditingController();
   final TextEditingController _lastNameController = TextEditingController();
@@ -59,15 +53,79 @@ class _AIAssistantPageState extends State<AIAssistantPage>
   bool _isSubmittingReservation = false;
   bool _reservationSubmitted = false;
 
-  // Related flower reference photos fetched from Pexels once we know
-  // which flower the AI recommended -- purely supplementary, never blocks
-  // the rest of the flow if it comes back empty. Fetched concurrently with
-  // image generation (see _analyzeVisualImage), but only ever DISPLAYED
-  // once _aiImageGenerationSucceeded is true -- see the gate in the build
-  // method below.
+  TimeOfDay? _selectedEventTime;
+  final TextEditingController _emailController = TextEditingController();
+  String _selectedPaymentMethod = 'physical';
+  bool _isProcessingPayment = false;
+
+  // NEW: shows a brief spinner on the date field while the availability
+  // check below runs, so the customer isn't left wondering why the
+  // picker "did nothing" for a moment.
+  bool _isCheckingAvailability = false;
+
+  final TextEditingController _budgetController = TextEditingController();
+  static const double _minimumBudget = 10000.0;
+
+  double get _parsedBudget =>
+      double.tryParse(_budgetController.text.trim().replaceAll(',', '')) ?? 0;
+
+  double get _depositAmount => _parsedBudget >= _minimumBudget ? _parsedBudget * 0.5 : 0;
+
+  String get _paymongoMethodId =>
+      _selectedPaymentMethod == 'maya' ? 'paymaya' : _selectedPaymentMethod;
+
   List<String> _flowerReferencePhotos = [];
   bool _isLoadingFlowerPhotos = false;
 
+  // NEW: single shared date-string formatter, used both when checking
+  // availability and when writing the final reservation -- keeping this
+  // in one place means the two can never drift into different formats
+  // and silently fail to match each other in Firestore.
+  String _formatDateStr(DateTime d) =>
+      '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+
+  // NEW: checks branches/{branchId}/availability/{dateStr} for an owner-set
+  // block or capacity limit, and (if a capacity exists) counts how many
+  // reservations already exist for that date to see if it's full.
+  // Fails OPEN on any error (missing index, network blip, etc.) -- an
+  // availability check that can't complete should never be the reason a
+  // legitimate customer can't book at all; it just means this specific
+  // safety net didn't run this time.
+  Future<Map<String, dynamic>> _checkDateAvailability(DateTime date) async {
+    final dateStr = _formatDateStr(date);
+
+    try {
+      final blockedDoc =
+      await FirebaseFirestore.instance.collection('blocked_dates').doc(dateStr).get();
+      if (blockedDoc.exists && blockedDoc.data()?['isBlocked'] == true) {
+        return {
+          'available': false,
+          'reason': 'This date is not available for reservations. Please choose another date.'
+        };
+      }
+
+      final configDoc =
+      await FirebaseFirestore.instance.collection('settings').doc('reservation_config').get();
+      final maxCapacity = (configDoc.data()?['maxDailyCapacity'] as num?)?.toInt() ?? 1;
+
+      final countSnap = await FirebaseFirestore.instance
+          .collectionGroup('reservations')
+          .where('fulfillment_date', isEqualTo: dateStr)
+          .count()
+          .get();
+      final current = countSnap.count ?? 0;
+      if (current >= maxCapacity) {
+        return {
+          'available': false,
+          'reason': 'This date is fully booked ($current/$maxCapacity). Please choose another date.'
+        };
+      }
+      return {'available': true};
+    } catch (e) {
+      print('Availability check failed, allowing booking to proceed: $e');
+      return {'available': true};
+    }
+  }
   Future<void> _fetchPexelsPhotos(String query) async {
     try {
       final url = Uri.parse(
@@ -143,7 +201,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     try {
       Uint8List? bytes;
       if (_imageBytes != null && _imageBytes!.isNotEmpty) {
-        // Instant placeholder shown immediately while the real AI call is in flight
         instantEdited = await GeminiService.compositeEditedRoomPhoto(
           userRoomBytes: _imageBytes!,
           flowerType: flowerName,
@@ -155,9 +212,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
           });
         }
 
-        // The real AI image edit -- this is what should end up on screen.
-        // Tries Gemini first; if that fails for any reason, automatically
-        // retries with Stability AI before giving up to the placeholder.
         try {
           bytes = await GeminiService.editUserPhotoWithGemini(
             userRoomBytes: _imageBytes!,
@@ -166,11 +220,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
             potType: potName,
           );
         } on GeminiImageException catch (geminiError) {
-          // Logged for debugging, but NOT shown to the user -- with Gemini's
-          // free-tier quota at 0 for this model, this fallback fires on
-          // every single attempt until billing is enabled. Showing a banner
-          // every time is just noise; only the final outcome (success or
-          // total failure below) is worth surfacing to the user.
           print(
               "Gemini failed, trying Stability AI fallback: ${geminiError.message}");
           bytes = await GeminiService.editUserPhotoWithStabilityAI(
@@ -189,9 +238,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
         setState(() {
           if (bytes != null && bytes.isNotEmpty) {
             _aiSynthesizedImageBytes = bytes;
-            // Real Gemini or Stability AI output -- safe to show the
-            // flower description text AND the Pexels reference photos now,
-            // since they both describe/reflect what's actually on screen.
             _aiImageGenerationSucceeded = true;
           }
           _isSynthesizingAiImage = false;
@@ -207,10 +253,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
         }
       }
     } on GeminiImageException catch (e) {
-      // Surface the REAL reason instead of failing silently. This is what
-      // was previously getting swallowed -- "nothing generates" with no
-      // way to tell why. Falls back to the instant placeholder so the
-      // screen isn't left blank, but the error is now visible.
       print("Gemini image generation failed: ${e.message}");
       if (mounted) {
         setState(() {
@@ -243,14 +285,11 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     }
   }
 
-  // Room Virtual Staging State
   Offset _flowerPosition = const Offset(90, 60);
   double _flowerScale = 1.0;
   bool _showStagedRoom = true;
-  bool _usePhotorealisticMode =
-  true; // Default to photorealistic HD photography!
-  bool _showFullGeminiAiBlend =
-  true; // Default to Gemini Web style Full Photorealistic Synthesis!
+  bool _usePhotorealisticMode = true;
+  bool _showFullGeminiAiBlend = true;
 
   Widget _buildPhotorealisticFallbackWidget() {
     return Container(
@@ -284,10 +323,8 @@ class _AIAssistantPageState extends State<AIAssistantPage>
   }
 
   int _selectedOverlayIndex = 0;
-  String _selectedFlowerType =
-      'rose'; // 'rose', 'sunflower', 'tulip', 'lily', 'carnation'
-  String _selectedPotType =
-      'glass'; // 'glass', 'ceramic', 'terracotta', 'gold'
+  String _selectedFlowerType = 'rose';
+  String _selectedPotType = 'glass';
 
   String _getPhotorealisticOverlayUrl() {
     if (_selectedFlowerType == 'rose') {
@@ -366,7 +403,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     },
   ];
 
-  // Personal Matchmaker State
   String _selectedRecipient = 'Partner / Spouse';
   String _selectedOccasion = 'Anniversary';
   String _selectedVibe = 'Romantic Red';
@@ -375,23 +411,12 @@ class _AIAssistantPageState extends State<AIAssistantPage>
   bool _isGeneratingMatch = false;
   Map<String, dynamic>? _matchResult;
 
-  // Lets the customer choose between an AI-written card note (using the
-  // Tone dropdown above) or typing their own message entirely -- some
-  // people want a personal touch AI can't replicate. When true, the
-  // custom text below is used verbatim instead of Gemini's cardNote.
   bool _useCustomCardNote = false;
   final TextEditingController _customCardNoteController =
   TextEditingController();
 
-  // Real Pexels photo(s) of the actual flowers in the generated bouquet
-  // formula -- replaces the old hardcoded keyword-to-Unsplash-URL picker
-  // (selectFloralImageUrl), which only ever had a handful of generic
-  // stock photos regardless of what flowers Gemini actually chose.
   List<String> _matchPhotos = [];
   bool _isLoadingMatchPhotos = false;
-
-  // Flora AI Concierge moved to its own page (FloraChatPage), opened from a
-  // floating button on the Shop Category screen -- no longer a tab here.
 
   @override
   void initState() {
@@ -409,10 +434,11 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     _phoneController.dispose();
     _customApiPromptController.dispose();
     _customCardNoteController.dispose();
+    _emailController.dispose();
+    _budgetController.dispose();
     super.dispose();
   }
 
-  // Visual Assistant Action
   Future<void> _pickImage(ImageSource source) async {
     try {
       final picker = ImagePicker();
@@ -428,8 +454,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
           _flowerReferencePhotos = [];
           _reservationSubmitted = false;
         });
-        // No auto-analysis here -- the user finishes typing their occasion
-        // note first, then explicitly taps "Analyze & Match Floral Theme".
       }
     } catch (e) {
       if (mounted) {
@@ -487,7 +511,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
       _isAnalyzingImage = true;
     });
 
-    // Step 1: detect theme + recommended flowers/colors from the photo + note
     final result = await GeminiService.analyzeVisualTheme(
       imageBytes: _imageBytes,
       description: _visualNoteController.text.trim().isEmpty
@@ -527,23 +550,12 @@ class _AIAssistantPageState extends State<AIAssistantPage>
       });
     }
 
-    // Step 2: fire off the real photo edit -- NOT awaited here, so it runs
-    // in the background while Step 3 (Pexels) fetches at the same time.
-    // This is purely a speed optimization. It does NOT mean the Pexels
-    // photos get shown early -- see the _aiImageGenerationSucceeded gate
-    // in the build method, which is the actual thing controlling when
-    // they're allowed to render.
     final userNote = _visualNoteController.text.trim();
     if (_imageBytes != null) {
       _generateAiPhotoSynthesis(
           customPrompt: userNote.isNotEmpty ? userNote : null);
     }
 
-    // Step 3: fetch real reference photos of the SAME recommended flower
-    // that Step 2 is asking the AI to paint into the photo. Fetching this
-    // concurrently (rather than waiting for Step 2 to finish first) just
-    // saves the user a few seconds -- the photos stay hidden regardless
-    // of when this finishes, until Step 2 actually succeeds.
     final recommendedList = (result['recommendedFlowers'] as List?) ?? [];
     final flowerQuery = recommendedList.isNotEmpty
         ? recommendedList.first.toString()
@@ -552,19 +564,60 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     if (mounted) {
       setState(() {
         _isLoadingFlowerPhotos = true;
-        _isAnalyzingImage = false; // Unlocks the results UI immediately
+        _isAnalyzingImage = false;
       });
     }
 
     await _fetchPexelsPhotos(flowerQuery);
   }
 
-  // Reservation Submission Action
+  Widget _paymentMethodChip(String value, String label, IconData icon, bool isDark) {
+    final selected = _selectedPaymentMethod == value;
+    return GestureDetector(
+      onTap: () => setState(() => _selectedPaymentMethod = value),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: selected
+              ? const Color(0xFFF59E0B)
+              : (isDark ? const Color(0xFF1E1E1E) : Colors.white),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+              color: selected ? const Color(0xFFF59E0B) : Colors.grey.withValues(alpha: 0.3)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 14, color: selected ? Colors.white : (isDark ? Colors.grey[300] : Colors.grey[700])),
+            const SizedBox(width: 6),
+            Text(label,
+                style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                    color: selected ? Colors.white : (isDark ? Colors.grey[300] : Colors.grey[700]))),
+          ],
+        ),
+      ),
+    );
+  }
+
   Future<void> _submitReservation() async {
+    if (_parsedBudget < _minimumBudget) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+              'Please enter a budget of at least ₱${_minimumBudget.toStringAsFixed(0)}.'),
+          backgroundColor: const Color(0xFFDC3545),
+        ),
+      );
+      return;
+    }
+
     final firstName = _firstNameController.text.trim();
     final lastName = _lastNameController.text.trim();
     final middleName = _middleNameController.text.trim();
     final phone = _phoneController.text.trim();
+    final email = _emailController.text.trim();
 
     if (firstName.isEmpty ||
         lastName.isEmpty ||
@@ -580,18 +633,43 @@ class _AIAssistantPageState extends State<AIAssistantPage>
       return;
     }
 
+    final isEWallet = _selectedPaymentMethod != 'physical';
+    if (isEWallet && email.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+              'Please enter an email address to receive your payment receipt.'),
+          backgroundColor: Color(0xFFDC3545),
+        ),
+      );
+      return;
+    }
+
+    final currentUser = FirebaseAuth.instance.currentUser;
+    if (currentUser == null) {
+      final loggedIn = await Navigator.push<bool>(
+        context,
+        MaterialPageRoute(
+          builder: (_) => const AuthPage(returnAfterLogin: true),
+        ),
+      );
+      if (!mounted) return;
+      if (loggedIn != true) {
+        return;
+      }
+      await _submitReservation();
+      return;
+    }
+
     setState(() {
       _isSubmittingReservation = true;
     });
 
     try {
-      // Upload whichever image best represents the final design -- the
-      // AI-generated decor if we have one, otherwise the original photo,
-      // so the web admin panel always has something to show if possible.
       String? uploadedPhotoUrl;
       final imageToUpload = _aiSynthesizedImageBytes ?? _imageBytes;
       if (imageToUpload != null) {
-        final uid = FirebaseAuth.instance.currentUser?.uid ?? 'guest';
+        final uid = currentUser.uid;
         final fileName =
             '${DateTime.now().millisecondsSinceEpoch}_$uid.png';
         final ref = FirebaseStorage.instance
@@ -609,9 +687,38 @@ class _AIAssistantPageState extends State<AIAssistantPage>
       final fullName = [firstName, middleName, lastName]
           .where((s) => s.isNotEmpty)
           .join(' ');
-      final eventDateStr = '${_selectedEventDate!.year.toString().padLeft(4, '0')}-'
-          '${_selectedEventDate!.month.toString().padLeft(2, '0')}-'
-          '${_selectedEventDate!.day.toString().padLeft(2, '0')}';
+      final eventDateStr = _formatDateStr(_selectedEventDate!);
+      final appointmentTimeStr =
+      _selectedEventTime != null ? _selectedEventTime!.format(context) : null;
+
+      final double budgetValue = _parsedBudget;
+      final double depositAmount = _depositAmount;
+
+      final Map<String, dynamic> paymentLedgerEntry = {
+        'amount': depositAmount,
+        'method': _selectedPaymentMethod,
+        'status': isEWallet ? 'pending_checkout' : 'pending_confirmation',
+        'note': isEWallet
+            ? 'Awaiting e-wallet deposit confirmation via PayMongo'
+            : 'To be collected in person / confirmed by staff',
+        'recorded_at': Timestamp.now(),
+      };
+
+      String? checkoutUrl;
+      String? checkoutSessionId;
+      if (isEWallet) {
+        setState(() => _isProcessingPayment = true);
+        final result = await PaymentService.createCheckoutSessionDetailed(
+          amount: depositAmount,
+          description: 'Deposit (50%) - $fullName ($eventDateStr)',
+          customerEmail: email,
+          customerName: fullName,
+          restrictToPaymentMethod: _paymongoMethodId,
+        );
+        checkoutUrl = result['checkoutUrl'];
+        checkoutSessionId = result['sessionId'];
+        if (mounted) setState(() => _isProcessingPayment = false);
+      }
 
       await FirebaseFirestore.instance
           .collection('branches')
@@ -623,7 +730,11 @@ class _AIAssistantPageState extends State<AIAssistantPage>
         'middle_name': middleName.isEmpty ? null : middleName,
         'last_name': lastName,
         'customer_phone': phone,
+        if (email.isNotEmpty) 'customer_email': email,
+        'customer_uid': currentUser.uid,
         'fulfillment_date': eventDateStr,
+        'appointment_date': eventDateStr,
+        if (appointmentTimeStr != null) 'appointment_time': appointmentTimeStr,
         'arrangement_details': _visualNoteController.text.trim(),
         'status': 'Pending Review',
         'source': 'visual_stylist',
@@ -632,8 +743,21 @@ class _AIAssistantPageState extends State<AIAssistantPage>
           'detected_theme': _visualResult!['detectedTheme'],
         if (_visualResult?['recommendedFlowers'] != null)
           'recommended_flowers': _visualResult!['recommendedFlowers'],
+        'customer_budget': budgetValue,
+        'total_amount': budgetValue,
+        'deposit_required': depositAmount,
+        'deposit_paid': false,
+        'amount_paid': 0.0,
+        'balance_due': budgetValue,
+        'payment_method': _selectedPaymentMethod,
+        if (checkoutSessionId != null) 'checkout_session_id': checkoutSessionId,
+        'payment_history': [paymentLedgerEntry],
         'created_at': FieldValue.serverTimestamp(),
       });
+
+      if (isEWallet && checkoutUrl != null) {
+        await launchUrl(Uri.parse(checkoutUrl), mode: LaunchMode.externalApplication);
+      }
 
       if (mounted) {
         setState(() {
@@ -641,10 +765,11 @@ class _AIAssistantPageState extends State<AIAssistantPage>
           _reservationSubmitted = true;
         });
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-                '✨ Reservation submitted! Our team will review it shortly.'),
-            backgroundColor: Color(0xFF10B981),
+          SnackBar(
+            content: Text(isEWallet
+                ? '✨ Reservation created! Complete your ₱${depositAmount.toStringAsFixed(0)} deposit in the page that just opened.'
+                : '✨ Reservation submitted! Please settle the ₱${depositAmount.toStringAsFixed(0)} deposit at the branch.'),
+            backgroundColor: const Color(0xFF10B981),
           ),
         );
       }
@@ -653,6 +778,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
       if (mounted) {
         setState(() {
           _isSubmittingReservation = false;
+          _isProcessingPayment = false;
         });
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -664,7 +790,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     }
   }
 
-  // Matchmaker Action
   Future<void> _generateMatch() async {
     setState(() {
       _isGeneratingMatch = true;
@@ -680,9 +805,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
       tone: _selectedTone,
     );
 
-    // If the customer chose to write their own card note, it overrides
-    // whatever Gemini generated -- their words take priority, Gemini's
-    // note is discarded entirely rather than shown alongside it.
     if (_useCustomCardNote && _customCardNoteController.text.trim().isNotEmpty) {
       result['cardNote'] = _customCardNoteController.text.trim();
     }
@@ -694,11 +816,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
       });
     }
 
-    // Fetch REAL photos of the actual flowers Gemini picked, via Pexels --
-    // done after the result is already shown so the card renders
-    // immediately with its existing fallback image, then upgrades to real
-    // photos once the search completes (non-blocking, same pattern used
-    // in the Visual Stylist tab).
     final formula = (result['flowerFormula'] as List?) ?? [];
     final flowerQuery = formula.isNotEmpty
         ? formula.first['flower']?.toString() ?? ''
@@ -767,7 +884,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
           labelColor: const Color(0xFFF59E0B),
           unselectedLabelColor: isDark ? Colors.grey[400] : Colors.grey[600],
           tabs: const [
-            Tab(icon: Icon(Icons.palette_outlined), text: 'Visual Stylist'),
+            Tab(icon: Icon(Icons.palette_outlined), text: 'Visual Stylist & Reservation'),
             Tab(icon: Icon(Icons.favorite_outline), text: 'Matchmaker'),
           ],
         ),
@@ -782,16 +899,12 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // TAB 1: VISUAL STYLIST & PHOTO ANALYZER
-  // ---------------------------------------------------------------------------
   Widget _buildVisualStylistTab(bool isDark) {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(20),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Header Card
           Container(
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
@@ -838,7 +951,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
           ),
           const SizedBox(height: 20),
 
-          // Image Picker Area
           GestureDetector(
             onTap: () => _showImageSourceBottomSheet(),
             child: Container(
@@ -906,7 +1018,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
           ),
           const SizedBox(height: 16),
 
-          // Optional Note input
           TextField(
             controller: _visualNoteController,
             decoration: InputDecoration(
@@ -922,7 +1033,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
           ),
           const SizedBox(height: 16),
 
-          // Analyze Button
           SizedBox(
             width: double.infinity,
             height: 50,
@@ -958,7 +1068,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
 
           const SizedBox(height: 24),
 
-          // Results
           if (_visualResult != null) ...[
             Text(
               'AI Visual Styling Analysis',
@@ -985,7 +1094,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // Room Virtual Staging Canvas & Image Preview
                   _buildRoomVirtualStagingWidget(isDark),
 
                   Padding(
@@ -993,13 +1101,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        // The theme/flower description text below is tied
-                        // to whether a REAL stylized image was generated --
-                        // it describes what's actually on screen, so it
-                        // would be misleading to show it next to a failed
-                        // generation or the generic placeholder.
                         if (_aiImageGenerationSucceeded) ...[
-                          // Aesthetic Theme
                           Row(
                             children: [
                               const Icon(Icons.style_outlined,
@@ -1024,7 +1126,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                           ),
                           const Divider(height: 24),
 
-                          // Color Palette
                           Text('Matching Color Palette:',
                               style: TextStyle(
                                   fontWeight: FontWeight.bold,
@@ -1053,7 +1154,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                           ),
                           const SizedBox(height: 16),
 
-                          // Recommended Flowers
                           Text('Recommended Flowers:',
                               style: TextStyle(
                                   fontWeight: FontWeight.bold,
@@ -1083,7 +1183,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
 
                           const SizedBox(height: 16),
 
-                          // Arrangement Style
                           Text('Arrangement Style:',
                               style: TextStyle(
                                   fontWeight: FontWeight.bold,
@@ -1099,7 +1198,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
 
                           const SizedBox(height: 16),
 
-                          // Matching Reason
                           Text('Stylist Note:',
                               style: TextStyle(
                                   fontWeight: FontWeight.bold,
@@ -1172,11 +1270,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                             ),
                           ),
                         ] else ...[
-                          // Fallback shown when AI photo generation didn't
-                          // succeed -- we don't know for certain the theme
-                          // matches an un-generated image, so we say so
-                          // plainly instead of guessing. The Pexels photos
-                          // stay hidden here too, per the gate below.
                           Container(
                             padding: const EdgeInsets.all(12),
                             decoration: BoxDecoration(
@@ -1214,7 +1307,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
 
                         const SizedBox(height: 20),
 
-                        // Action Buttons
                         Row(
                           children: [
                             Expanded(
@@ -1249,13 +1341,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                           ],
                         ),
 
-                        // Related Flower Reference Photos (from Pexels) --
-                        // gated on _aiImageGenerationSucceeded so this only
-                        // ever shows once we KNOW a real image is on screen,
-                        // matching the flower that was actually generated.
-                        // If generation fails, this stays hidden entirely,
-                        // even if the Pexels fetch itself already finished
-                        // in the background.
                         if (_aiImageGenerationSucceeded &&
                             _flowerReferencePhotos.isNotEmpty) ...[
                           const SizedBox(height: 20),
@@ -1315,7 +1400,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                           ),
                         ],
 
-                        // Reservation Details Form
                         const SizedBox(height: 20),
                         const Divider(),
                         const SizedBox(height: 8),
@@ -1425,6 +1509,12 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                             ),
                           ),
                           const SizedBox(height: 10),
+                          // NEW: date field now runs an availability check
+                          // BEFORE accepting the picked date. If the
+                          // business has blocked the date, or the day is
+                          // already at capacity, the date is rejected here
+                          // -- the customer never even gets to see it
+                          // "selected" only to fail at submission time.
                           InkWell(
                             onTap: () async {
                               final picked = await showDatePicker(
@@ -1436,9 +1526,25 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                                 lastDate: DateTime.now()
                                     .add(const Duration(days: 365)),
                               );
-                              if (picked != null) {
-                                setState(() => _selectedEventDate = picked);
+                              if (picked == null) return;
+
+                              setState(() => _isCheckingAvailability = true);
+                              final check = await _checkDateAvailability(picked);
+                              if (mounted) setState(() => _isCheckingAvailability = false);
+
+                              if (check['available'] != true) {
+                                if (mounted) {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      content: Text(check['reason'] ?? 'This date is unavailable.'),
+                                      backgroundColor: const Color(0xFFDC3545),
+                                    ),
+                                  );
+                                }
+                                return;
                               }
+
+                              setState(() => _selectedEventDate = picked);
                             },
                             child: InputDecorator(
                               decoration: InputDecoration(
@@ -1448,7 +1554,16 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                                 fillColor: isDark
                                     ? const Color(0xFF262626)
                                     : Colors.white,
-                                prefixIcon: const Icon(
+                                prefixIcon: _isCheckingAvailability
+                                    ? const Padding(
+                                  padding: EdgeInsets.all(12.0),
+                                  child: SizedBox(
+                                    width: 16,
+                                    height: 16,
+                                    child: CircularProgressIndicator(strokeWidth: 2),
+                                  ),
+                                )
+                                    : const Icon(
                                     Icons.calendar_month_outlined,
                                     size: 18,
                                     color: Color(0xFFF59E0B)),
@@ -1469,12 +1584,189 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                               ),
                             ),
                           ),
+                          const SizedBox(height: 10),
+                          InkWell(
+                            onTap: () async {
+                              final picked = await showTimePicker(
+                                context: context,
+                                initialTime: _selectedEventTime ??
+                                    const TimeOfDay(hour: 10, minute: 0),
+                              );
+                              if (picked != null) {
+                                setState(() => _selectedEventTime = picked);
+                              }
+                            },
+                            child: InputDecorator(
+                              decoration: InputDecoration(
+                                labelText: 'Preferred Time',
+                                isDense: true,
+                                filled: true,
+                                fillColor: isDark
+                                    ? const Color(0xFF262626)
+                                    : Colors.white,
+                                prefixIcon: const Icon(
+                                    Icons.access_time_rounded,
+                                    size: 18,
+                                    color: Color(0xFFF59E0B)),
+                                border: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(10)),
+                              ),
+                              child: Text(
+                                _selectedEventTime == null
+                                    ? 'Tap to select a time'
+                                    : _selectedEventTime!.format(context),
+                                style: TextStyle(
+                                  color: _selectedEventTime == null
+                                      ? Colors.grey[500]
+                                      : (isDark
+                                      ? Colors.white
+                                      : Colors.black87),
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 14),
+                          Container(
+                            padding: const EdgeInsets.all(14),
+                            decoration: BoxDecoration(
+                              color: isDark
+                                  ? const Color(0xFF262626)
+                                  : const Color(0xFFFFFBEB),
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                  color: const Color(0xFFF59E0B)
+                                      .withValues(alpha: 0.3)),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  children: [
+                                    const Icon(Icons.savings_outlined,
+                                        color: Color(0xFFF59E0B), size: 18),
+                                    const SizedBox(width: 8),
+                                    Expanded(
+                                      child: Text(
+                                        'Budget Range',
+                                        style: TextStyle(
+                                            fontSize: 13,
+                                            fontWeight: FontWeight.w800,
+                                            color: isDark
+                                                ? Colors.white
+                                                : Colors.black87),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 8),
+                                TextField(
+                                  controller: _budgetController,
+                                  keyboardType: const TextInputType.numberWithOptions(decimal: false),
+                                  onChanged: (_) => setState(() {}),
+                                  decoration: InputDecoration(
+                                    labelText: 'Estimated Arrangement Budget',
+                                    hintText: 'Minimum ₱${_minimumBudget.toStringAsFixed(0)}',
+                                    prefixText: '₱ ',
+                                    isDense: true,
+                                    filled: true,
+                                    fillColor: isDark
+                                        ? const Color(0xFF1E1E1E)
+                                        : Colors.white,
+                                    border: OutlineInputBorder(
+                                        borderRadius: BorderRadius.circular(10)),
+                                  ),
+                                ),
+                                // NEW: standing note, always visible so the
+                                // 50% deposit expectation is clear before
+                                // the customer even types a number.
+                                const SizedBox(height: 6),
+                                Text(
+                                  'A 50% deposit of your budget is required to confirm this reservation.',
+                                  style: TextStyle(
+                                      fontSize: 10.5,
+                                      color: isDark ? Colors.grey[400] : Colors.grey[600],
+                                      fontStyle: FontStyle.italic),
+                                ),
+                                if (_budgetController.text.trim().isNotEmpty) ...[
+                                  const SizedBox(height: 8),
+                                  if (_parsedBudget < _minimumBudget)
+                                    Text(
+                                      'Budget must be at least ₱${_minimumBudget.toStringAsFixed(0)}.',
+                                      style: const TextStyle(
+                                          fontSize: 11,
+                                          color: Color(0xFFDC3545),
+                                          fontWeight: FontWeight.w600),
+                                    )
+                                  else
+                                    Text(
+                                      'Deposit due now (50%): ₱${_depositAmount.toStringAsFixed(2)}',
+                                      style: const TextStyle(
+                                          fontSize: 12,
+                                          color: Color(0xFFF59E0B),
+                                          fontWeight: FontWeight.w800),
+                                    ),
+                                ],
+                                const SizedBox(height: 14),
+                                Text('How will you pay the deposit?',
+                                    style: TextStyle(
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.bold,
+                                        color: isDark
+                                            ? Colors.grey[300]
+                                            : Colors.grey[700])),
+                                const SizedBox(height: 8),
+                                Wrap(
+                                  spacing: 8,
+                                  runSpacing: 8,
+                                  children: [
+                                    _paymentMethodChip(
+                                        'gcash',
+                                        'GCash',
+                                        Icons
+                                            .account_balance_wallet_outlined,
+                                        isDark),
+                                    _paymentMethodChip(
+                                        'maya',
+                                        'Maya',
+                                        Icons
+                                            .account_balance_wallet_outlined,
+                                        isDark),
+                                    _paymentMethodChip(
+                                        'physical',
+                                        'Pay at Branch',
+                                        Icons.storefront_outlined,
+                                        isDark),
+                                  ],
+                                ),
+                                if (_selectedPaymentMethod != 'physical') ...[
+                                  const SizedBox(height: 12),
+                                  TextField(
+                                    controller: _emailController,
+                                    keyboardType:
+                                    TextInputType.emailAddress,
+                                    decoration: InputDecoration(
+                                      labelText: 'Email (for payment receipt)',
+                                      isDense: true,
+                                      filled: true,
+                                      fillColor: isDark
+                                          ? const Color(0xFF1E1E1E)
+                                          : Colors.white,
+                                      border: OutlineInputBorder(
+                                          borderRadius:
+                                          BorderRadius.circular(10)),
+                                    ),
+                                  ),
+                                ],
+                              ],
+                            ),
+                          ),
                           const SizedBox(height: 14),
                           SizedBox(
                             width: double.infinity,
                             height: 48,
                             child: ElevatedButton.icon(
-                              onPressed: _isSubmittingReservation
+                              onPressed: (_isSubmittingReservation ||
+                                  _isProcessingPayment)
                                   ? null
                                   : _submitReservation,
                               style: ElevatedButton.styleFrom(
@@ -1484,7 +1776,8 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                                     borderRadius:
                                     BorderRadius.circular(12)),
                               ),
-                              icon: _isSubmittingReservation
+                              icon: (_isSubmittingReservation ||
+                                  _isProcessingPayment)
                                   ? const SizedBox(
                                 width: 18,
                                 height: 18,
@@ -1494,7 +1787,9 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                               )
                                   : const Icon(Icons.event_available),
                               label: Text(
-                                _isSubmittingReservation
+                                _isProcessingPayment
+                                    ? 'Preparing Payment...'
+                                    : _isSubmittingReservation
                                     ? 'Submitting...'
                                     : 'Submit Reservation',
                                 style: const TextStyle(
@@ -1520,7 +1815,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        // Mode Switcher Bar
         Container(
           margin: const EdgeInsets.fromLTRB(12, 12, 12, 8),
           padding: const EdgeInsets.all(4),
@@ -1621,7 +1915,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
         ),
 
         if (_showStagedRoom) ...[
-          // Interactive Room Photo Canvas with Floral Overlay / Gemini API Direct Edited Picture
           ClipRRect(
             borderRadius: const BorderRadius.vertical(top: Radius.circular(12)),
             child: Container(
@@ -1631,7 +1924,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
               child: Stack(
                 fit: StackFit.expand,
                 children: [
-                  // A. Gemini API Synthesized/Edited Direct Picture Result
                   if (_aiSynthesizedImageBytes != null)
                     Image.memory(
                       _aiSynthesizedImageBytes!,
@@ -1639,7 +1931,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                       width: double.infinity,
                       height: double.infinity,
                     )
-                  // B. User's Uploaded Room Photo Background
                   else if (_imageBytes != null)
                     Image.memory(
                       _imageBytes!,
@@ -1702,7 +1993,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                         ],
                       ),
 
-                  // C. Photorealistic Floral Overlay (ONLY rendered when NO user photo is uploaded and NOT in AI synthesis mode)
                   if (_aiSynthesizedImageBytes == null &&
                       _imageBytes == null &&
                       _selectedImage == null &&
@@ -1715,8 +2005,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                         onPanUpdate: (details) {
                           setState(() {
                             if (_showFullGeminiAiBlend) {
-                              _showFullGeminiAiBlend =
-                              false; // switch to manual drag on user interaction
+                              _showFullGeminiAiBlend = false;
                             }
                             _flowerPosition += details.delta;
                           });
@@ -1746,7 +2035,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                                   ),
                                 ),
                               ),
-                              // Seamless Transparent Cutout (No rectangular card box frame)
                               SizedBox(
                                 width: 210,
                                 height: 250,
@@ -1815,7 +2103,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                       ),
                     ),
 
-                  // D. Non-blocking Status Banner when calling Gemini API
                   if (_isSynthesizingAiImage)
                     Positioned(
                       bottom: 12,
@@ -1854,7 +2141,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                       ),
                     ),
 
-                  // Top Indicator Badge & Mode Toggle
                   Positioned(
                     top: 10,
                     left: 10,
@@ -1887,7 +2173,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                     ),
                   ),
 
-                  // Save & Reset Buttons
                   Positioned(
                     top: 10,
                     right: 10,
@@ -1969,7 +2254,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
             ),
           ),
         ] else ...[
-          // Reference Catalog Photo View
           if (_visualResult!['imageUrl'] != null)
             ClipRRect(
               borderRadius:
@@ -2018,9 +2302,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // TAB 2: PERSONAL MATCHMAKER (QUIZ & CUSTOM CREATIONS)
-  // ---------------------------------------------------------------------------
   Widget _buildMatchmakerTab(bool isDark) {
     final recipients = [
       'Partner / Spouse',
@@ -2062,7 +2343,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Banner
           Container(
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
@@ -2099,7 +2379,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
           ),
           const SizedBox(height: 20),
 
-          // Quiz Fields
           _buildDropdownSection(
               '1. Who is this for?', _selectedRecipient, recipients, (val) {
             if (val != null) setState(() => _selectedRecipient = val);
@@ -2120,9 +2399,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                 if (val != null) setState(() => _selectedBudget = val);
               }, isDark),
 
-          // 5. Card note: AI-generated (with a tone dropdown) OR the
-          // customer's own words entirely. Some occasions call for
-          // something too personal for AI to write believably.
           Padding(
             padding: const EdgeInsets.only(bottom: 6.0),
             child: Text('5. Card Message',
@@ -2188,7 +2464,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
 
           const SizedBox(height: 16),
 
-          // Submit Button
           SizedBox(
             width: double.infinity,
             height: 52,
@@ -2219,7 +2494,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
 
           const SizedBox(height: 24),
 
-          // Results
           if (_matchResult != null) ...[
             Text(
               'Your Custom AI Creation',
@@ -2246,11 +2520,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // Bouquet Preview Image -- prefers a REAL Pexels photo of
-                  // the actual flowers Gemini chose (_matchPhotos), falling
-                  // back to the old hardcoded keyword-matched Unsplash pick
-                  // only if the Pexels search comes back empty or hasn't
-                  // finished yet.
                   if (_matchPhotos.isNotEmpty ||
                       _matchResult!['imageUrl'] != null)
                     ClipRRect(
@@ -2342,7 +2611,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
 
                         const Divider(height: 24),
 
-                        // Stem Formula Breakdown
                         Text(
                           'Stem Formula (For 3D Builder):',
                           style: TextStyle(
@@ -2386,7 +2654,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
 
                         const SizedBox(height: 16),
 
-                        // Card Note
                         Container(
                           padding: const EdgeInsets.all(14),
                           decoration: BoxDecoration(
@@ -2452,7 +2719,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
 
                         const SizedBox(height: 12),
 
-                        // Care Tip
                         if (_matchResult!['careTip'] != null)
                           Row(
                             crossAxisAlignment: CrossAxisAlignment.start,
@@ -2558,13 +2824,8 @@ class PottedFlowerPainter extends CustomPainter {
     final double w = size.width;
     final double h = size.height;
 
-    // 1. Draw Stems & Leaves inside vase
     _drawStemsAndLeaves(canvas, w, h);
-
-    // 2. Draw Flowers on top
     _drawFlowers(canvas, w, h);
-
-    // 3. Draw Pot / Glass Crystal Vase (Paso) over stems for realistic glass transparency!
     _drawPot(canvas, w, h);
   }
 
@@ -2580,7 +2841,6 @@ class PottedFlowerPainter extends CustomPainter {
     final potLeftBottom = (w - potBottomWidth) / 2;
     final potRightBottom = potLeftBottom + potBottomWidth;
 
-    // Body
     potPath.moveTo(potLeftTop, potTopY);
     potPath.lineTo(potRightTop, potTopY);
     potPath.lineTo(potRightBottom, potBottomY);
@@ -2595,7 +2855,7 @@ class PottedFlowerPainter extends CustomPainter {
         rimColor = const Color(0xFFD1D5DB);
         break;
       case 'glass':
-        potColor = const Color(0x66E0F2FE); // Semi-transparent glass vase water
+        potColor = const Color(0x66E0F2FE);
         rimColor = const Color(0xCC38BDF8);
         break;
       case 'gold':
@@ -2614,7 +2874,6 @@ class PottedFlowerPainter extends CustomPainter {
       ..style = PaintingStyle.fill;
     canvas.drawPath(potPath, potPaint);
 
-    // Water level for Glass Vase
     if (potType == 'glass') {
       final waterPath = Path();
       final waterY = potTopY + (potBottomY - potTopY) * 0.35;
@@ -2630,7 +2889,6 @@ class PottedFlowerPainter extends CustomPainter {
         Paint()..color = const Color(0x440284C7),
       );
 
-      // Glass shine highlight
       final shinePath = Path()
         ..moveTo(potLeftTop + 8, potTopY + 4)
         ..lineTo(potLeftTop + 16, potTopY + 4)
@@ -2643,7 +2901,6 @@ class PottedFlowerPainter extends CustomPainter {
       );
     }
 
-    // Rim
     final rimRect = RRect.fromLTRBR(
       potLeftTop - 4,
       potTopY - 8,
@@ -2656,7 +2913,6 @@ class PottedFlowerPainter extends CustomPainter {
       Paint()..color = rimColor,
     );
 
-    // Glass / Pot 3D outline highlight
     canvas.drawPath(
       potPath,
       Paint()
@@ -2681,25 +2937,21 @@ class PottedFlowerPainter extends CustomPainter {
 
     final potTopY = h * 0.60;
 
-    // Stem 1 (Center)
     final path1 = Path()
       ..moveTo(w * 0.5, potTopY)
       ..quadraticBezierTo(w * 0.48, h * 0.4, w * 0.5, h * 0.22);
     canvas.drawPath(path1, stemPaint);
 
-    // Stem 2 (Left)
     final path2 = Path()
       ..moveTo(w * 0.48, potTopY)
       ..quadraticBezierTo(w * 0.3, h * 0.45, w * 0.28, h * 0.32);
     canvas.drawPath(path2, stemPaint);
 
-    // Stem 3 (Right)
     final path3 = Path()
       ..moveTo(w * 0.52, potTopY)
       ..quadraticBezierTo(w * 0.7, h * 0.42, w * 0.72, h * 0.28);
     canvas.drawPath(path3, stemPaint);
 
-    // Leaves
     _drawLeaf(canvas, w * 0.38, h * 0.48, -0.6, leafPaint);
     _drawLeaf(canvas, w * 0.62, h * 0.46, 0.6, leafPaint);
     _drawLeaf(canvas, w * 0.42, h * 0.35, -0.4, leafPaint);
@@ -2750,7 +3002,6 @@ class PottedFlowerPainter extends CustomPainter {
   }
 
   void _drawSunflower(Canvas canvas, double cx, double cy, double radius) {
-    // Inner Layer 1: Outer Petals with Gradient
     for (int i = 0; i < 16; i++) {
       final angle = (i * math.pi / 8);
       canvas.save();
@@ -2775,7 +3026,6 @@ class PottedFlowerPainter extends CustomPainter {
       canvas.restore();
     }
 
-    // Inner Layer 2: Secondary Petals
     for (int i = 0; i < 16; i++) {
       final angle = (i * math.pi / 8) + (math.pi / 16);
       canvas.save();
@@ -2796,7 +3046,6 @@ class PottedFlowerPainter extends CustomPainter {
       canvas.restore();
     }
 
-    // Textured Center Disk with Radial Shading
     final centerRect =
     Rect.fromCircle(center: Offset(cx, cy), radius: radius * 0.45);
     final centerPaint = Paint()
@@ -2811,7 +3060,6 @@ class PottedFlowerPainter extends CustomPainter {
       );
     canvas.drawCircle(Offset(cx, cy), radius * 0.45, centerPaint);
 
-    // Center seed texture dots
     final dotPaint = Paint()..color = const Color(0xFFFDE68A).withValues(alpha: 0.4);
     for (int d = 0; d < 12; d++) {
       final dotAngle = d * (math.pi / 6);
@@ -2837,7 +3085,6 @@ class PottedFlowerPainter extends CustomPainter {
 
     canvas.drawCircle(Offset(cx, cy), radius, rosePaint);
 
-    // Overlapping Rose Petal Swirls
     final swirlPaint = Paint()
       ..color = Colors.white.withValues(alpha: 0.2)
       ..style = PaintingStyle.stroke

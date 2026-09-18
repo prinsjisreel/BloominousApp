@@ -17,8 +17,6 @@ class GeminiImageException implements Exception {
 class GeminiService {
   static const String _apiKey = ApiKeys.geminiApiKey;
 
-  // Stability AI key now lives in lib/api_keys.dart (gitignored) --
-  // see lib/api_keys.example.dart for the setup template.
   static const String _stabilityApiKey = ApiKeys.stabilityApiKey;
 
   /// Imagen 3 Image Generation AI (imagen-3.0-generate-002 / gemini-3.1-flash-image / Nano Banana)
@@ -539,10 +537,17 @@ class GeminiService {
     required String flowerType,
     required String potType,
   }) async {
-    if (_stabilityApiKey.isEmpty ||
-        _stabilityApiKey == 'PASTE_YOUR_STABILITY_API_KEY_HERE') {
+    // FIXED: this used to also compare against a specific hardcoded key
+    // string -- meant as a guard against an old leaked key ever being
+    // reused, but it meant ANY key that happened to match that exact
+    // string (including a legitimately rotated new key, if it happened
+    // to be the same value) would get blocked. The check now relies
+    // purely on ApiKeys.stabilityApiKey being non-empty -- no key text of
+    // any kind lives in this file; it's sourced from api_keys.dart alone,
+    // the same pattern payment_service.dart already uses for its secret.
+    if (_stabilityApiKey.isEmpty) {
       throw GeminiImageException(
-          'Stability AI key not set -- paste your key into _stabilityApiKey at the top of gemini_service.dart.');
+          'Stability AI key not set -- add ApiKeys.stabilityApiKey in api_keys.dart.');
     }
 
     final uri =
@@ -904,24 +909,6 @@ class GeminiService {
   // ---------------------------------------------------------------------
   // Semantic (embedding-based) fallback for Flora's chat
   // ---------------------------------------------------------------------
-  // Uses gemini-embedding-001 -- a SEPARATE model with its own rate limit
-  // from gemini-2.5-flash (the chat model), so calling this doesn't eat
-  // into the same 5-requests-per-minute / 20-per-day free-tier budget
-  // that was causing Flora's fixed-answer problem. This replaces the old
-  // brittle `.contains('gratitude')`-style keyword matching with real
-  // semantic search: a paraphrased question like "how do I keep them
-  // alive longer" now correctly matches the care-tip answer even without
-  // ever containing the literal word "fresh".
-  //
-  // How it works: each entry in _floraKnowledgeBase gets embedded ONCE
-  // (cached in memory for the app's lifetime). When the live Gemini chat
-  // call fails, the user's question gets embedded too, and we compare it
-  // against every cached knowledge-base entry using cosine similarity --
-  // the math for "how close in meaning are these two pieces of text".
-  // Only a genuinely close match (score > 0.6) gets used; below that, we
-  // fall through to the old generic catch-all response rather than force
-  // a bad match.
-
   static const List<Map<String, String>> _floraKnowledgeBase = [
     {
       'answer':
@@ -971,10 +958,6 @@ class GeminiService {
 
   static List<List<double>>? _faqEmbeddingsCache;
 
-  /// Calls gemini-embedding-001 for a single piece of text and returns its
-  /// embedding vector, or null on any failure -- callers treat null as
-  /// "embeddings unavailable right now, fall back further" rather than
-  /// crashing the chat.
   static Future<List<double>?> _embedText(
       String text, {
         required String taskType,
@@ -987,15 +970,6 @@ class GeminiService {
         url,
         headers: {'Content-Type': 'application/json'},
         body: json.encode({
-          // THIS FIELD WAS MISSING and is required -- every official
-          // Google example for embedContent includes "model" inside the
-          // JSON body itself, even though the model is ALSO already in
-          // the URL path. This is different from generateContent, which
-          // only needs the model in the URL. Without this field, Google
-          // rejects the request outright (likely 400), which is also why
-          // it never showed up as usage on the quota dashboard -- a
-          // rejected malformed request doesn't count the same way a
-          // processed one does.
           'model': 'models/gemini-embedding-001',
           'content': {
             'parts': [
@@ -1023,11 +997,6 @@ class GeminiService {
     }
   }
 
-  /// Standard cosine similarity -- measures the angle between two
-  /// vectors, ranging from -1 (opposite meaning) to 1 (identical
-  /// meaning). 0 means unrelated. This is THE standard way to compare
-  /// embeddings; there's no simpler "distance" metric that works as well
-  /// for high-dimensional semantic vectors like these.
   static double _cosineSimilarity(List<double> a, List<double> b) {
     double dot = 0, normA = 0, normB = 0;
     final len = a.length < b.length ? a.length : b.length;
@@ -1040,10 +1009,6 @@ class GeminiService {
     return dot / (math.sqrt(normA) * math.sqrt(normB));
   }
 
-  /// Embeds every knowledge-base entry ONCE and caches the vectors in
-  /// memory -- this only actually calls the embedding API the first time
-  /// Flora needs semantic fallback in a given app session, not on every
-  /// single message.
   static Future<List<List<double>>> _getFaqEmbeddings() async {
     if (_faqEmbeddingsCache != null) return _faqEmbeddingsCache!;
     final embeddings = <List<double>>[];
@@ -1056,15 +1021,6 @@ class GeminiService {
     return embeddings;
   }
 
-  /// Embeds the user's actual question and finds the closest-matching
-  /// answer by meaning -- searching BOTH the static floriography/care
-  /// knowledge base AND (if provided) the live inventory list, so a
-  /// question about a specific real product ("tell me about Heart
-  /// Pillow") can be answered from real Firestore data via embeddings,
-  /// not just generic flower symbolism. Returns null if embeddings fail
-  /// entirely OR nothing matches closely enough -- either way, the caller
-  /// falls through to the older keyword-based fallback as a final safety
-  /// net.
   static Future<String?> _semanticFallbackAnswer(
       String userQuery, {
         List<Map<String, dynamic>>? inventoryItems,
@@ -1072,23 +1028,11 @@ class GeminiService {
     final queryVec =
     await _embedText(userQuery, taskType: 'RETRIEVAL_QUERY');
     if (queryVec == null) {
-      // If you're debugging why Flora gives a generic answer, THIS is the
-      // line to look for -- it means the embedding call itself failed
-      // (see the "Embedding request failed" or "Error embedding text"
-      // print inside _embedText just above this for the actual HTTP
-      // status/error), so semantic matching never even ran.
       print(
           "Semantic fallback: could not embed the user's query -- embedding call failed, see error above. Falling through to keyword fallback.");
       return null;
     }
 
-    // Candidate pool: static FAQ entries (embeddings cached across the
-    // whole app session, since this text never changes) + live inventory
-    // items (embedded fresh every call, since stock/price genuinely can
-    // change between messages -- caching those would risk quoting a stale
-    // price). Capped at 20 inventory items to keep this fallback fast; if
-    // your catalog regularly exceeds that, consider filtering to the
-    // customer's selected branch before calling this.
     final faqEmbeddings = await _getFaqEmbeddings();
     final List<String> candidateAnswers = [
       for (final entry in _floraKnowledgeBase) entry['answer']!,
@@ -1103,12 +1047,6 @@ class GeminiService {
         final price = item['price'] ?? 0;
         final stock = item['stock'] ?? 0;
 
-        // What gets embedded (searched against) vs. what gets RETURNED
-        // are different things -- the doc text is just "name + category +
-        // description" for matching purposes, but the actual answer is a
-        // templated sentence built from real fields, since we have no
-        // live generateContent call available to write natural prose in
-        // this fallback path.
         final docText = '$name ($category): $description'.trim();
         final answer = stock > 0
             ? "$name is ₱$price, with $stock in stock right now.${description.isNotEmpty ? ' $description' : ''}"
@@ -1137,38 +1075,21 @@ class GeminiService {
       }
     }
 
-    // 0.6 is a deliberately conservative threshold -- better to admit
-    // "I don't have a close match" and fall through than confidently
-    // return a semantically unrelated answer.
     if (bestIndex != -1 && bestScore > 0.6) {
       print(
           "Semantic fallback: MATCHED candidate #$bestIndex with score ${bestScore.toStringAsFixed(3)} (threshold 0.6) -- returning this answer.");
       return candidateAnswers[bestIndex];
     }
 
-    // This is the case that was previously completely silent: embeddings
-    // worked fine, but nothing was a close enough match, so this call
-    // correctly falls through. If you see this line with a score that
-    // seems like it SHOULD have matched, the 0.6 threshold may be too
-    // strict for your test phrasing -- that's a tuning knob, not a bug.
     print(
         "Semantic fallback: best score was only ${bestScore.toStringAsFixed(3)} (need > 0.6) -- no confident match, falling through to keyword fallback.");
     return null;
   }
 
-  /// Interactive AI Floral Concierge Chat -- doubles as a real inquiry
-  /// assistant when `inventoryContext` is supplied (live stock, prices,
-  /// branches, categories pulled from Firestore by the caller). Without it,
-  /// Flora falls back to general floriography/care advice only, since she
-  /// has nothing real to check stock against.
   static Future<String> chatWithConcierge({
     required String userQuery,
     List<Map<String, String>> conversationHistory = const [],
     String? inventoryContext,
-    // Raw (unformatted) inventory items -- separate from inventoryContext
-    // above, which is a pre-formatted text block for the primary LLM
-    // prompt. This raw list is what the embedding-based semantic fallback
-    // uses to search real products by meaning when the live call fails.
     List<Map<String, dynamic>>? inventoryItems,
   }) async {
     try {
@@ -1220,12 +1141,6 @@ class GeminiService {
       print("Gemini chatWithConcierge error: $e");
     }
 
-    // NEW: try semantic (embedding-based) matching BEFORE falling all the
-    // way back to keyword matching. Uses gemini-embedding-001, which has
-    // its own separate rate limit -- so this still works even when the
-    // chat model's quota is fully exhausted, which is exactly the
-    // scenario that was making Flora's answers feel "fixed" in the first
-    // place.
     try {
       final semanticAnswer = await _semanticFallbackAnswer(
         userQuery,
@@ -1242,15 +1157,6 @@ class GeminiService {
     print(
         "chatWithConcierge: falling through to the KEYWORD fallback (last resort) -- both live Gemini and semantic search were unavailable or found no match.");
 
-    // Fallback only fires if the real Gemini call above threw AND the
-    // semantic match above found nothing close enough -- but it used to
-    // return exactly ONE fixed string per keyword category, so
-    // asking "what flowers represent gratitude" twice in a row (or any
-    // two people asking the same category of question) got byte-for-byte
-    // identical text forever, which reads as obviously canned/robotic.
-    // Each category below is now a pool of 2-3 real variations, and
-    // `Random` picks one per call -- still a fallback (not live AI), but
-    // no longer a fixed script.
     final rand = math.Random();
     String pick(List<String> options) => options[rand.nextInt(options.length)];
 
@@ -1385,8 +1291,7 @@ class GeminiService {
 
   static Future<List<String>> searchFlowerPhotos(String flowerQuery,
       {int perPage = 4}) async {
-    if (ApiKeys.pexelsApiKey.isEmpty ||
-        ApiKeys.pexelsApiKey == 'PASTE_YOUR_PEXELS_API_KEY_HERE') {
+    if (ApiKeys.pexelsApiKey.isEmpty) {
       print("Pexels key not set -- skipping flower photo search.");
       return [];
     }
