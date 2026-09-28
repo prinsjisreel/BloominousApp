@@ -25,11 +25,16 @@ class _SalesAnomaliesPageState extends State<SalesAnomaliesPage> {
   final FirebaseFirestore _db = FirebaseFirestore.instance;
   String _severityFilter = 'all';
 
+  // NEW: peakAvgMultiplier / peakCriticalMultiplier added alongside the
+  // original numeric fields — same settings/anomaly_config document the
+  // web dashboard now writes these two keys to.
   final Map<String, TextEditingController> _controllers = {
     'avgMultiplier': TextEditingController(),
     'criticalMultiplier': TextEditingController(),
     'minBaselineTransactions': TextEditingController(),
     'fallbackHighValueThreshold': TextEditingController(),
+    'peakAvgMultiplier': TextEditingController(),
+    'peakCriticalMultiplier': TextEditingController(),
     'voidWindowHours': TextEditingController(),
     'voidCountMedium': TextEditingController(),
     'voidCountCritical': TextEditingController(),
@@ -42,13 +47,23 @@ class _SalesAnomaliesPageState extends State<SalesAnomaliesPage> {
     'criticalMultiplier': FocusNode(),
     'minBaselineTransactions': FocusNode(),
     'fallbackHighValueThreshold': FocusNode(),
+    'peakAvgMultiplier': FocusNode(),
+    'peakCriticalMultiplier': FocusNode(),
     'voidWindowHours': FocusNode(),
     'voidCountMedium': FocusNode(),
     'voidCountCritical': FocusNode(),
     'discountMediumPercent': FocusNode(),
     'discountCriticalPercent': FocusNode(),
   };
-  bool get _anyFieldFocused => _focusNodes.values.any((f) => f.hasFocus);
+
+  // NEW: peakDates is a multi-line date-range list, not a single number —
+  // it gets its own controller/focus node rather than living in the
+  // numeric maps above.
+  final TextEditingController _peakDatesController = TextEditingController();
+  final FocusNode _peakDatesFocus = FocusNode();
+
+  bool get _anyFieldFocused =>
+      _focusNodes.values.any((f) => f.hasFocus) || _peakDatesFocus.hasFocus;
 
   String _storeOpenTime24 = '08:00';
   String _storeCloseTime24 = '20:00';
@@ -72,6 +87,8 @@ class _SalesAnomaliesPageState extends State<SalesAnomaliesPage> {
     for (final f in _focusNodes.values) {
       f.dispose();
     }
+    _peakDatesController.dispose();
+    _peakDatesFocus.dispose();
     super.dispose();
   }
 
@@ -87,6 +104,35 @@ class _SalesAnomaliesPageState extends State<SalesAnomaliesPage> {
     return '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
   }
 
+  // NEW: turns the textarea's "2026-02-10 to 2026-02-15" lines into the
+  // {start, end} map shape the web engine's checkValueSpike() expects.
+  // Mirrors sales_anomalies.js's parsePeakDatesText() exactly, so a range
+  // typed in the app reads back correctly on web and vice versa.
+  List<Map<String, String>> _parsePeakDatesText(String text) {
+    return text
+        .split('\n')
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .map((line) {
+      final parts = line.split(RegExp(r'\s+to\s+', caseSensitive: false)).map((p) => p.trim()).toList();
+      final start = parts.isNotEmpty ? parts[0] : '';
+      final end = parts.length > 1 ? parts[1] : start;
+      return {'start': start, 'end': end};
+    })
+        .where((r) => (r['start'] ?? '').isNotEmpty && (r['end'] ?? '').isNotEmpty)
+        .toList();
+  }
+
+  // The reverse of the above — turns the stored array back into editable
+  // textarea lines.
+  String _peakDatesToText(List<dynamic>? ranges) {
+    if (ranges == null) return '';
+    return ranges.map((r) {
+      final map = r as Map<String, dynamic>;
+      return '${map['start'] ?? ''} to ${map['end'] ?? ''}';
+    }).join('\n');
+  }
+
   void _listenToConfig() {
     _configSub = _db.collection('settings').doc('anomaly_config').snapshots().listen((doc) {
       if (_anyFieldFocused) return;
@@ -97,6 +143,9 @@ class _SalesAnomaliesPageState extends State<SalesAnomaliesPage> {
         _controllers['criticalMultiplier']!.text = (data['criticalMultiplier'] ?? 10).toString();
         _controllers['minBaselineTransactions']!.text = (data['minBaselineTransactions'] ?? 5).toString();
         _controllers['fallbackHighValueThreshold']!.text = (data['fallbackHighValueThreshold'] ?? 5000).toString();
+        _controllers['peakAvgMultiplier']!.text = (data['peakAvgMultiplier'] ?? 8).toString();
+        _controllers['peakCriticalMultiplier']!.text = (data['peakCriticalMultiplier'] ?? 15).toString();
+        _peakDatesController.text = _peakDatesToText(data['peakDates'] as List<dynamic>?);
         _controllers['voidWindowHours']!.text = (data['voidWindowHours'] ?? 24).toString();
         _controllers['voidCountMedium']!.text = (data['voidCountMedium'] ?? 2).toString();
         _controllers['voidCountCritical']!.text = (data['voidCountCritical'] ?? 4).toString();
@@ -121,6 +170,9 @@ class _SalesAnomaliesPageState extends State<SalesAnomaliesPage> {
         'criticalMultiplier': double.tryParse(_controllers['criticalMultiplier']!.text) ?? 10.0,
         'minBaselineTransactions': int.tryParse(_controllers['minBaselineTransactions']!.text) ?? 5,
         'fallbackHighValueThreshold': double.tryParse(_controllers['fallbackHighValueThreshold']!.text) ?? 5000.0,
+        'peakAvgMultiplier': double.tryParse(_controllers['peakAvgMultiplier']!.text) ?? 8.0,
+        'peakCriticalMultiplier': double.tryParse(_controllers['peakCriticalMultiplier']!.text) ?? 15.0,
+        'peakDates': _parsePeakDatesText(_peakDatesController.text),
         'voidWindowHours': double.tryParse(_controllers['voidWindowHours']!.text) ?? 24.0,
         'voidCountMedium': int.tryParse(_controllers['voidCountMedium']!.text) ?? 2,
         'voidCountCritical': int.tryParse(_controllers['voidCountCritical']!.text) ?? 4,
@@ -133,12 +185,12 @@ class _SalesAnomaliesPageState extends State<SalesAnomaliesPage> {
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Thresholds saved and synced to web.'), backgroundColor: Colors.green),
+          const SnackBar(content: Text('Settings saved and synced to web.'), backgroundColor: Colors.green),
         );
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error saving thresholds: $e')));
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error saving settings: $e')));
       }
     } finally {
       if (mounted) setState(() => _saving = false);
@@ -408,6 +460,54 @@ class _SalesAnomaliesPageState extends State<SalesAnomaliesPage> {
     );
   }
 
+  // NEW: label + tap-to-reveal "?" info tooltip. Uses Flutter's own
+  // built-in Tooltip widget rather than a custom overlay — this app
+  // already relies on Tooltip elsewhere (NotificationBell's icon uses
+  // the `tooltip:` shorthand), so this keeps the same mechanism instead
+  // of introducing a second, different way of showing help text.
+  // triggerMode: tap makes it show on a single tap on mobile (the
+  // default is a long-press, which is far less discoverable) and still
+  // shows on hover for desktop/web builds.
+  Widget _fieldLabel(String text, String tooltip, Color subTextColor) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Flexible(
+          child: Text(
+            text,
+            style: TextStyle(fontSize: 8.5, fontWeight: FontWeight.bold, color: subTextColor, letterSpacing: 0.3),
+          ),
+        ),
+        const SizedBox(width: 4),
+        Tooltip(
+          message: tooltip,
+          triggerMode: TooltipTriggerMode.tap,
+          showDuration: const Duration(seconds: 5),
+          decoration: BoxDecoration(color: const Color(0xFF111827), borderRadius: BorderRadius.circular(8)),
+          textStyle: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w600, height: 1.4),
+          padding: const EdgeInsets.all(10),
+          child: Container(
+            width: 14,
+            height: 14,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(color: Colors.grey.withValues(alpha: 0.35), shape: BoxShape.circle),
+            child: const Text('?', style: TextStyle(fontSize: 8, fontWeight: FontWeight.w900, color: Colors.white)),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _sectionTitle(String text) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 4, bottom: 4),
+      child: Text(
+        text,
+        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w900, color: Color(0xFFF59E0B), letterSpacing: 0.8),
+      ),
+    );
+  }
+
   Widget _buildConfigSection(bool isDark, Color cardColor, Color borderColor, Color textColor, Color subTextColor) {
     if (_isLoadingThresholds) return const Center(child: CircularProgressIndicator());
 
@@ -424,7 +524,7 @@ class _SalesAnomaliesPageState extends State<SalesAnomaliesPage> {
           Row(
             children: [
               Expanded(
-                child: Text('Detection Thresholds',
+                child: Text('Detection Settings',
                     style: GoogleFonts.cormorantGaramond(fontSize: 22, fontWeight: FontWeight.bold, color: textColor)),
               ),
               Container(
@@ -443,48 +543,80 @@ class _SalesAnomaliesPageState extends State<SalesAnomaliesPage> {
             ],
           ),
           const SizedBox(height: 4),
-          Text('Changes apply immediately to every branch and every open device — web included.',
+          Text('Changes apply immediately to every branch and every open device — web included. Tap a ? for its definition.',
               style: TextStyle(fontSize: 11, color: subTextColor)),
-          const SizedBox(height: 24),
+          const SizedBox(height: 20),
 
+          _sectionTitle('SALE VALUE'),
           _buildThresholdRow([
-            _numField('VALUE SPIKE — MEDIUM MULTIPLIER (X AVG)', 'avgMultiplier', textColor, subTextColor, borderColor, isDark),
-            _numField('VALUE SPIKE — CRITICAL MULTIPLIER (X AVG)', 'criticalMultiplier', textColor, subTextColor, borderColor, isDark),
-            _numField('MIN. TRANSACTIONS FOR BASELINE', 'minBaselineTransactions', textColor, subTextColor, borderColor, isDark),
+            _numField('Elevated Sale Threshold', 'avgMultiplier',
+                'The size of a transaction, expressed as a multiple of this branch\'s typical sale, at which a sale is considered elevated.',
+                textColor, subTextColor, borderColor, isDark),
+            _numField('Severe Sale Threshold', 'criticalMultiplier',
+                'The size of a transaction, expressed as a multiple of this branch\'s typical sale, at which a sale is considered severely elevated.',
+                textColor, subTextColor, borderColor, isDark),
+            _numField('Minimum Sales for Baseline', 'minBaselineTransactions',
+                'The number of prior walk-in sales at a branch required to establish a reliable typical-sale amount.',
+                textColor, subTextColor, borderColor, isDark),
           ]),
           const SizedBox(height: 16),
           _buildThresholdRow([
-            _numField('FALLBACK FLAT THRESHOLD (₱)', 'fallbackHighValueThreshold', textColor, subTextColor, borderColor, isDark),
-            _numField('VOID WINDOW (HOURS)', 'voidWindowHours', textColor, subTextColor, borderColor, isDark),
-            _numField('VOID COUNT — MEDIUM', 'voidCountMedium', textColor, subTextColor, borderColor, isDark),
+            _numField('Fallback Value Threshold (₱)', 'fallbackHighValueThreshold',
+                'A fixed peso amount used to judge whether a sale is elevated when a branch does not yet have enough sales history to establish a baseline.',
+                textColor, subTextColor, borderColor, isDark),
+            _numField('Peak Season Elevated Threshold', 'peakAvgMultiplier',
+                'The Elevated Sale Threshold used specifically during the Peak Season Dates configured below.',
+                textColor, subTextColor, borderColor, isDark),
+            _numField('Peak Season Severe Threshold', 'peakCriticalMultiplier',
+                'The Severe Sale Threshold used specifically during the Peak Season Dates configured below.',
+                textColor, subTextColor, borderColor, isDark),
           ]),
           const SizedBox(height: 16),
-          _buildThresholdRow([
-            _numField('VOID COUNT — CRITICAL', 'voidCountCritical', textColor, subTextColor, borderColor, isDark),
-            _numField('DISCOUNT % — MEDIUM', 'discountMediumPercent', textColor, subTextColor, borderColor, isDark),
-            _numField('DISCOUNT % — CRITICAL', 'discountCriticalPercent', textColor, subTextColor, borderColor, isDark),
-          ]),
-          const SizedBox(height: 16),
+          _peakDatesField(textColor, subTextColor, borderColor, isDark),
 
-          // FIXED: opening time + closing time now share their own row;
-          // the Save button gets a separate full-width row below instead
-          // of squeezing into a third Expanded column. That third-column
-          // squeeze was exactly what caused "SAVE THRESHOLDS" to overflow
-          // its own button on narrower screens.
+          const SizedBox(height: 20),
+          _sectionTitle('VOIDS & REFUNDS'),
+          _buildThresholdRow([
+            _numField('Void Review Window (hours)', 'voidWindowHours',
+                'The rolling time period over which a staff member\'s voids and refunds are counted.',
+                textColor, subTextColor, borderColor, isDark),
+            _numField('Elevated Void Count', 'voidCountMedium',
+                'The number of voids or refunds by one staff member within the Void Review Window considered elevated.',
+                textColor, subTextColor, borderColor, isDark),
+            _numField('Severe Void Count', 'voidCountCritical',
+                'The number of voids or refunds by one staff member within the Void Review Window considered severe.',
+                textColor, subTextColor, borderColor, isDark),
+          ]),
+
+          const SizedBox(height: 20),
+          _sectionTitle('DISCOUNTS'),
+          _buildThresholdRow([
+            _numField('Elevated Discount Percentage', 'discountMediumPercent',
+                'The manual discount percentage on a single transaction considered elevated.',
+                textColor, subTextColor, borderColor, isDark),
+            _numField('Severe Discount Percentage', 'discountCriticalPercent',
+                'The manual discount percentage on a single transaction considered severe.',
+                textColor, subTextColor, borderColor, isDark),
+          ]),
+
+          const SizedBox(height: 20),
+          _sectionTitle('STORE HOURS'),
           Row(
             children: [
               Expanded(
-                child: _timeField('STORE OPENING TIME', _to12HourDisplay(_storeOpenTime24), () => _pickTime(true),
+                child: _timeField('Store Opening Time', _to12HourDisplay(_storeOpenTime24), () => _pickTime(true),
+                    'The time of day this branch normally opens for business.',
                     textColor, subTextColor, borderColor, isDark),
               ),
               const SizedBox(width: 12),
               Expanded(
-                child: _timeField('STORE CLOSING TIME', _to12HourDisplay(_storeCloseTime24), () => _pickTime(false),
+                child: _timeField('Store Closing Time', _to12HourDisplay(_storeCloseTime24), () => _pickTime(false),
+                    'The time of day this branch normally closes for business.',
                     textColor, subTextColor, borderColor, isDark),
               ),
             ],
           ),
-          const SizedBox(height: 16),
+          const SizedBox(height: 20),
           SizedBox(
             width: double.infinity,
             height: 48,
@@ -499,14 +631,9 @@ class _SalesAnomaliesPageState extends State<SalesAnomaliesPage> {
               child: _saving
                   ? const SizedBox(
                   width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
-              // FittedBox is a backstop: full-width row alone should
-              // give this text plenty of room, but if the button is
-              // ever squeezed further (very narrow foldable, larger
-              // system font size), the label scales down instead of
-              // painting past the button's edges.
                   : FittedBox(
                 fit: BoxFit.scaleDown,
-                child: Text('SAVE THRESHOLDS',
+                child: Text('SAVE SETTINGS',
                     style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, letterSpacing: 0.5)),
               ),
             ),
@@ -524,14 +651,11 @@ class _SalesAnomaliesPageState extends State<SalesAnomaliesPage> {
     );
   }
 
-  Widget _numField(String label, String key, Color textColor, Color subTextColor, Color borderColor, bool isDark) {
+  Widget _numField(String label, String key, String tooltip, Color textColor, Color subTextColor, Color borderColor, bool isDark) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(
-          label,
-          style: TextStyle(fontSize: 8.5, fontWeight: FontWeight.bold, color: subTextColor, letterSpacing: 0.3),
-        ),
+        _fieldLabel(label, tooltip, subTextColor),
         const SizedBox(height: 6),
         Container(
           height: 42,
@@ -558,14 +682,50 @@ class _SalesAnomaliesPageState extends State<SalesAnomaliesPage> {
     );
   }
 
-  Widget _timeField(String label, String value, VoidCallback onTap, Color textColor, Color subTextColor, Color borderColor, bool isDark) {
+  // NEW: multi-line "one range per line" field for peakDates, matching
+  // the web dashboard's textarea exactly — same "YYYY-MM-DD to
+  // YYYY-MM-DD" line format, same parse/serialize round trip.
+  Widget _peakDatesField(Color textColor, Color subTextColor, Color borderColor, bool isDark) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(
-          label,
-          style: TextStyle(fontSize: 8.5, fontWeight: FontWeight.bold, color: subTextColor, letterSpacing: 0.3),
+        _fieldLabel(
+          'Peak Season Dates (one range per line)',
+          'Date ranges during which higher sales volume is expected and normal, such as known holidays or seasonal events.',
+          subTextColor,
         ),
+        const SizedBox(height: 6),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          decoration: BoxDecoration(
+            color: isDark ? const Color(0xFF222222) : const Color(0xFFFAFAFA),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: borderColor),
+          ),
+          child: TextField(
+            controller: _peakDatesController,
+            focusNode: _peakDatesFocus,
+            minLines: 2,
+            maxLines: 4,
+            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: textColor),
+            decoration: InputDecoration(
+              isDense: true,
+              border: InputBorder.none,
+              contentPadding: EdgeInsets.zero,
+              hintText: '2026-02-10 to 2026-02-15\n2026-05-04 to 2026-05-11',
+              hintStyle: TextStyle(fontSize: 12, color: subTextColor.withValues(alpha: 0.6)),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _timeField(String label, String value, VoidCallback onTap, String tooltip, Color textColor, Color subTextColor, Color borderColor, bool isDark) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _fieldLabel(label, tooltip, subTextColor),
         const SizedBox(height: 6),
         GestureDetector(
           onTap: onTap,

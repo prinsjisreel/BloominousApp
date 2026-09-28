@@ -112,8 +112,6 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
 
   bool sendAsGift = false;
   bool isLoading = false;
-  bool isCodRestricted = false;
-  String restrictionReason = "";
 
   String selectedPaymentMethod = 'gcash';
 
@@ -138,6 +136,13 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
   Timer? _streetSearchDebounce;
 
   // --- Account-restriction / phone-trust-restore state ---
+  // This is the ONE real, shared fraud rule between web and mobile:
+  // an isRestricted account must verify its phone before submit_order.php
+  // will accept ANY order, regardless of payment method. There is no
+  // separate COD-specific restriction anymore — that heuristic was
+  // removed because the server-side gate already covers every payment
+  // method uniformly, and keeping a second, less accurate check just
+  // added confusing UI without adding real security.
   StreamSubscription<DocumentSnapshot>? _fraudStatusSub;
   bool _isAccountRestricted = false;
   String? _restrictedUntilText;
@@ -310,6 +315,13 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return;
 
+    // FIXED: this used to also derive its own separate COD-availability
+    // decision from raw fraudScore bands (with a real gap bug at
+    // scores 87-89). That logic is removed entirely — it doesn't align
+    // with anything the server actually enforces. isRestricted is the
+    // only signal that matters here: it's the same field submit_order.php
+    // checks before accepting an order at all, so this listener now only
+    // tracks what the OTP-verification banner/flow actually needs.
     _fraudStatusSub = FirebaseFirestore.instance
         .collection('customers')
         .doc(user.uid)
@@ -319,20 +331,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
       final data = doc.data()!;
 
       final bool isRestricted = data['isRestricted'] ?? false;
-      final bool isBanned = (data['status'] ?? '') == 'blocked';
-      final int score = (data['fraudScore'] ?? 0) as int;
       final restrictedUntil = data['restrictedUntil'];
-
-      bool restrictCod = false;
-      String reason = "";
-
-      if (isBanned || score >= 90) {
-        restrictCod = true;
-        reason = "Account flagged for severe fraud. Cash on Delivery is disabled.";
-      } else if (isRestricted || (score >= 50 && score <= 86)) {
-        restrictCod = true;
-        reason = "Cash-on-Delivery (COD) disabled due to account restriction (50-86% risk rating).";
-      }
 
       String? untilText;
       if (isRestricted && restrictedUntil is Timestamp) {
@@ -341,13 +340,8 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
       }
 
       setState(() {
-        isCodRestricted = restrictCod;
-        restrictionReason = reason;
         _isAccountRestricted = isRestricted;
         _restrictedUntilText = untilText;
-        if (restrictCod && selectedPaymentMethod == 'cod') {
-          selectedPaymentMethod = 'gcash';
-        }
         if (!isRestricted) _otpVerifiedThisSession = false;
       });
     }, onError: (e) => debugPrint('Fraud status listener error: $e'));
@@ -1034,24 +1028,12 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
       return;
     }
 
-    if (method == 'cod') {
-      if (sendAsGift) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-              content: Text('Cash on Delivery isn\'t available for gift orders. Please choose GCash or Maya.')),
-        );
-        return;
-      }
-      if (isCodRestricted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(restrictionReason.isNotEmpty
-                ? restrictionReason
-                : 'Cash-on-Delivery is disabled for your account due to fraud risk rating.'),
-          ),
-        );
-        return;
-      }
+    if (method == 'cod' && sendAsGift) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text('Cash on Delivery isn\'t available for gift orders. Please choose GCash or Maya.')),
+      );
+      return;
     }
 
     setState(() => isLoading = true);
@@ -1500,33 +1482,25 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
                     const DropdownMenuItem(value: 'maya', child: Text('Maya')),
                     DropdownMenuItem(
                       value: 'cod',
-                      enabled: !isCodRestricted && !sendAsGift,
+                      // FIXED: COD is now disabled ONLY for gift orders —
+                      // matching web's codOption exactly. It's no longer
+                      // gated by fraud score/riskTier here; the real
+                      // enforcement (isRestricted requiring OTP) already
+                      // covers this account regardless of which payment
+                      // method they pick.
+                      enabled: !sendAsGift,
                       child: Text(
-                        sendAsGift
-                            ? 'Cash on Delivery (unavailable for gifts)'
-                            : isCodRestricted
-                            ? 'Cash on Delivery (Restricted)'
-                            : 'Cash on Delivery',
-                        style: TextStyle(
-                          color: (isCodRestricted || sendAsGift) ? Colors.grey : null,
-                        ),
+                        sendAsGift ? 'Cash on Delivery (unavailable for gifts)' : 'Cash on Delivery',
+                        style: TextStyle(color: sendAsGift ? Colors.grey : null),
                       ),
                     ),
                   ],
                   onChanged: (val) {
                     if (val == null) return;
-                    if (val == 'cod' && (isCodRestricted || sendAsGift)) return;
+                    if (val == 'cod' && sendAsGift) return;
                     setState(() => selectedPaymentMethod = val);
                   },
                 ),
-                if (isCodRestricted && !sendAsGift)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 8.0),
-                    child: Text(
-                      restrictionReason,
-                      style: const TextStyle(fontSize: 11, color: Colors.red, fontWeight: FontWeight.bold),
-                    ),
-                  ),
               ],
             ),
 

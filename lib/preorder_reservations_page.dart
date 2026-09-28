@@ -20,23 +20,44 @@ class PreordersPage extends StatefulWidget {
 class _PreordersPageState extends State<PreordersPage> {
   final FirebaseFirestore _db = FirebaseFirestore.instance;
 
+  // CHANGED (1 of 3): reservations now live in ONE top-level collection,
+  // `reservations/{id}`, with the branch stored as a `branchId` FIELD
+  // (previously the branch was part of the path:
+  // branches/{branchId}/reservations/{id}).
+  //  - A branch is selected -> only that branch's reservations.
+  //  - No branch selected   -> every reservation.
+  // Sorting happens here in Dart instead of with .orderBy(): combining a
+  // .where() on one field with an .orderBy() on another would require a
+  // custom composite index in Firestore.
   Stream<List<Map<String, dynamic>>> _reservationsStream() {
     final branchId = InventoryData.selectedBranchId;
 
-    final Query<Map<String, dynamic>> query = branchId != null
-        ? _db.collection('branches').doc(branchId).collection('reservations')
-        : _db.collectionGroup('reservations');
+    Query<Map<String, dynamic>> query = _db.collection('reservations');
+    if (branchId != null) {
+      query = query.where('branchId', isEqualTo: branchId);
+    }
 
-    return query.orderBy('created_at', descending: true).snapshots().map(
-          (snap) => snap.docs.map((d) {
-        final branchIdFromPath = d.reference.parent.parent?.id ?? '';
-        return {...d.data(), 'id': d.id, '_branchId': branchIdFromPath};
-      }).toList(),
-    );
+    return query.snapshots().map((snap) {
+      final list = snap.docs.map((d) {
+        final data = d.data();
+        return {...data, 'id': d.id, '_branchId': (data['branchId'] ?? '').toString()};
+      }).toList();
+
+      int createdMs(Map<String, dynamic> m) {
+        final v = m['created_at'];
+        return v is Timestamp ? v.millisecondsSinceEpoch : 0;
+      }
+
+      list.sort((a, b) => createdMs(b).compareTo(createdMs(a))); // newest first
+      return list;
+    });
   }
 
+  // CHANGED (2 of 3): every action now targets reservations/{id}.
+  // branchId is kept as a parameter so none of the callers below had to
+  // change; it is no longer part of the document's address.
   DocumentReference<Map<String, dynamic>> _reservationRef(String branchId, String id) {
-    return _db.collection('branches').doc(branchId).collection('reservations').doc(id);
+    return _db.collection('reservations').doc(id);
   }
 
   String _formatDateStr(DateTime d) =>
@@ -450,6 +471,167 @@ class _PreordersPageState extends State<PreordersPage> {
     }
   }
 
+  // NEW: writes a new payment entry inside a Firestore TRANSACTION rather
+  // than a plain .update(). A transaction re-reads the document at write
+  // time and Firestore retries it automatically if another write landed
+  // in between -- so if a staff member on the web panel and someone on
+  // the mobile app both record a payment for the same reservation within
+  // moments of each other, neither payment silently overwrites the
+  // other's amount_paid/balance_due. A plain .update() using numbers
+  // captured earlier from the StreamBuilder snapshot would NOT be safe
+  // here, because that snapshot could already be stale by the time the
+  // write actually happens.
+  Future<void> _recordPayment({
+    required String branchId,
+    required String id,
+    required double amount,
+    required String method,
+    required String note,
+  }) async {
+    final ref = _reservationRef(branchId, id);
+    try {
+      await _db.runTransaction((transaction) async {
+        final snap = await transaction.get(ref);
+        if (!snap.exists) {
+          throw Exception('This reservation no longer exists.');
+        }
+        final current = snap.data() ?? {};
+        final totalAmount = (current['total_amount'] as num?)?.toDouble() ?? 0.0;
+        final currentPaid = (current['amount_paid'] as num?)?.toDouble() ?? 0.0;
+        final newPaid = currentPaid + amount;
+        final rawNewBalance = totalAmount - newPaid;
+        final newBalance = rawNewBalance < 0 ? 0.0 : rawNewBalance;
+        final existingHistory = (current['payment_history'] is List)
+            ? List<dynamic>.from(current['payment_history'] as List)
+            : <dynamic>[];
+
+        // Timestamp.now() (client-generated), not FieldValue.serverTimestamp() --
+        // server timestamps aren't allowed inside array elements, only as a
+        // top-level field value. This is the same reason the deposit entry
+        // in ai_assistant_page.dart uses Timestamp.now() for its
+        // paymentLedgerEntry.
+        final entry = {
+          'amount': amount,
+          'method': method,
+          'status': 'confirmed',
+          'note': note,
+          'recorded_by': FirebaseAuth.instance.currentUser?.email ?? 'Admin',
+          'recorded_at': Timestamp.now(),
+        };
+
+        transaction.update(ref, {
+          'amount_paid': newPaid,
+          'balance_due': newBalance,
+          'payment_history': [...existingHistory, entry],
+          if (newBalance <= 0) 'deposit_paid': true,
+          'updated_at': FieldValue.serverTimestamp(),
+        });
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Payment of ₱${amount.toStringAsFixed(0)} recorded'),
+            backgroundColor: const Color(0xFF10B981),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not record payment: $e'), backgroundColor: Colors.red),
+        );
+      }
+    }
+  }
+
+  // NEW: small dialog for staff to log a balance payment against an
+  // existing reservation. StatefulBuilder is used (rather than a whole
+  // new StatefulWidget) purely so the method dropdown and the inline
+  // error message can update live inside the dialog -- the same trick
+  // Flutter dialogs commonly use when they need local, throwaway state
+  // that doesn't belong on the page's main State object.
+  void _showRecordPaymentDialog(String branchId, String id, double balanceDue) {
+    final amountController = TextEditingController();
+    final noteController = TextEditingController();
+    String selectedMethod = 'cash';
+    String? errorText;
+
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setDialogState) {
+            return AlertDialog(
+              title: const Text('Record Payment'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Balance due: ₱${balanceDue.toStringAsFixed(0)}',
+                      style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: amountController,
+                      keyboardType: const TextInputType.numberWithOptions(decimal: false),
+                      decoration: InputDecoration(
+                        labelText: 'Amount received',
+                        prefixText: '₱ ',
+                        errorText: errorText,
+                        isDense: true,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    DropdownButtonFormField<String>(
+                      value: selectedMethod,
+                      decoration: const InputDecoration(labelText: 'Method', isDense: true),
+                      items: const [
+                        DropdownMenuItem(value: 'cash', child: Text('Cash')),
+                        DropdownMenuItem(value: 'gcash', child: Text('GCash')),
+                        DropdownMenuItem(value: 'maya', child: Text('Maya')),
+                      ],
+                      onChanged: (val) => setDialogState(() => selectedMethod = val ?? 'cash'),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: noteController,
+                      decoration: const InputDecoration(labelText: 'Note (optional)', isDense: true),
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('CANCEL')),
+                ElevatedButton(
+                  onPressed: () async {
+                    final parsed = double.tryParse(amountController.text.trim());
+                    if (parsed == null || parsed <= 0) {
+                      setDialogState(() => errorText = 'Enter a valid amount');
+                      return;
+                    }
+                    Navigator.pop(ctx);
+                    await _recordPayment(
+                      branchId: branchId,
+                      id: id,
+                      amount: parsed,
+                      method: selectedMethod,
+                      note: noteController.text.trim(),
+                    );
+                  },
+                  style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFF59E0B), foregroundColor: Colors.white),
+                  child: const Text('RECORD'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
   Map<String, dynamic> _statusMeta(String? status) {
     switch (status) {
       case 'Reserved':
@@ -491,6 +673,154 @@ class _PreordersPageState extends State<PreordersPage> {
       color: Colors.grey.withValues(alpha: 0.1),
       alignment: Alignment.center,
       child: const Icon(Icons.image_not_supported_outlined, color: Colors.grey),
+    );
+  }
+
+  // NEW: single small stat block used inside the payment ledger section
+  // (Total / Paid / Balance). Pulled into its own tiny widget so the
+  // three stats stay visually identical instead of three separate,
+  // slightly-different-by-accident Column blocks.
+  Widget _paymentStat(String label, double value, Color valueColor, Color labelColor) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label.toUpperCase(),
+            style: TextStyle(fontSize: 8, fontWeight: FontWeight.w800, color: labelColor, letterSpacing: 0.3)),
+        const SizedBox(height: 2),
+        Text('₱${value.toStringAsFixed(0)}',
+            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w900, color: valueColor)),
+      ],
+    );
+  }
+
+  // NEW: the payment ledger section itself -- stat row, progress bar,
+  // payment history, and the Record Payment action. Only ever called
+  // when total_amount exists on the reservation (i.e. it came through
+  // the AI Visual Stylist booking flow, which is the only place that
+  // writes these fields today).
+  Widget _buildPaymentLedgerSection(
+      Map<String, dynamic> data,
+      String branchId,
+      String id,
+      bool isDark,
+      Color borderColor,
+      Color textColor,
+      Color subTextColor,
+      ) {
+    final totalAmount = (data['total_amount'] as num?)?.toDouble() ?? 0.0;
+    final amountPaid = (data['amount_paid'] as num?)?.toDouble() ?? 0.0;
+    final rawBalance = data['balance_due'];
+    final balanceDue = rawBalance != null
+        ? (rawBalance as num).toDouble()
+        : (totalAmount - amountPaid < 0 ? 0.0 : totalAmount - amountPaid);
+    final progress = totalAmount > 0 ? (amountPaid / totalAmount).clamp(0.0, 1.0) : 0.0;
+    final history = (data['payment_history'] is List) ? (data['payment_history'] as List) : const [];
+
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(top: 10, bottom: 14),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: isDark ? Colors.black26 : const Color(0xFFFAFAFA),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: borderColor),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('PAYMENT LEDGER',
+              style: TextStyle(fontSize: 8, fontWeight: FontWeight.w800, color: subTextColor, letterSpacing: 0.5)),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(child: _paymentStat('Total', totalAmount, textColor, subTextColor)),
+              Expanded(child: _paymentStat('Paid', amountPaid, Colors.green[700]!, subTextColor)),
+              Expanded(
+                child: _paymentStat(
+                  'Balance',
+                  balanceDue,
+                  balanceDue > 0 ? Colors.red[700]! : Colors.green[700]!,
+                  subTextColor,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: progress,
+              minHeight: 6,
+              backgroundColor: borderColor,
+              valueColor: AlwaysStoppedAnimation(balanceDue <= 0 ? Colors.green : const Color(0xFFF59E0B)),
+            ),
+          ),
+          if (history.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            ...history.map((raw) {
+              final entry = Map<String, dynamic>.from(raw as Map);
+              final entryAmount = (entry['amount'] as num?)?.toDouble() ?? 0.0;
+              final method = (entry['method'] ?? '').toString();
+              final methodLabel = method.isNotEmpty ? method[0].toUpperCase() + method.substring(1) : 'Payment';
+              final note = (entry['note'] ?? '').toString();
+              final rawDate = entry['recorded_at'];
+              DateTime? entryDate;
+              if (rawDate is Timestamp) entryDate = rawDate.toDate();
+              final dateStr = entryDate != null ? DateFormat('MMM d').format(entryDate) : '';
+              return Padding(
+                padding: const EdgeInsets.symmetric(vertical: 3),
+                child: Row(
+                  children: [
+                    Icon(Icons.receipt_long, size: 12, color: subTextColor),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        '$dateStr · $methodLabel${note.isNotEmpty ? ' ($note)' : ''}',
+                        style: TextStyle(fontSize: 10.5, color: textColor),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    Text('₱${entryAmount.toStringAsFixed(0)}',
+                        style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.bold, color: textColor)),
+                  ],
+                ),
+              );
+            }),
+          ] else ...[
+            const SizedBox(height: 8),
+            Text('No balance payments recorded yet.',
+                style: TextStyle(fontSize: 10.5, color: subTextColor, fontStyle: FontStyle.italic)),
+          ],
+          const SizedBox(height: 10),
+          if (balanceDue > 0)
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: () => _showRecordPaymentDialog(branchId, id, balanceDue),
+                icon: const Icon(Icons.add_card, size: 14),
+                label: const Text('Record Payment', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: const Color(0xFFF59E0B),
+                  side: const BorderSide(color: Color(0xFFF59E0B), width: 1.5),
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                ),
+              ),
+            )
+          else
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.green.withValues(alpha: 0.1),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              alignment: Alignment.center,
+              child: Text('FULLY PAID',
+                  style: TextStyle(fontSize: 10, fontWeight: FontWeight.w800, color: Colors.green[700])),
+            ),
+        ],
+      ),
     );
   }
 
@@ -666,9 +996,7 @@ class _PreordersPageState extends State<PreordersPage> {
         ? (data['recommended_flowers'] as List).map((e) => e.toString()).toList()
         : <String>[];
 
-    final depositRequired = data['deposit_required'];
     final totalAmount = data['total_amount'];
-    final paymentMethod = (data['payment_method'] ?? '').toString();
 
     final rawFulfillment = data['fulfillment_date'];
     String targetDateStr = 'N/A';
@@ -818,30 +1146,15 @@ class _PreordersPageState extends State<PreordersPage> {
                     ),
                   ),
                 ],
-                if (depositRequired != null) ...[
-                  const SizedBox(height: 10),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFF59E0B).withValues(alpha: 0.1),
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                    child: Row(
-                      children: [
-                        const Icon(Icons.payments_outlined, size: 12, color: Color(0xFFF59E0B)),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: Text(
-                            'Budget: ₱${(totalAmount ?? 0).toStringAsFixed(0)} · Deposit: ₱${(depositRequired as num).toStringAsFixed(0)}${paymentMethod.isNotEmpty ? ' via $paymentMethod' : ''}',
-                            style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w700, color: Color(0xFFF59E0B)),
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-                const SizedBox(height: 14),
+                // CHANGED: was a single-line "Budget: ₱X · Deposit: ₱Y"
+                // chip. Now the full payment ledger section, since it
+                // shows the same info (total + deposit context) plus
+                // what's actually new: amount paid so far, remaining
+                // balance, and the running history -- with a way to
+                // record the next payment right from the card.
+                if (totalAmount != null)
+                  _buildPaymentLedgerSection(data, branchId, id, isDark, borderColor, textColor, subTextColor),
+                const SizedBox(height: 4),
                 Container(
                   width: double.infinity,
                   padding: const EdgeInsets.all(12),
@@ -888,14 +1201,21 @@ class _PreordersPageState extends State<PreordersPage> {
                   ],
                 ),
                 const SizedBox(height: 4),
-                FutureBuilder<Map<String, dynamic>?>(
-                  future: InventoryData.getBranchDetails(branchId),
-                  builder: (context, snap) {
-                    final name = snap.data?['name'] ?? branchId;
-                    return Text('Branch: $name',
-                        style: TextStyle(fontSize: 10, color: subTextColor, fontStyle: FontStyle.italic));
-                  },
-                ),
+                // CHANGED (3 of 3): branchId now comes from the document's
+                // `branchId` field. A reservation saved without one shows
+                // "Unassigned" instead of looking up a branch with an empty id.
+                if (branchId.isEmpty)
+                  Text('Branch: Unassigned',
+                      style: TextStyle(fontSize: 10, color: subTextColor, fontStyle: FontStyle.italic))
+                else
+                  FutureBuilder<Map<String, dynamic>?>(
+                    future: InventoryData.getBranchDetails(branchId),
+                    builder: (context, snap) {
+                      final name = snap.data?['name'] ?? branchId;
+                      return Text('Branch: $name',
+                          style: TextStyle(fontSize: 10, color: subTextColor, fontStyle: FontStyle.italic));
+                    },
+                  ),
                 const SizedBox(height: 16),
 
                 if (isPendingReview)

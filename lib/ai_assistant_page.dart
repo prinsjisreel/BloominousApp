@@ -50,6 +50,14 @@ class _AIAssistantPageState extends State<AIAssistantPage>
   final TextEditingController _lastNameController = TextEditingController();
   final TextEditingController _phoneController = TextEditingController();
   DateTime? _selectedEventDate;
+
+  // Separate from _selectedEventDate. This is the date the customer
+  // will actually come into the branch -- the one thing the shop has a
+  // real, finite daily capacity for. _selectedEventDate (the wedding,
+  // birthday, whatever) can be any future date; the branch has no
+  // capacity constraint tied to it at all.
+  DateTime? _selectedAppointmentDate;
+
   bool _isSubmittingReservation = false;
   bool _reservationSubmitted = false;
 
@@ -58,7 +66,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
   String _selectedPaymentMethod = 'physical';
   bool _isProcessingPayment = false;
 
-  // NEW: shows a brief spinner on the date field while the availability
+  // Shows a brief spinner on the date field while the availability
   // check below runs, so the customer isn't left wondering why the
   // picker "did nothing" for a moment.
   bool _isCheckingAvailability = false;
@@ -77,20 +85,30 @@ class _AIAssistantPageState extends State<AIAssistantPage>
   List<String> _flowerReferencePhotos = [];
   bool _isLoadingFlowerPhotos = false;
 
-  // NEW: single shared date-string formatter, used both when checking
+  // Single shared date-string formatter, used both when checking
   // availability and when writing the final reservation -- keeping this
   // in one place means the two can never drift into different formats
   // and silently fail to match each other in Firestore.
   String _formatDateStr(DateTime d) =>
       '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
 
-  // NEW: checks branches/{branchId}/availability/{dateStr} for an owner-set
-  // block or capacity limit, and (if a capacity exists) counts how many
-  // reservations already exist for that date to see if it's full.
-  // Fails OPEN on any error (missing index, network blip, etc.) -- an
-  // availability check that can't complete should never be the reason a
-  // legitimate customer can't book at all; it just means this specific
-  // safety net didn't run this time.
+  // Checks availability for the APPOINTMENT date -- Reservation
+  // Settings' blocked dates and daily capacity cap exist to limit how
+  // many customers the branch can see in person on a given day, not
+  // how many customer events happen to fall on the same calendar date.
+  // Checks blocked_dates/{dateStr} for an owner-set block, and counts
+  // how many reservations already share that same appointment_date to
+  // see if the daily slot cap is full. Fails OPEN on any error (network
+  // blip, etc.) -- an availability check that can't complete should
+  // never be the reason a legitimate customer can't book at all.
+  //
+  // CHANGED: counts from the top-level `reservations` collection (every
+  // branch's reservations live there now, each with a branchId field).
+  // Previously this used collectionGroup('reservations') + where(), which
+  // needs a special collection-group index; without that index the query
+  // failed, the catch below allowed the booking, and the daily cap was
+  // silently never enforced. A plain collection + one where() uses the
+  // index Firestore creates automatically.
   Future<Map<String, dynamic>> _checkDateAvailability(DateTime date) async {
     final dateStr = _formatDateStr(date);
 
@@ -100,7 +118,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
       if (blockedDoc.exists && blockedDoc.data()?['isBlocked'] == true) {
         return {
           'available': false,
-          'reason': 'This date is not available for reservations. Please choose another date.'
+          'reason': 'This appointment date is not available. Please choose another date.'
         };
       }
 
@@ -109,15 +127,15 @@ class _AIAssistantPageState extends State<AIAssistantPage>
       final maxCapacity = (configDoc.data()?['maxDailyCapacity'] as num?)?.toInt() ?? 1;
 
       final countSnap = await FirebaseFirestore.instance
-          .collectionGroup('reservations')
-          .where('fulfillment_date', isEqualTo: dateStr)
+          .collection('reservations')
+          .where('appointment_date', isEqualTo: dateStr)
           .count()
           .get();
       final current = countSnap.count ?? 0;
       if (current >= maxCapacity) {
         return {
           'available': false,
-          'reason': 'This date is fully booked ($current/$maxCapacity). Please choose another date.'
+          'reason': 'This appointment date is fully booked ($current/$maxCapacity). Please choose another date.'
         };
       }
       return {'available': true};
@@ -405,11 +423,27 @@ class _AIAssistantPageState extends State<AIAssistantPage>
 
   String _selectedRecipient = 'Partner / Spouse';
   String _selectedOccasion = 'Anniversary';
-  String _selectedVibe = 'Romantic Red';
   String _selectedBudget = '₱1,000 - ₱2,500';
   String _selectedTone = 'Heartfelt & Deep';
   bool _isGeneratingMatch = false;
   Map<String, dynamic>? _matchResult;
+
+  // "Others" free-text fallback controllers for the recipient and
+  // occasion dropdowns -- only ever read from when their dropdown's
+  // value is literally 'Others', so they never interfere with the
+  // preset options.
+  final TextEditingController _customRecipientController =
+  TextEditingController();
+  final TextEditingController _customOccasionController =
+  TextEditingController();
+
+  // Replaces the old fixed "_selectedVibe" dropdown. The vibe is now a
+  // free-text description in the customer's own words, sent to Gemini
+  // as-is so the AI can both NAME it (see 'vibeName' in the Gemini
+  // response) AND base its flower/color choices on the actual
+  // description rather than a rigid preset label.
+  final TextEditingController _vibeController =
+  TextEditingController(text: 'Soft, romantic pastel tones');
 
   bool _useCustomCardNote = false;
   final TextEditingController _customCardNoteController =
@@ -434,6 +468,9 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     _phoneController.dispose();
     _customApiPromptController.dispose();
     _customCardNoteController.dispose();
+    _customRecipientController.dispose();
+    _customOccasionController.dispose();
+    _vibeController.dispose();
     _emailController.dispose();
     _budgetController.dispose();
     super.dispose();
@@ -619,14 +656,18 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     final phone = _phoneController.text.trim();
     final email = _emailController.text.trim();
 
+    // Requires an appointment date in addition to the event date -- the
+    // two answer different questions ("when's the event?" vs. "when
+    // will you come to the branch?") and both are needed to submit.
     if (firstName.isEmpty ||
         lastName.isEmpty ||
         phone.isEmpty ||
-        _selectedEventDate == null) {
+        _selectedEventDate == null ||
+        _selectedAppointmentDate == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text(
-              'Please fill in first name, last name, phone number, and event date.'),
+              'Please fill in first name, last name, phone number, event date, and appointment date.'),
           backgroundColor: Color(0xFFDC3545),
         ),
       );
@@ -666,21 +707,33 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     });
 
     try {
+      // Photo upload is isolated in its own try/catch, separate from the
+      // reservation-submission logic below. If Firebase Storage isn't
+      // enabled yet, the upload throws -- a failed upload now just means
+      // no photo attaches; the reservation still gets written to Firestore.
       String? uploadedPhotoUrl;
+      bool photoUploadFailed = false;
       final imageToUpload = _aiSynthesizedImageBytes ?? _imageBytes;
       if (imageToUpload != null) {
-        final uid = currentUser.uid;
-        final fileName =
-            '${DateTime.now().millisecondsSinceEpoch}_$uid.png';
-        final ref = FirebaseStorage.instance
-            .ref()
-            .child('reservation_designs')
-            .child(fileName);
-        final uploadTask = await ref.putData(
-          imageToUpload,
-          SettableMetadata(contentType: 'image/png'),
-        );
-        uploadedPhotoUrl = await uploadTask.ref.getDownloadURL();
+        try {
+          final uid = currentUser.uid;
+          final fileName =
+              '${DateTime.now().millisecondsSinceEpoch}_$uid.png';
+          final ref = FirebaseStorage.instance
+              .ref()
+              .child('reservation_designs')
+              .child(fileName);
+          final uploadTask = await ref.putData(
+            imageToUpload,
+            SettableMetadata(contentType: 'image/png'),
+          );
+          uploadedPhotoUrl = await uploadTask.ref.getDownloadURL();
+        } catch (storageError) {
+          print(
+              "Photo upload failed (Firebase Storage may not be enabled yet) -- continuing without a photo: $storageError");
+          uploadedPhotoUrl = null;
+          photoUploadFailed = true;
+        }
       }
 
       final branchId = InventoryData.selectedBranchId ?? 'main_branch';
@@ -688,6 +741,10 @@ class _AIAssistantPageState extends State<AIAssistantPage>
           .where((s) => s.isNotEmpty)
           .join(' ');
       final eventDateStr = _formatDateStr(_selectedEventDate!);
+      // The appointment date, formatted the same shared way, so it
+      // matches exactly against blocked_dates doc IDs and the capacity
+      // count in _checkDateAvailability.
+      final appointmentDateStr = _formatDateStr(_selectedAppointmentDate!);
       final appointmentTimeStr =
       _selectedEventTime != null ? _selectedEventTime!.format(context) : null;
 
@@ -720,11 +777,15 @@ class _AIAssistantPageState extends State<AIAssistantPage>
         if (mounted) setState(() => _isProcessingPayment = false);
       }
 
+      // CHANGED: saved to the TOP-LEVEL `reservations` collection, with
+      // the branch stored as a `branchId` FIELD. Previously this wrote to
+      // branches/{branchId}/reservations, where the branch was part of the
+      // document's address instead of its data. The web Event Organizer
+      // page and preorder_reservations_page.dart both read from here now.
       await FirebaseFirestore.instance
-          .collection('branches')
-          .doc(branchId)
           .collection('reservations')
           .add({
+        'branchId': branchId,
         'customer_name': fullName,
         'first_name': firstName,
         'middle_name': middleName.isEmpty ? null : middleName,
@@ -732,8 +793,12 @@ class _AIAssistantPageState extends State<AIAssistantPage>
         'customer_phone': phone,
         if (email.isNotEmpty) 'customer_email': email,
         'customer_uid': currentUser.uid,
+        // fulfillment_date: the day of the customer's actual event --
+        // shown to staff as "Fulfillment Target". Not capacity-checked.
         'fulfillment_date': eventDateStr,
-        'appointment_date': eventDateStr,
+        // appointment_date: the day the customer visits the branch --
+        // THIS is what blocked_dates and the daily capacity cap govern.
+        'appointment_date': appointmentDateStr,
         if (appointmentTimeStr != null) 'appointment_time': appointmentTimeStr,
         'arrangement_details': _visualNoteController.text.trim(),
         'status': 'Pending Review',
@@ -764,11 +829,17 @@ class _AIAssistantPageState extends State<AIAssistantPage>
           _isSubmittingReservation = false;
           _reservationSubmitted = true;
         });
+        // The success message mentions the missing photo ONLY when the
+        // upload genuinely failed.
+        final baseMessage = isEWallet
+            ? '✨ Reservation created! Complete your ₱${depositAmount.toStringAsFixed(0)} deposit in the page that just opened.'
+            : '✨ Reservation submitted! Please settle the ₱${depositAmount.toStringAsFixed(0)} deposit at the branch.';
+        final finalMessage = photoUploadFailed
+            ? '$baseMessage (Your styled photo couldn\'t be attached this time, but your reservation is confirmed.)'
+            : baseMessage;
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text(isEWallet
-                ? '✨ Reservation created! Complete your ₱${depositAmount.toStringAsFixed(0)} deposit in the page that just opened.'
-                : '✨ Reservation submitted! Please settle the ₱${depositAmount.toStringAsFixed(0)} deposit at the branch.'),
+            content: Text(finalMessage),
             backgroundColor: const Color(0xFF10B981),
           ),
         );
@@ -797,10 +868,18 @@ class _AIAssistantPageState extends State<AIAssistantPage>
       _matchPhotos = [];
     });
 
+    final recipientToSend = _selectedRecipient == 'Others'
+        ? _customRecipientController.text.trim()
+        : _selectedRecipient;
+    final occasionToSend = _selectedOccasion == 'Others'
+        ? _customOccasionController.text.trim()
+        : _selectedOccasion;
+    final vibeToSend = _vibeController.text.trim();
+
     final result = await GeminiService.getPersonalizedMatch(
-      recipient: _selectedRecipient,
-      occasion: _selectedOccasion,
-      vibe: _selectedVibe,
+      recipient: recipientToSend.isNotEmpty ? recipientToSend : 'a loved one',
+      occasion: occasionToSend.isNotEmpty ? occasionToSend : 'a special day',
+      vibe: vibeToSend.isNotEmpty ? vibeToSend : 'Soft, romantic pastel tones',
       budget: _selectedBudget,
       tone: _selectedTone,
     );
@@ -868,7 +947,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                     ),
                   ),
                   Text(
-                    'Visual Styling & Personal Matchmaker',
+                    'Visual Styling & Floral Stylist',
                     style: TextStyle(
                         fontSize: 11,
                         color: isDark ? Colors.grey[400] : Colors.grey[600]),
@@ -885,7 +964,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
           unselectedLabelColor: isDark ? Colors.grey[400] : Colors.grey[600],
           tabs: const [
             Tab(icon: Icon(Icons.palette_outlined), text: 'Visual Stylist & Reservation'),
-            Tab(icon: Icon(Icons.favorite_outline), text: 'Matchmaker'),
+            Tab(icon: Icon(Icons.favorite_outline), text: 'Floral Stylist'),
           ],
         ),
       ),
@@ -893,7 +972,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
         controller: _tabController,
         children: [
           _buildVisualStylistTab(isDark),
-          _buildMatchmakerTab(isDark),
+          _buildFloralStylistTab(isDark),
         ],
       ),
     );
@@ -1509,17 +1588,76 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                             ),
                           ),
                           const SizedBox(height: 10),
-                          // NEW: date field now runs an availability check
-                          // BEFORE accepting the picked date. If the
-                          // business has blocked the date, or the day is
-                          // already at capacity, the date is rejected here
-                          // -- the customer never even gets to see it
-                          // "selected" only to fail at submission time.
+
+                          // Plain date picker -- no availability check
+                          // here. This date is about the customer's
+                          // event, which the branch has no capacity
+                          // constraint on.
                           InkWell(
                             onTap: () async {
                               final picked = await showDatePicker(
                                 context: context,
                                 initialDate: _selectedEventDate ??
+                                    DateTime.now()
+                                        .add(const Duration(days: 3)),
+                                firstDate: DateTime.now(),
+                                lastDate: DateTime.now()
+                                    .add(const Duration(days: 365)),
+                              );
+                              if (picked != null) {
+                                setState(() => _selectedEventDate = picked);
+                              }
+                            },
+                            child: InputDecorator(
+                              decoration: InputDecoration(
+                                labelText: 'Event Date',
+                                isDense: true,
+                                filled: true,
+                                fillColor: isDark
+                                    ? const Color(0xFF262626)
+                                    : Colors.white,
+                                prefixIcon: const Icon(
+                                    Icons.celebration_outlined,
+                                    size: 18,
+                                    color: Color(0xFFF59E0B)),
+                                border: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(10)),
+                              ),
+                              child: Text(
+                                _selectedEventDate == null
+                                    ? 'Tap to select your event date'
+                                    : '${_selectedEventDate!.month}/${_selectedEventDate!.day}/${_selectedEventDate!.year}',
+                                style: TextStyle(
+                                  color: _selectedEventDate == null
+                                      ? Colors.grey[500]
+                                      : (isDark
+                                      ? Colors.white
+                                      : Colors.black87),
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            'The day of your actual event or occasion.',
+                            style: TextStyle(
+                                fontSize: 10.5,
+                                color: isDark ? Colors.grey[500] : Colors.grey[500],
+                                fontStyle: FontStyle.italic),
+                          ),
+                          const SizedBox(height: 10),
+
+                          // Appointment Date -- separate from Event
+                          // Date. This is the one that runs the
+                          // availability check (blocked dates + daily
+                          // capacity cap from Reservation Settings),
+                          // because it's the date the branch actually
+                          // has to plan around.
+                          InkWell(
+                            onTap: () async {
+                              final picked = await showDatePicker(
+                                context: context,
+                                initialDate: _selectedAppointmentDate ??
                                     DateTime.now()
                                         .add(const Duration(days: 3)),
                                 firstDate: DateTime.now(),
@@ -1544,11 +1682,11 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                                 return;
                               }
 
-                              setState(() => _selectedEventDate = picked);
+                              setState(() => _selectedAppointmentDate = picked);
                             },
                             child: InputDecorator(
                               decoration: InputDecoration(
-                                labelText: 'Event Date',
+                                labelText: 'Appointment Date',
                                 isDense: true,
                                 filled: true,
                                 fillColor: isDark
@@ -1564,18 +1702,18 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                                   ),
                                 )
                                     : const Icon(
-                                    Icons.calendar_month_outlined,
+                                    Icons.event_available_outlined,
                                     size: 18,
                                     color: Color(0xFFF59E0B)),
                                 border: OutlineInputBorder(
                                     borderRadius: BorderRadius.circular(10)),
                               ),
                               child: Text(
-                                _selectedEventDate == null
-                                    ? 'Tap to select a date'
-                                    : '${_selectedEventDate!.month}/${_selectedEventDate!.day}/${_selectedEventDate!.year}',
+                                _selectedAppointmentDate == null
+                                    ? 'Tap to select an appointment date'
+                                    : '${_selectedAppointmentDate!.month}/${_selectedAppointmentDate!.day}/${_selectedAppointmentDate!.year}',
                                 style: TextStyle(
-                                  color: _selectedEventDate == null
+                                  color: _selectedAppointmentDate == null
                                       ? Colors.grey[500]
                                       : (isDark
                                       ? Colors.white
@@ -1584,7 +1722,16 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                               ),
                             ),
                           ),
+                          const SizedBox(height: 4),
+                          Text(
+                            'When you\'ll visit the branch to finalize your design. Subject to daily booking limits set by the shop.',
+                            style: TextStyle(
+                                fontSize: 10.5,
+                                color: isDark ? Colors.grey[500] : Colors.grey[500],
+                                fontStyle: FontStyle.italic),
+                          ),
                           const SizedBox(height: 10),
+
                           InkWell(
                             onTap: () async {
                               final picked = await showTimePicker(
@@ -1676,7 +1823,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                                         borderRadius: BorderRadius.circular(10)),
                                   ),
                                 ),
-                                // NEW: standing note, always visible so the
+                                // Standing note, always visible so the
                                 // 50% deposit expectation is clear before
                                 // the customer even types a number.
                                 const SizedBox(height: 6),
@@ -2302,13 +2449,14 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     );
   }
 
-  Widget _buildMatchmakerTab(bool isDark) {
+  Widget _buildFloralStylistTab(bool isDark) {
     final recipients = [
       'Partner / Spouse',
       'Mother / Parent',
       'Best Friend',
       'Colleague / Boss',
-      'Self-Care Treat'
+      'Self-Care Treat',
+      'Others',
     ];
     final occasions = [
       'Anniversary',
@@ -2316,14 +2464,8 @@ class _AIAssistantPageState extends State<AIAssistantPage>
       'Get Well Soon',
       'Apology / Reconciliation',
       'Graduation / Success',
-      'Just Because'
-    ];
-    final vibes = [
-      'Romantic Red',
-      'Pastel Soft & Sweet',
-      'Sunny Vibrant',
-      'Rustic Earthy',
-      'Modern Luxury White'
+      'Just Because',
+      'Others',
     ];
     final budgets = [
       '₱500 - ₱1,000',
@@ -2360,7 +2502,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'AI Personal Floral Matchmaker',
+                        'AI Floral Stylist',
                         style: TextStyle(
                             fontWeight: FontWeight.bold,
                             fontSize: 16,
@@ -2368,7 +2510,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                       ),
                       SizedBox(height: 2),
                       Text(
-                        'Answer 5 quick preferences and let Gemini create a custom flower formula & card note!',
+                        'Answer a few quick prompts and let Gemini craft a custom flower formula, vibe name & card note!',
                         style: TextStyle(fontSize: 12, color: Colors.white70),
                       ),
                     ],
@@ -2384,15 +2526,71 @@ class _AIAssistantPageState extends State<AIAssistantPage>
             if (val != null) setState(() => _selectedRecipient = val);
           }, isDark),
 
+          if (_selectedRecipient == 'Others')
+            Padding(
+              padding: const EdgeInsets.only(bottom: 14.0),
+              child: TextField(
+                controller: _customRecipientController,
+                decoration: InputDecoration(
+                  hintText: 'e.g., My business partner, our new puppy...',
+                  filled: true,
+                  fillColor: isDark ? const Color(0xFF262626) : Colors.white,
+                  border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12)),
+                ),
+              ),
+            ),
+
           _buildDropdownSection(
               '2. What is the occasion?', _selectedOccasion, occasions, (val) {
             if (val != null) setState(() => _selectedOccasion = val);
           }, isDark),
 
-          _buildDropdownSection('3. Desired Color Vibe', _selectedVibe, vibes,
-                  (val) {
-                if (val != null) setState(() => _selectedVibe = val);
-              }, isDark),
+          if (_selectedOccasion == 'Others')
+            Padding(
+              padding: const EdgeInsets.only(bottom: 14.0),
+              child: TextField(
+                controller: _customOccasionController,
+                decoration: InputDecoration(
+                  hintText: 'e.g., Housewarming, promotion, just felt like it...',
+                  filled: true,
+                  fillColor: isDark ? const Color(0xFF262626) : Colors.white,
+                  border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12)),
+                ),
+              ),
+            ),
+
+          Padding(
+            padding: const EdgeInsets.only(bottom: 6.0),
+            child: Text('3. Describe Your Desired Vibe',
+                style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 13,
+                    color: isDark ? Colors.white : Colors.black87)),
+          ),
+          const SizedBox(height: 6),
+          TextField(
+            controller: _vibeController,
+            maxLines: 2,
+            decoration: InputDecoration(
+              hintText:
+              'e.g., moody and dramatic, like a rainy evening in Paris',
+              filled: true,
+              fillColor: isDark ? const Color(0xFF262626) : Colors.white,
+              border:
+              OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            "Describe it in your own words -- Gemini will give it a name and pick flowers/colors that match.",
+            style: TextStyle(
+                fontSize: 10.5,
+                fontStyle: FontStyle.italic,
+                color: isDark ? Colors.grey[400] : Colors.grey[600]),
+          ),
+          const SizedBox(height: 14),
 
           _buildDropdownSection('4. Budget Range', _selectedBudget, budgets,
                   (val) {
@@ -2599,6 +2797,29 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                             ),
                           ],
                         ),
+                        if (_matchResult!['vibeName'] != null &&
+                            _matchResult!['vibeName'].toString().isNotEmpty) ...[
+                          const SizedBox(height: 4),
+                          Row(
+                            children: [
+                              const Icon(Icons.palette_outlined,
+                                  size: 14, color: Color(0xFFF59E0B)),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: Text(
+                                  'Vibe: ${_matchResult!['vibeName']}',
+                                  style: TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w700,
+                                      fontStyle: FontStyle.italic,
+                                      color: isDark
+                                          ? Colors.grey[300]
+                                          : Colors.grey[700]),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
                         const SizedBox(height: 8),
                         Text(
                           _matchResult!['explanation'] ?? '',

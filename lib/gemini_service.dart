@@ -805,14 +805,21 @@ class GeminiService {
     return resultData;
   }
 
-  /// AI Personalization Matchmaker - Generates bouquet ideas, 3D formulas & card notes
+  /// AI Floral Stylist - Generates bouquet ideas, 3D formulas & card notes
+  ///
+  /// CHANGED: 'vibe' is no longer a preset label -- it's now whatever the
+  /// customer typed describing the mood/aesthetic they want. Gemini is
+  /// asked to (1) invent a short, real-world-sounding NAME for that vibe
+  /// (returned as 'vibeName', shown back to the customer in the UI so
+  /// they see their description was actually used) and (2) still pick
+  /// flowers/colors based on the description, same as before.
   ///
   /// TODO (tracked separately, not yet implemented): estimatedPrice below is
   /// still AI-guessed free text. The plan discussed is to replace this with
   /// a computed price from a real Dangwa-tier wholesale rate table once
   /// that pricing service is built -- flagging here so it isn't forgotten,
   /// but intentionally NOT changed in this pass to avoid breaking the
-  /// existing Matchmaker price display before its replacement exists.
+  /// existing Floral Stylist price display before its replacement exists.
   static Future<Map<String, dynamic>> getPersonalizedMatch({
     required String recipient,
     required String occasion,
@@ -828,16 +835,27 @@ class GeminiService {
       );
 
       final prompt = """
-        You are Bloominous AI Personal Floral Matchmaker.
+        You are Bloominous' AI Floral Stylist.
         Generate a personalized floral recommendation based on:
         - Recipient: $recipient
         - Occasion: $occasion
-        - Desired Vibe: $vibe
+        - Desired Vibe (in the customer's own words): "$vibe"
         - Budget: $budget
         - Card Note Tone: $tone
 
+        First, invent a short, real-world-sounding NAME for the vibe described
+        above -- something a florist might actually print on a catalog tag
+        (e.g. "Velvet Noir", "Golden Hour", "Coastal Breeze", "Morning Meadow").
+        It should genuinely reflect the mood/colors/style implied by the
+        customer's description, not be generic.
+
+        Then base your flower choices, color palette, and overall styling
+        directly on that same description -- the customer's own words are
+        the source of truth for the vibe, more than any single keyword in it.
+
         Return JSON with:
         {
+          "vibeName": "Short, evocative, real-world-sounding name for the described vibe",
           "title": "Name for the custom creation",
           "explanation": "Why this matches recipient & occasion",
           "flowerFormula": [
@@ -859,6 +877,7 @@ class GeminiService {
         Map<String, dynamic>.from(json.decode(jsonMatch.group(0)!));
       } else {
         resultData = {
+          "vibeName": vibe.isNotEmpty ? vibe : "Custom Vibe",
           "title": "The $vibe $occasion Arrangement for $recipient",
           "explanation":
           "Curated with soft textures and rich colors suited for $recipient on this $occasion.",
@@ -877,6 +896,7 @@ class GeminiService {
     } catch (e) {
       print("Gemini getPersonalizedMatch fallback: $e");
       resultData = {
+        "vibeName": vibe.isNotEmpty ? vibe : "Custom Vibe",
         "title": "The $vibe $occasion Arrangement for $recipient",
         "explanation":
         "Curated with soft textures and rich colors suited for $recipient on this $occasion.",
@@ -1249,8 +1269,8 @@ class GeminiService {
     }
 
     return pick([
-      "For '$userQuery', I recommend a bouquet featuring fresh Ecuadorian Roses, Sunflowers, and Eucalyptus. You can also use our 'Matchmaker' tab or 'Visual Stylist' above to get personalized 3D bouquet formulas!",
-      "That's a great question -- for something tailored to '$userQuery', try our 'Matchmaker' tab for a personalized bouquet formula, or ask me something more specific and I'll do my best!",
+      "For '$userQuery', I recommend a bouquet featuring fresh Ecuadorian Roses, Sunflowers, and Eucalyptus. You can also use our 'Floral Stylist' tab or 'Visual Stylist' above to get personalized 3D bouquet formulas!",
+      "That's a great question -- for something tailored to '$userQuery', try our 'Floral Stylist' tab for a personalized bouquet formula, or ask me something more specific and I'll do my best!",
     ]);
   }
 

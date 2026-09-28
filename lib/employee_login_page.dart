@@ -74,12 +74,25 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
     }
   }
 
+  // RESTORED + FIXED: reads/writes 'employees/{uid}' now, not the old
+  // 'users/{uid}' -- deviceHashes and branchId both moved to the
+  // 'employees' collection when that split happened, so pointing this
+  // at 'users' meant it was always reading/writing a field that
+  // wasn't there anymore. Also switched .update() to
+  // .set(..., merge: true): .update() THROWS if the document doesn't
+  // exist at all, which is exactly what was silently killing this for
+  // the super-admin account (no 'employees' doc existed for it until
+  // the fix in InventoryData.getUserData() below). .set() with merge
+  // creates the doc if missing and merges into it if present -- safe
+  // either way, for every role.
   Future<void> _checkAndTrackDevice(String uid, String displayEmail) async {
     try {
       final deviceHash = await _securityService.getDeviceHash();
-      final userDoc =
-      await FirebaseFirestore.instance.collection('users').doc(uid).get();
-      final data = userDoc.data();
+      final employeeDoc = await FirebaseFirestore.instance
+          .collection('employees')
+          .doc(uid)
+          .get();
+      final data = employeeDoc.data();
       final rawHashes = data?['deviceHashes'];
       final hasNoDeviceHistoryYet = rawHashes == null;
       final knownHashes = rawHashes is List
@@ -100,9 +113,12 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
       }
 
       if (!isRecognized) {
-        await FirebaseFirestore.instance.collection('users').doc(uid).update({
+        await FirebaseFirestore.instance
+            .collection('employees')
+            .doc(uid)
+            .set({
           'deviceHashes': FieldValue.arrayUnion([deviceHash]),
-        });
+        }, SetOptions(merge: true));
       }
     } catch (e) {
       debugPrint('Device tracking failed (login still proceeds): $e');
@@ -150,6 +166,8 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
 
         await _securityService.resetAttempts();
 
+        // RESTORED: device-tracking call site, now targeting the
+        // fixed function above.
         await _checkAndTrackDevice(
             credential.user!.uid, emailController.text.trim());
 
@@ -224,10 +242,6 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
       return;
     }
 
-    // Previously unprotected — every other sensitive action on this
-    // page (login, login failure) goes through this same rate limiter.
-    // This button was the one gap letting someone hammer password-reset
-    // emails at any address with zero throttling.
     if (await _isRateLimited()) return;
 
     try {

@@ -25,6 +25,10 @@ class InventoryData {
     return _db.collection('users');
   }
 
+  static CollectionReference _employeesCollection() {
+    return _db.collection('employees');
+  }
+
   static CollectionReference _branchesCollection() {
     return _db.collection('branches');
   }
@@ -321,7 +325,7 @@ class InventoryData {
 
   static Stream<List<Map<String, dynamic>>> employeesStream(
       {String? branchId, List<String>? roles}) {
-    Query query = _usersCollection()
+    Query query = _employeesCollection()
         .where('role', whereIn: roles ?? ['employee', 'delivery']);
     if (branchId != null) {
       query = query.where('branchId', isEqualTo: branchId);
@@ -445,8 +449,6 @@ class InventoryData {
     return docRef.id;
   }
 
-  // Every caller of this shared method (order status updates from the
-  // admin/staff side) gets a branch-scoped notification automatically.
   static Future<void> updateOrderStatus(String orderId, String status) async {
     await _ordersCollection().doc(orderId).update({'status': status});
 
@@ -514,9 +516,6 @@ class InventoryData {
 
     await _ordersCollection().doc(orderId).update(updateData);
 
-    // Notifies the assigned branch whenever a delivery's status changes —
-    // covers both the driver app and the admin Delivery Status monitor,
-    // since both call this same shared method.
     final orderSnap = await _ordersCollection().doc(orderId).get();
     final branchIdForNotif = (orderSnap.data() as Map<String, dynamic>?)?['branchId'];
     await createNotification(
@@ -799,9 +798,13 @@ class InventoryData {
     String? employeeId,
     String? role,
     String? branchId,
+    FirebaseFirestore? firestoreInstance,
   }) async {
+    final db = firestoreInstance ?? _db;
     final normalizedEmail = email.trim().toLowerCase();
-    await _usersCollection().doc(uid).set({
+    final resolvedRole = role ?? 'employee';
+
+    await db.collection('employees').doc(uid).set({
       'uid': uid,
       'firstName': firstName,
       'middleName': middleName,
@@ -810,9 +813,15 @@ class InventoryData {
       'sex': sex,
       'email': normalizedEmail,
       'employeeId': employeeId,
-      'role': role ?? 'employee',
+      'role': resolvedRole,
       'branchId': branchId,
       'createdAt': FieldValue.serverTimestamp(),
+    });
+
+    await db.collection('users').doc(uid).set({
+      'uid': uid,
+      'email': normalizedEmail,
+      'role': resolvedRole,
     });
   }
 
@@ -827,6 +836,7 @@ class InventoryData {
     String? employeeId,
     String? role,
     String? branchId,
+    FirebaseFirestore? firestoreInstance,
   }) async {
     await createEmployee(
       uid: uid,
@@ -839,6 +849,7 @@ class InventoryData {
       employeeId: employeeId,
       role: role,
       branchId: branchId,
+      firestoreInstance: firestoreInstance,
     );
   }
 
@@ -858,10 +869,24 @@ class InventoryData {
     if (userId.isEmpty) return null;
     final doc = await _usersCollection().doc(userId).get();
     if (doc.exists) {
-      final data = doc.data() as Map<String, dynamic>;
+      final data = Map<String, dynamic>.from(doc.data() as Map<String, dynamic>);
       if (data['email'] == '789jojoalvarado@gmail.com' ||
           data['username'] == '789jojoalvarado@gmail.com') {
         data['role'] = 'super-admin';
+      }
+
+      final role = data['role'];
+      if (role != null && role != 'customer') {
+        try {
+          final empDoc = await _employeesCollection().doc(userId).get();
+          if (empDoc.exists) {
+            data.addAll(empDoc.data() as Map<String, dynamic>);
+            data['role'] = role;
+            data['uid'] = userId;
+          }
+        } catch (e) {
+          debugPrint('Could not merge employee profile for $userId: $e');
+        }
       }
       return data;
     }
@@ -871,18 +896,76 @@ class InventoryData {
       final normalizedEmail = user.email!.trim().toLowerCase();
 
       if (normalizedEmail == '789jojoalvarado@gmail.com') {
-        final superAdminData = {
-          'uid': userId,
-          'email': normalizedEmail,
-          'username': '789jojoalvarado',
-          'firstName': 'Super',
-          'lastName': 'Admin',
-          'role': 'super-admin',
-          'branchId': 'main_branch',
-          'createdAt': FieldValue.serverTimestamp(),
-        };
-        await _usersCollection().doc(userId).set(superAdminData);
-        return superAdminData;
+        final existingSnap = await _usersCollection()
+            .where('email', isEqualTo: normalizedEmail)
+            .limit(1)
+            .get();
+
+        Map<String, dynamic> consolidated;
+        if (existingSnap.docs.isNotEmpty) {
+          final existingDoc = existingSnap.docs.first;
+          final existingData =
+          Map<String, dynamic>.from(existingDoc.data() as Map<String, dynamic>);
+
+          consolidated = {
+            ...existingData,
+            'uid': userId,
+            'role': 'super-admin',
+          };
+          await _usersCollection().doc(userId).set(consolidated, SetOptions(merge: true));
+
+          if (existingDoc.id != userId) {
+            await _usersCollection().doc(existingDoc.id).delete();
+          }
+        } else {
+          consolidated = {
+            'uid': userId,
+            'email': normalizedEmail,
+            'username': '789jojoalvarado',
+            'firstName': 'Super',
+            'lastName': 'Admin',
+            'role': 'super-admin',
+            'branchId': 'main_branch',
+            'createdAt': FieldValue.serverTimestamp(),
+          };
+          await _usersCollection().doc(userId).set(consolidated);
+        }
+
+        try {
+          final existingEmpSnap = await _employeesCollection()
+              .where('email', isEqualTo: normalizedEmail)
+              .limit(1)
+              .get();
+
+          Map<String, dynamic> employeeBase = {};
+          String? staleEmployeeDocId;
+          if (existingEmpSnap.docs.isNotEmpty) {
+            employeeBase = Map<String, dynamic>.from(
+                existingEmpSnap.docs.first.data() as Map<String, dynamic>);
+            staleEmployeeDocId = existingEmpSnap.docs.first.id;
+          }
+
+          final consolidatedEmployee = {
+            ...employeeBase,
+            'uid': userId,
+            'email': normalizedEmail,
+            'role': 'super-admin',
+            'firstName': employeeBase['firstName'] ?? 'Super',
+            'lastName': employeeBase['lastName'] ?? 'Admin',
+            'branchId': employeeBase['branchId'] ?? 'main_branch',
+          };
+          await _employeesCollection()
+              .doc(userId)
+              .set(consolidatedEmployee, SetOptions(merge: true));
+
+          if (staleEmployeeDocId != null && staleEmployeeDocId != userId) {
+            await _employeesCollection().doc(staleEmployeeDocId).delete();
+          }
+        } catch (e) {
+          debugPrint('Could not ensure employees doc for super-admin $userId: $e');
+        }
+
+        return consolidated;
       }
 
       var snap = await _usersCollection()
@@ -1088,6 +1171,44 @@ class InventoryData {
     selectedBranchId = targetBranchId;
   }
 
+  static Future<Map<String, int>> migrateLegacyEmployeesToEmployeesCollection() async {
+    int migrated = 0;
+    int skippedAlready = 0;
+
+    final snap = await _usersCollection()
+        .where('role', whereIn: ['admin', 'super-admin', 'employee', 'delivery'])
+        .get();
+
+    for (final doc in snap.docs) {
+      final uid = doc.id;
+      final data = doc.data() as Map<String, dynamic>;
+
+      final existing = await _employeesCollection().doc(uid).get();
+      if (existing.exists) {
+        skippedAlready++;
+        continue;
+      }
+
+      await _employeesCollection().doc(uid).set({
+        'uid': uid,
+        'firstName': data['firstName'],
+        'middleName': data['middleName'],
+        'lastName': data['lastName'],
+        'birthday': data['birthday'],
+        'sex': data['sex'],
+        'email': data['email'],
+        'employeeId': data['employeeId'],
+        'role': data['role'],
+        'branchId': data['branchId'],
+        'createdAt': data['createdAt'] ?? FieldValue.serverTimestamp(),
+        'migratedFromUsersCollection': true,
+      });
+      migrated++;
+    }
+
+    return {'migrated': migrated, 'skippedAlready': skippedAlready};
+  }
+
   static Future<void> seedInventoryIfEmpty() async {
     final bid = selectedBranchId ?? 'main_branch';
     final snap = await _db
@@ -1145,25 +1266,51 @@ class InventoryData {
   static Future<void> updateUserRoleAndBranch(
       String email, String role, String? branchId) async {
     final normalizedEmail = email.trim().toLowerCase();
-    final snapshot = await _db
-        .collection('users')
+    final snapshot = await _usersCollection()
         .where('email', isEqualTo: normalizedEmail)
         .get();
 
     if (snapshot.docs.isNotEmpty) {
+      final uid = snapshot.docs.first.id;
       await snapshot.docs.first.reference.update({
         'role': role,
-        'branchId': branchId,
         'email': normalizedEmail,
       });
-    } else {
-      await _db.collection('users').add({
-        'email': normalizedEmail,
+
+      await _employeesCollection().doc(uid).set({
         'role': role,
         'branchId': branchId,
+        'email': normalizedEmail,
+      }, SetOptions(merge: true));
+    } else {
+      await _usersCollection().add({
+        'email': normalizedEmail,
+        'role': role,
         'createdAt': FieldValue.serverTimestamp(),
       });
     }
+  }
+
+  static bool canRemoveAccount(String callerRole, String targetRole) {
+    if (callerRole == 'super-admin') return true;
+    if (callerRole == 'admin') {
+      return targetRole != 'admin' && targetRole != 'super-admin';
+    }
+    return false;
+  }
+
+  static Future<void> deleteEmployeeAccount({
+    required String uid,
+    required String targetRole,
+    required String callerRole,
+  }) async {
+    if (!canRemoveAccount(callerRole, targetRole)) {
+      throw Exception('You do not have permission to remove this account.');
+    }
+    await Future.wait([
+      _employeesCollection().doc(uid).delete(),
+      _usersCollection().doc(uid).delete(),
+    ]);
   }
 
   static Future<void> _checkExpiredRecycledBouquets(String bid) async {

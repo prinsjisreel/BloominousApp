@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'dart:async';
@@ -43,6 +44,10 @@ class _AuthPageState extends State<AuthPage> {
   bool _obscurePassword = true;
   bool _isSigningUp = false;
 
+  bool _agreedToTerms = false;
+
+  late final TapGestureRecognizer _termsTapRecognizer;
+
   int _remainingLockoutSeconds = 0;
   bool _superAdminLocked = false;
   Timer? _lockoutTimer;
@@ -57,6 +62,7 @@ class _AuthPageState extends State<AuthPage> {
   @override
   void initState() {
     super.initState();
+    _termsTapRecognizer = TapGestureRecognizer()..onTap = _showTermsDialog;
     _checkExistingSession();
     _isRateLimited();
   }
@@ -64,6 +70,7 @@ class _AuthPageState extends State<AuthPage> {
   @override
   void dispose() {
     _lockoutTimer?.cancel();
+    _termsTapRecognizer.dispose();
     super.dispose();
   }
 
@@ -202,6 +209,12 @@ class _AuthPageState extends State<AuthPage> {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Passwords do not match')));
         return;
       }
+      if (!_agreedToTerms) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('You must agree to the Terms and Conditions to create an account.')),
+        );
+        return;
+      }
     }
 
     setState(() => _isLoading = true);
@@ -291,6 +304,18 @@ class _AuthPageState extends State<AuthPage> {
           password: password,
         );
       } catch (authError) {
+        // NEW: a network failure during Auth itself means we genuinely
+        // don't know whether the password was right or wrong — Firebase
+        // never got far enough to check. Rethrow the ORIGINAL exception
+        // (not a wrapped generic one) so the outer catch below can still
+        // see its .code and recognize it as a connectivity failure,
+        // instead of falling into the Firestore fallback query, which
+        // needs the same connection that just failed and would just
+        // produce a second, more confusing error on top of it.
+        if (authError is FirebaseAuthException && authError.code == 'network-request-failed') {
+          rethrow;
+        }
+
         final query = await _firestore.collection('customers').where('email', isEqualTo: email).limit(1).get();
         if (query.docs.isNotEmpty) {
           throw Exception('Incorrect password. If this is an older account, please use "Forgot Password?" to reset it securely.');
@@ -373,6 +398,32 @@ class _AuthPageState extends State<AuthPage> {
       }
     } catch (e) {
       setState(() => _isLoading = false);
+
+      // NEW: distinguish "couldn't verify your credentials because
+      // Firebase/Firestore is unreachable" from "credentials are
+      // actually wrong" — same logic as web's index.php.
+      // network-request-failed is Firebase Auth's own code for "the
+      // request never made it to the server"; 'unavailable' is
+      // Firestore's equivalent, thrown by any .get()/.where() call
+      // above when the backend can't be reached. Neither means the
+      // password was wrong, so neither should burn a lockout attempt
+      // or show the generic credential-failure message.
+      final isConnectivityError =
+          (e is FirebaseAuthException && e.code == 'network-request-failed') ||
+              (e is FirebaseException && e.code == 'unavailable');
+
+      if (isConnectivityError) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text("Couldn't reach the server. Check your internet connection and try again."),
+              backgroundColor: Colors.orangeAccent,
+            ),
+          );
+        }
+        return;
+      }
+
       await _securityService.recordFailedAttempt();
       await _isRateLimited();
       ScaffoldMessenger.of(context).showSnackBar(
@@ -472,6 +523,7 @@ class _AuthPageState extends State<AuthPage> {
         'deviceHashes': [deviceHash],
         'email': email,
         'requireEmailVerification': true,
+        'agreedToTermsAt': FieldValue.serverTimestamp(),
       };
 
       await _firestore.collection('customers').doc(uid).set(customerData, SetOptions(merge: true));
@@ -492,16 +544,6 @@ class _AuthPageState extends State<AuthPage> {
         await _registrationRiskService.recordScore(riskResult.scoreBump);
       }
 
-      // Tries the branded custom email FIRST (via
-      // send_verification_email.php), and only falls back to Firebase's
-      // own native sendEmailVerification() if that fails for ANY
-      // reason — network error, non-success response, or a stale
-      // CDN-cached reply we can't yet be certain is fixed (Hostinger's
-      // forced CDN on this temporary subdomain was confirmed via
-      // canary-string testing to serve stale responses from this exact
-      // endpoint; the no-cache header fix in bloom_json_response() may
-      // or may not be enough on its own). This guarantees the customer
-      // always gets SOME verification email either way.
       bool primarySucceeded = false;
       try {
         final result = await _emailVerificationService.sendVerificationEmail();
@@ -533,6 +575,161 @@ class _AuthPageState extends State<AuthPage> {
     }
   }
 
+  void _showTermsDialog() {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final cardColor = isDark ? const Color(0xFF2A241D) : Colors.white;
+    final textColor = isDark ? const Color(0xFFEAE6DF) : const Color(0xFF1A1A1A);
+    final subTextColor = isDark ? const Color(0xFFA0998F) : const Color(0xFF9E9E9E);
+
+    showDialog(
+      context: context,
+      builder: (dialogContext) {
+        return Dialog(
+          backgroundColor: cardColor,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+          insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 40),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 500, maxHeight: 640),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(24, 24, 16, 12),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          'Terms of Service',
+                          style: GoogleFonts.cormorantGaramond(
+                            fontSize: 22,
+                            fontWeight: FontWeight.bold,
+                            color: textColor,
+                          ),
+                        ),
+                      ),
+                      IconButton(
+                        icon: Icon(Icons.close, color: subTextColor),
+                        onPressed: () => Navigator.pop(dialogContext),
+                      ),
+                    ],
+                  ),
+                ),
+                Expanded(
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.fromLTRB(24, 0, 24, 8),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        _tosParagraph(
+                          'By placing an order on this website or mobile application, you are agreeing to the following terms and conditions:',
+                          textColor,
+                        ),
+                        _tosSection('Order Acceptance Policy', textColor, subTextColor),
+                        _tosParagraph(
+                          'All orders and online requests received are subject to acceptance by Bloominous Flower Shop. We reserve the right, at our absolute discretion, to reject or cancel any order without giving prior reasons (e.g., due to stock depletion or system fraud flags). In the event of an order rejection by our management, any payment received will be refunded or canceled in full via the original payment method used.',
+                          textColor,
+                        ),
+                        _tosSection('Delivery & Pickup Policy', textColor, subTextColor),
+                        _tosParagraph(
+                          'Flower deliveries are available from Mondays to Sundays. For online ordering, customers may select their preferred fulfillment mode: Cash on Delivery (COD), Store Pick-up, or E-Wallet payment. For same-day deliveries, orders must be placed within the available operational hours of the target branches. Specific time-slot deliveries are subject to local traffic conditions and courier availability. While we strive for punctuality, Bloominous Flower Shop cannot be held liable for late deliveries caused by severe weather conditions, extreme traffic, or factors outside our control. The sender is responsible for providing accurate recipient details (full name, complete address, and active contact number). If a delivery fails due to incorrect customer details or an uncontactable recipient, a re-delivery fee may apply.',
+                          textColor,
+                        ),
+                        _tosSection('Changes to Your Order', textColor, subTextColor),
+                        _tosParagraph(
+                          'If you wish to make changes to your order (including delivery addresses or card greeting messages), please contact our team immediately through our official channels. For scheduled or pre-orders, request changes at least one day prior to the delivery date. For same-day orders, we will make every effort to accommodate modifications, but changes cannot be guaranteed once processing has begun.',
+                          textColor,
+                        ),
+                        _tosSection('Cancellation & Refund Policy', textColor, subTextColor),
+                        _tosParagraph(
+                          'Advance / Pre-Orders: Cancellations requested before the order goes into the preparation pipeline may be granted and processed via store credit or account balance adjustment. Same-Day & Custom AR Orders: Orders that have already been prepared, assembled, or dispatched by our florists cannot be canceled or refunded due to the perishable nature of floral stocks. Non-Refundable Policy: Strictly no cash refund transactions are permitted once a floral arrangement has been custom-built, accepted, or successfully delivered. If an order cannot be fulfilled by our shop due to unforeseen supply issues, a full replacement or reimbursement will be issued.',
+                          textColor,
+                        ),
+                        _tosSection('Product, AR Customization, and Substitution Policy', textColor, subTextColor),
+                        _tosParagraph(
+                          'Perishable Nature: Flowers are natural, perishable goods. Their actual color, shade, bouquet size, fillers and bloom stage may slightly vary from visual previews. Augmented Reality (AR) Previews: The 3D and AR customization modules within our web and mobile application serve as interactive visual references. While AR models provide a 3D preview of arrangement styles, wrappers, and ribbons, minor differences between the digital preview and the physical hand-crafted arrangement may occur. Substitutions: All items are subject to live stock availability. If specific flower species, wrapper colors, or accessories become unavailable, Bloominous Flower Shop reserves the right to substitute them with materials of equivalent or greater value and quality to maintain the design aesthetic.',
+                          textColor,
+                        ),
+                        _tosSection('Payments', textColor, subTextColor),
+                        _tosParagraph(
+                          'We accept Cash on Pick-up, Cash on Delivery (COD), and digital E-Wallets (GCash, PayMaya, etc.). Online e-wallet transactions and digital receipts are validated securely through integrated payment channels. We do not store sensitive payment card credentials directly on our local servers.',
+                          textColor,
+                        ),
+                        _tosSection('Freshness & Quality Assurance', textColor, subTextColor),
+                        _tosParagraph(
+                          'We are committed to delivering fresh floral arrangements. Fresh flowers are visually scanned and monitored using our integrated freshness tracking tools. If you receive flowers that are severely damaged or defective upon arrival, you must report the issue within 24 hours of receipt by providing your Order ID and clear photographs of the product. Valid reports will be reviewed by our customer support for a replacement on the next available delivery date.',
+                          textColor,
+                        ),
+                        _tosSection('Promos & Discount Vouchers', textColor, subTextColor),
+                        _tosParagraph(
+                          'Discount vouchers and promotional promo codes may be issued periodically at our discretion. Promotional codes cannot be combined with other active discounts or retroactively applied to completed orders. Bloominous Flower Shop reserves the right to modify or discontinue promo offers without prior notice.',
+                          textColor,
+                        ),
+                        _tosSection('Force Majeure & Uncontrollable Circumstances', textColor, subTextColor),
+                        _tosParagraph(
+                          'Bloominous Flower Shop shall not be liable for delayed performance or delivery failures resulting from severe weather conditions (typhoons, heavy floods), acts of God, government restrictions, power outages, system network disruptions, or other events beyond our reasonable control.',
+                          textColor,
+                        ),
+                        _tosSection('Customer Information & Privacy', textColor, subTextColor),
+                        _tosParagraph(
+                          'We value your privacy. Personal information collected during account registration and checkout—such as your full name, contact details, email address, and recipient address—is strictly used to fulfill transactions, process orders, send status updates, and improve user service. We do not lease, sell, or rent your personal information to third parties.',
+                          textColor,
+                        ),
+                        _tosSection('Store Details & Operating Headquarters', textColor, subTextColor),
+                        _tosParagraph(
+                          'Bloominous Flower Shop. Operating Hours: 12 Hours Daily (Catering to Walk-in & Online Customers).',
+                          textColor,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(24, 8, 24, 24),
+                  child: SizedBox(
+                    width: double.infinity,
+                    height: 46,
+                    child: ElevatedButton(
+                      onPressed: () => Navigator.pop(dialogContext),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: _primaryGold,
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        elevation: 0,
+                      ),
+                      child: const Text('I Understand', style: TextStyle(fontWeight: FontWeight.bold)),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _tosSection(String title, Color textColor, Color subTextColor) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 16, bottom: 6),
+      child: Text(
+        title.toUpperCase(),
+        style: TextStyle(
+          fontSize: 11,
+          fontWeight: FontWeight.w800,
+          letterSpacing: 0.5,
+          color: textColor,
+        ),
+      ),
+    );
+  }
+
+  Widget _tosParagraph(String text, Color textColor) {
+    return Text(
+      text,
+      style: TextStyle(fontSize: 12.5, height: 1.5, color: textColor.withOpacity(0.85)),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
@@ -543,14 +740,20 @@ class _AuthPageState extends State<AuthPage> {
     final borderColor = isDark ? const Color(0xFF3F382F) : const Color(0xFFE0E0E0);
     final inputFillColor = isDark ? const Color(0xFF221D17) : Colors.white;
 
+    final screenWidth = MediaQuery.of(context).size.width;
+    final isNarrow = screenWidth < 380;
+    final outerHorizontalPadding = isNarrow ? 12.0 : 24.0;
+    final cardHorizontalPadding = isNarrow ? 22.0 : 40.0;
+    final cardVerticalPadding = isNarrow ? 36.0 : 56.0;
+
     return Scaffold(
       backgroundColor: bgColor,
       body: Center(
         child: SingleChildScrollView(
-          padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 40.0),
+          padding: EdgeInsets.symmetric(horizontal: outerHorizontalPadding, vertical: 40.0),
           child: Container(
             constraints: const BoxConstraints(maxWidth: 450),
-            padding: const EdgeInsets.symmetric(horizontal: 40.0, vertical: 56.0),
+            padding: EdgeInsets.symmetric(horizontal: cardHorizontalPadding, vertical: cardVerticalPadding),
             decoration: BoxDecoration(
               color: cardColor,
               borderRadius: BorderRadius.circular(24),
@@ -733,6 +936,57 @@ class _AuthPageState extends State<AuthPage> {
                     fillColor: inputFillColor,
                   ),
 
+                if (_isSigningUp)
+                  Container(
+                    margin: const EdgeInsets.only(bottom: 8),
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                    decoration: BoxDecoration(
+                      color: inputFillColor,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: borderColor, width: 1),
+                    ),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        SizedBox(
+                          width: 22,
+                          height: 22,
+                          child: Checkbox(
+                            value: _agreedToTerms,
+                            activeColor: _primaryGold,
+                            materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            visualDensity: VisualDensity.compact,
+                            onChanged: (val) => setState(() => _agreedToTerms = val ?? false),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Padding(
+                            padding: const EdgeInsets.only(top: 2),
+                            child: RichText(
+                              text: TextSpan(
+                                style: TextStyle(fontSize: 12.5, height: 1.45, color: textColor),
+                                children: [
+                                  const TextSpan(text: 'I have read and agree to the '),
+                                  TextSpan(
+                                    text: 'Terms and Conditions',
+                                    style: TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      color: _primaryGold,
+                                      decoration: TextDecoration.underline,
+                                    ),
+                                    recognizer: _termsTapRecognizer,
+                                  ),
+                                  const TextSpan(text: ' of Bloominous Flower Shop.'),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+
                 if (!_isSigningUp)
                   Align(
                     alignment: Alignment.centerRight,
@@ -762,8 +1016,8 @@ class _AuthPageState extends State<AuthPage> {
 
                 const SizedBox(height: 32),
 
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
+                Wrap(
+                  alignment: WrapAlignment.center,
                   children: [
                     Text(
                       _isSigningUp ? "Already have an account?  " : "Don't have an account?  ",
@@ -774,6 +1028,7 @@ class _AuthPageState extends State<AuthPage> {
                         _isSigningUp = !_isSigningUp;
                         _emailController.clear();
                         _passwordController.clear();
+                        _agreedToTerms = false;
                       }),
                       child: Text(
                         _isSigningUp ? 'LOGIN HERE' : 'REGISTER HERE',
