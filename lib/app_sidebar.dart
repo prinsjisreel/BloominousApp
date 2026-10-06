@@ -18,7 +18,7 @@ import 'freshness_matrix_page.dart';
 import 'preorder_reservations_page.dart';
 import 'fraud_analytics_page.dart';
 import 'sales_anomalies_page.dart';
-import 'delivery_status_page.dart';
+import 'delivery_status_page.dart'; // must export a public `DeliveryStatusPage` class
 import 'invoice_portal_page.dart';
 import 'admin_audit_log_page.dart';
 import 'override_codes_page.dart';
@@ -45,14 +45,9 @@ class AppSidebar extends StatelessWidget {
         ? 'SUPER ADMIN'
         : (role == 'admin' ? 'ADMINISTRATOR' : 'STAFF MEMBER');
 
-    // FIXED: wrapping the whole sidebar in SafeArea keeps its content —
-    // most visibly the Logout tile at the very bottom — from rendering
-    // underneath the phone's on-screen system navigation bar. Without
-    // this, Flutter has no idea that strip of the physical screen is
-    // reserved by the OS, so it just draws content all the way to the
-    // true bottom edge, and the nav bar visually covers whatever lands
-    // there. Since every page's Drawer builds THIS widget, one fix here
-    // resolves it everywhere at once — no need to touch each page.
+    // SafeArea keeps the sidebar content (especially the Logout tile at the
+    // bottom) from rendering underneath the phone's on-screen navigation bar.
+    // Every page's Drawer builds THIS widget, so one fix here covers all pages.
     return SafeArea(
       child: Container(
         width: 260,
@@ -60,6 +55,8 @@ class AppSidebar extends StatelessWidget {
         child: Column(
           children: [
             const SizedBox(height: 40),
+
+            // ── Brand header: logo, name, role badge ──
             Column(
               children: [
                 Container(
@@ -113,35 +110,61 @@ class AppSidebar extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 30),
+
+            // ── Navigation list (one _item per line so none hide off-screen) ──
             Expanded(
               child: ListView(
                 padding: EdgeInsets.zero,
                 physics: const BouncingScrollPhysics(),
                 children: [
-                  _item(context, 'Dashboard', Icons.dashboard, 'dashboard', AdminDashboard(role: role), isDark, textColor),
-                  _item(context, 'Orders', Icons.shopping_cart_checkout, 'orders', OrdersPage(role: role), isDark, textColor),
-                  _item(context, 'Invoice Portal', Icons.receipt_long, 'invoice', InvoicePortalPage(role: role), isDark, textColor),
-                  _item(context, 'Pre-Orders', Icons.calendar_today, 'preorders', PreordersPage(role: role), isDark, textColor, isHidden: !isAdmin),
-                  _item(context, 'Fraud Analytics', Icons.security, 'fraud', FraudAnalyticsPage(role: role), isDark, textColor, isHidden: !isAdmin),
-                  _item(context, 'Admin Activity Log', Icons.fact_check, 'audit_log', AdminAuditLogPage(role: role), isDark, textColor, isHidden: !isAdmin),
-                  // New — mobile equivalent of override_codes.php. Shares
-                  // the exact same Firestore collections as web, so a
-                  // batch generated on either platform shows up live on
-                  // the other.
-                  _item(context, 'Override Codes', Icons.vpn_key, 'override_codes', OverrideCodesPage(role: role), isDark, textColor, isHidden: !isAdmin),
-                  _item(context, 'Sales Anomalies', Icons.warning_amber, 'anomalies', SalesAnomaliesPage(role: role), isDark, textColor, isHidden: !isAdmin),
-                  _item(context, 'Inventory', Icons.inventory_2, 'inventory', InventoryPage(role: role), isDark, textColor),
-                  _item(context, 'Freshness Matrix', Icons.health_and_safety, 'freshness', FreshnessMatrixPage(role: role), isDark, textColor),
-                  _item(context, 'Spoilage Tracker', Icons.delete_sweep, 'spoilage', const SpoilageTrackerPage(), isDark, textColor),
-                  _item(context, 'AI Stock Alerts', Icons.notification_important, 'alerts', LowStockAlertsPage(role: role), isDark, textColor),                  _item(context, 'POS Scanner', Icons.qr_code_scanner, 'pos', const POSScannerPage(), isDark, textColor),
-                  _item(context, 'Barcode Gen', Icons.barcode_reader, 'barcode', const BarcodeGeneratorPage(), isDark, textColor),
-                  _item(context, 'Delivery Status', Icons.local_shipping, 'delivery', DeliveryStatusPage(role: role), isDark, textColor),
-                  _item(context, 'Profile', Icons.person_outline, 'profile', ProfilePage(role: role), isDark, textColor),                  _item(context, 'Manage Employees', Icons.badge, 'employees', ManageEmployeesPage(role: role), isDark, textColor, isHidden: !isAdmin),
-                  _item(context, 'Sales Report', Icons.analytics, 'sales_report', SalesReportPage(role: role), isDark, textColor, isHidden: !isAdmin),
-                  _item(context, '3D Realism Hub', Icons.auto_awesome_mosaic, 'kiri', KiriGeneratorPage(role: role), isDark, textColor),                  _item(context, 'Settings', Icons.settings, 'settings', SettingsPage(role: role), isDark, textColor),
+                  _item(context, 'Dashboard', Icons.dashboard, 'dashboard',
+                      AdminDashboard(role: role), isDark, textColor),
+                  _item(context, 'Orders', Icons.shopping_cart_checkout, 'orders',
+                      OrdersPage(role: role), isDark, textColor),
+                  _item(context, 'Invoice Portal', Icons.receipt_long, 'invoice',
+                      InvoicePortalPage(role: role), isDark, textColor),
+                  _item(context, 'Pre-Orders', Icons.calendar_today, 'preorders',
+                      PreordersPage(role: role), isDark, textColor, isHidden: !isAdmin),
+                  _item(context, 'Fraud Analytics', Icons.security, 'fraud',
+                      FraudAnalyticsPage(role: role), isDark, textColor, isHidden: !isAdmin),
+                  _item(context, 'Admin Activity Log', Icons.fact_check, 'audit_log',
+                      AdminAuditLogPage(role: role), isDark, textColor, isHidden: !isAdmin),
+                  // Mobile equivalent of override_codes.php. Shares the same
+                  // Firestore collections as web, so batches sync both ways.
+                  _item(context, 'Override Codes', Icons.vpn_key, 'override_codes',
+                      OverrideCodesPage(role: role), isDark, textColor, isHidden: !isAdmin),
+                  _item(context, 'Sales Anomalies', Icons.warning_amber, 'anomalies',
+                      SalesAnomaliesPage(role: role), isDark, textColor, isHidden: !isAdmin),
+                  _item(context, 'Inventory', Icons.inventory_2, 'inventory',
+                      InventoryPage(role: role), isDark, textColor),
+                  _item(context, 'Freshness Matrix', Icons.health_and_safety, 'freshness',
+                      FreshnessMatrixPage(role: role), isDark, textColor),
+                  _item(context, 'Spoilage Tracker', Icons.delete_sweep, 'spoilage',
+                      const SpoilageTrackerPage(), isDark, textColor),
+                  _item(context, 'AI Stock Alerts', Icons.notification_important, 'alerts',
+                      LowStockAlertsPage(role: role), isDark, textColor),
+                  _item(context, 'POS Scanner', Icons.qr_code_scanner, 'pos',
+                      const POSScannerPage(), isDark, textColor),
+                  _item(context, 'Barcode Gen', Icons.barcode_reader, 'barcode',
+                      const BarcodeGeneratorPage(), isDark, textColor),
+                  // Mobile equivalent of delivery_status.php on web.
+                  _item(context, 'Delivery Status', Icons.local_shipping, 'delivery',
+                      DeliveryStatusPage(role: role), isDark, textColor),
+                  _item(context, 'Profile', Icons.person_outline, 'profile',
+                      ProfilePage(role: role), isDark, textColor),
+                  _item(context, 'Manage Employees', Icons.badge, 'employees',
+                      ManageEmployeesPage(role: role), isDark, textColor, isHidden: !isAdmin),
+                  _item(context, 'Sales Report', Icons.analytics, 'sales_report',
+                      SalesReportPage(role: role), isDark, textColor, isHidden: !isAdmin),
+                  _item(context, '3D Realism Hub', Icons.auto_awesome_mosaic, 'kiri',
+                      KiriGeneratorPage(role: role), isDark, textColor),
+                  _item(context, 'Settings', Icons.settings, 'settings',
+                      SettingsPage(role: role), isDark, textColor),
                 ],
               ),
             ),
+
+            // ── Logout tile pinned to the bottom ──
             Container(
               margin: const EdgeInsets.only(bottom: 24, top: 8),
               decoration: const BoxDecoration(
@@ -168,6 +191,8 @@ class AppSidebar extends StatelessWidget {
     );
   }
 
+  /// Builds one sidebar row. Returns an invisible, zero-size box when hidden,
+  /// so non-admins never see admin-only pages.
   Widget _item(
       BuildContext context,
       String title,

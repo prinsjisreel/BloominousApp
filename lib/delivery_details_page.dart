@@ -136,15 +136,16 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
   Timer? _streetSearchDebounce;
 
   // --- Account-restriction / phone-trust-restore state ---
-  // This is the ONE real, shared fraud rule between web and mobile:
-  // an isRestricted account must verify its phone before submit_order.php
-  // will accept ANY order, regardless of payment method. There is no
-  // separate COD-specific restriction anymore — that heuristic was
-  // removed because the server-side gate already covers every payment
-  // method uniformly, and keeping a second, less accurate check just
-  // added confusing UI without adding real security.
+  // FRAUD ACTIVITY MODEL: there is no fraud score anymore. The server
+  // (submit_order.php) records fraud activities for admins to review and
+  // only blocks an order in three situations, all mirrored here:
+  //   - isRestricted == true -> phone verification required (any payment method)
+  //   - status == 'blocked'  -> no orders at all
+  //   - banned device match  -> server restricts the account on the spot
+  //     (this listener then sees isRestricted flip to true live)
   StreamSubscription<DocumentSnapshot>? _fraudStatusSub;
   bool _isAccountRestricted = false;
+  bool _isAccountBlocked = false;
   String? _restrictedUntilText;
   bool _otpVerifiedThisSession = false;
   bool _isVerifyingPhone = false;
@@ -311,17 +312,15 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
     }
   }
 
+  // Watches THIS customer's own document live, so the checkout reacts the
+  // moment an admin restricts/blocks the account (from web or the app's
+  // Fraud Activity Log) or the server auto-restricts it after a
+  // banned-device match. Only the fields submit_order.php actually
+  // enforces are read here: isRestricted, restrictedUntil, status.
   void _checkUserFraudStatus() {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return;
 
-    // FIXED: this used to also derive its own separate COD-availability
-    // decision from raw fraudScore bands (with a real gap bug at
-    // scores 87-89). That logic is removed entirely — it doesn't align
-    // with anything the server actually enforces. isRestricted is the
-    // only signal that matters here: it's the same field submit_order.php
-    // checks before accepting an order at all, so this listener now only
-    // tracks what the OTP-verification banner/flow actually needs.
     _fraudStatusSub = FirebaseFirestore.instance
         .collection('customers')
         .doc(user.uid)
@@ -330,21 +329,29 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
       if (!mounted || !doc.exists || doc.data() == null) return;
       final data = doc.data()!;
 
-      final bool isRestricted = data['isRestricted'] ?? false;
+      // "== true" instead of "?? false": a missing OR non-boolean value
+      // safely counts as "not restricted" instead of crashing.
+      final bool isRestricted = data['isRestricted'] == true;
+      final bool isBlocked = data['status'] == 'blocked';
       final restrictedUntil = data['restrictedUntil'];
 
       String? untilText;
       if (isRestricted && restrictedUntil is Timestamp) {
-        final daysLeft = restrictedUntil.toDate().difference(DateTime.now()).inDays;
-        untilText = daysLeft > 0 ? 'for the next $daysLeft days' : 'for 30 days';
+        final remaining = restrictedUntil.toDate().difference(DateTime.now());
+        if (remaining.inDays >= 1) {
+          untilText = 'for the next ${remaining.inDays} day${remaining.inDays == 1 ? '' : 's'}';
+        } else if (remaining.inMinutes > 0) {
+          untilText = 'for less than a day';
+        }
       }
 
       setState(() {
         _isAccountRestricted = isRestricted;
+        _isAccountBlocked = isBlocked;
         _restrictedUntilText = untilText;
         if (!isRestricted) _otpVerifiedThisSession = false;
       });
-    }, onError: (e) => debugPrint('Fraud status listener error: $e'));
+    }, onError: (e) => debugPrint('Account status listener error: $e'));
   }
 
   void _updateFullAddress() {
@@ -659,6 +666,18 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
   }
 
   void _handlePlaceOrderTapped() {
+    // Blocked accounts can't order at all (the server answers BLOCKED).
+    // Stopping here saves a pointless round trip and explains why.
+    if (_isAccountBlocked) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('This account can no longer place orders. Please contact the shop if you think this is a mistake.'),
+          backgroundColor: Colors.redAccent,
+        ),
+      );
+      return;
+    }
+
     _updateFullAddress();
     if (recipientController.text.isEmpty ||
         addressController.text.isEmpty ||
@@ -893,7 +912,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
                     const SizedBox(height: 8),
                     Text(
                       _phoneVerificationId == null
-                          ? 'Enter the 6-digit code to restore your account trust.'
+                          ? 'Verify your phone number to place orders on this account again.'
                           : 'Enter the 6-digit code sent to your phone.',
                       style: TextStyle(fontSize: 12, color: isDark ? Colors.grey[400] : Colors.grey[600]),
                     ),
@@ -909,9 +928,11 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
                           children: [
                             const Icon(Icons.phone_android, color: Color(0xFFF4B400), size: 20),
                             const SizedBox(width: 10),
-                            Text('We will send a code to ${phoneController.text}',
-                                style: TextStyle(
-                                    fontSize: 13, color: isDark ? Colors.white : Colors.black87)),
+                            Expanded(
+                              child: Text('We will send a code to ${phoneController.text}',
+                                  style: TextStyle(
+                                      fontSize: 13, color: isDark ? Colors.white : Colors.black87)),
+                            ),
                           ],
                         ),
                       ),
@@ -932,8 +953,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
                           child: _isVerifyingPhone
                               ? const SizedBox(
                               width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
-                              : const Text('SEND CODE',
-                              style: TextStyle(fontWeight: FontWeight.bold)),
+                              : const Text('SEND CODE', style: TextStyle(fontWeight: FontWeight.bold)),
                         ),
                       ),
                     ] else ...[
@@ -991,9 +1011,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
                             await _startPhoneVerification(phoneController.text);
                             setModalState(() {});
                           },
-                          child: Text(_resendCooldown > 0
-                              ? 'Resend in ${_resendCooldown}s'
-                              : 'Resend Code'),
+                          child: Text(_resendCooldown > 0 ? 'Resend in ${_resendCooldown}s' : 'Resend Code'),
                         ),
                       ),
                     ],
@@ -1042,56 +1060,58 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
     try {
       final branchId = InventoryData.selectedBranchId ?? 'main_branch';
 
-      if (method == 'gcash' || method == 'maya') {
-        final checkoutUrl = await PaymentService.createCheckoutSession(
-          amount: total,
-          description: '${widget.occasion} - Flower Delivery',
-          customerEmail: user?.email ?? 'customer@example.com',
-          customerName: user?.displayName ?? recipientController.text,
-          restrictToPaymentMethod: method == 'maya' ? 'paymaya' : 'gcash',
-        );
+      // STEP 1 — the server decides first, for EVERY payment method.
+      // submit_order.php runs the blocked/restricted gate, the
+      // banned-device check, and records fraud activities. If it refuses
+      // (RESTRICTED / BLOCKED / EMAIL_UNREACHABLE), it throws an
+      // OrderSubmissionException and we never reach the payment step,
+      // so no PayMongo session is ever created for a refused order.
+      final result = await _orderSubmissionService.submitOrder(
+        name: recipientController.text,
+        phone: phoneController.text,
+        address: addressController.text,
+        items: widget.cartItems,
+        subtotal: subtotal,
+        shippingFee: deliveryFee,
+        paymentMethod: method,
+        branchId: branchId,
+        email: user?.email,
+        isGift: sendAsGift,
+        customerLat: _customerLat,
+        customerLng: _customerLng,
+        otpVerified: _otpVerifiedThisSession,
+        notes: notesController.text,
+      );
 
-        await _orderSubmissionService.submitOrder(
-          name: recipientController.text,
-          phone: phoneController.text,
-          address: addressController.text,
-          items: widget.cartItems,
-          subtotal: subtotal,
-          shippingFee: deliveryFee,
-          paymentMethod: method,
-          branchId: branchId,
-          email: user?.email,
-          isGift: sendAsGift,
-          customerLat: _customerLat,
-          customerLng: _customerLng,
-          otpVerified: _otpVerifiedThisSession,
-        );
+      debugPrint('Order placed: ${result.invoiceId} (${result.orderId})');
+
+      if (method == 'gcash' || method == 'maya') {
+        // STEP 2 (e-wallet only) — the order exists now, so open payment.
+        // If this part fails, the order is already saved as pending, so
+        // the message tells the customer their invoice number instead of
+        // implying nothing happened.
+        String checkoutUrl;
+        try {
+          // Same server endpoint as the web checkout: the amount comes from
+          // the order in Firestore, and the server's rate limits apply.
+          checkoutUrl = await PaymentService.startOrderPayment(
+            orderId: result.orderId,
+            paymentMethod: method,
+          );
+        } on PaymentSessionException catch (e) {
+          throw 'Your order ${result.invoiceId} was received, but the payment page could not be opened: ${e.message}';
+        } catch (e) {
+          throw 'Your order ${result.invoiceId} was received, but the payment page could not be opened. Please contact the shop to complete payment.';
+        }
 
         final url = Uri.parse(checkoutUrl);
         if (await canLaunchUrl(url)) {
           await launchUrl(url, mode: LaunchMode.externalApplication);
         } else {
-          throw 'Could not launch payment portal';
+          throw 'Your order ${result.invoiceId} was received, but the payment page could not be opened. Please contact the shop to complete payment.';
         }
       } else {
-        final result = await _orderSubmissionService.submitOrder(
-          name: recipientController.text,
-          phone: phoneController.text,
-          address: addressController.text,
-          items: widget.cartItems,
-          subtotal: subtotal,
-          shippingFee: deliveryFee,
-          paymentMethod: 'cod',
-          branchId: branchId,
-          email: user?.email,
-          isGift: sendAsGift,
-          customerLat: _customerLat,
-          customerLng: _customerLng,
-          otpVerified: _otpVerifiedThisSession,
-        );
-
-        debugPrint('Order placed: ${result.invoiceId} (${result.orderId})');
-
+        // COD: nothing left to do but show success.
         if (mounted) {
           Navigator.push(
             context,
@@ -1100,22 +1120,116 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
         }
       }
     } on OrderSubmissionException catch (e) {
-      String message = e.message;
+      // Server refusals. The Firestore listener will ALSO pick up any
+      // account change (e.g. isRestricted flipping to true after a
+      // banned-device match), but these setStates make the screen react
+      // immediately instead of waiting for the listener.
       if (e.code == 'RESTRICTED') {
-        setState(() => _otpVerifiedThisSession = false);
+        setState(() {
+          _isAccountRestricted = true;
+          _otpVerifiedThisSession = false;
+        });
+      } else if (e.code == 'BLOCKED') {
+        setState(() => _isAccountBlocked = true);
       }
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(message), backgroundColor: Colors.redAccent),
+          SnackBar(content: Text(e.message), backgroundColor: Colors.redAccent),
         );
       }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Checkout failed: $e')),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Checkout failed: $e')),
+        );
+      }
     } finally {
       if (mounted) setState(() => isLoading = false);
     }
+  }
+
+  Widget _buildAccountStatusBanner(bool isDark) {
+    // Blocked wins over restricted: a blocked account can't be fixed by
+    // phone verification, so showing the OTP message would mislead.
+    if (_isAccountBlocked) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: Colors.red.withOpacity(isDark ? 0.15 : 0.08),
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: Colors.red.withOpacity(0.4)),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Icon(Icons.block, color: Colors.redAccent, size: 22),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Account Blocked',
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 12,
+                      color: isDark ? Colors.red[200] : Colors.red[900],
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'This account can no longer place orders. If you believe this is a mistake, please contact the shop.',
+                    style: TextStyle(fontSize: 11, color: isDark ? Colors.red[100] : Colors.red[800]),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    final untilPart = _restrictedUntilText != null ? ' $_restrictedUntilText' : '';
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.amber.withOpacity(isDark ? 0.15 : 0.1),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.amber.withOpacity(0.4)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.warning_amber_rounded, color: Colors.amber, size: 22),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  _otpVerifiedThisSession ? 'Identity Verified' : 'Account Temporarily Restricted',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 12,
+                    color: isDark ? Colors.amber[200] : Colors.amber[900],
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  _otpVerifiedThisSession
+                      ? 'You\'ve verified your identity for this order. You can now place it normally.'
+                      : 'This account is restricted$untilPart following a review of recent account activity. A verification code sent to your phone is required to place an order.',
+                  style: TextStyle(fontSize: 11, color: isDark ? Colors.amber[100] : Colors.amber[800]),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -1138,50 +1252,8 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            if (_isAccountRestricted) ...[
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: Colors.amber.withOpacity(isDark ? 0.15 : 0.1),
-                  borderRadius: BorderRadius.circular(18),
-                  border: Border.all(color: Colors.amber.withOpacity(0.4)),
-                ),
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Icon(Icons.warning_amber_rounded, color: Colors.amber, size: 22),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            _otpVerifiedThisSession
-                                ? 'Identity Verified'
-                                : 'Account Soft Restriction Active',
-                            style: TextStyle(
-                              fontWeight: FontWeight.bold,
-                              fontSize: 12,
-                              color: isDark ? Colors.amber[200] : Colors.amber[900],
-                            ),
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            _otpVerifiedThisSession
-                                ? 'You\'ve verified your identity for this order. You can now place it normally.'
-                                : 'This account was restricted ${_restrictedUntilText ?? "for 30 days"} due to behavioral tracking flags. A verification code will be required to place an order.',
-                            style: TextStyle(
-                              fontSize: 11,
-                              color: isDark ? Colors.amber[100] : Colors.amber[800],
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-              ),
+            if (_isAccountBlocked || _isAccountRestricted) ...[
+              _buildAccountStatusBanner(isDark),
               const SizedBox(height: 16),
             ],
             _sectionCard(
@@ -1326,10 +1398,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
                   suffixIcon: _isSearchingStreet
                       ? const Padding(
                     padding: EdgeInsets.all(14),
-                    child: SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(strokeWidth: 2)),
+                    child: SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
                   )
                       : null,
                 ),
@@ -1340,9 +1409,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
                       color: isDark ? const Color(0xFF262626) : Colors.white,
                       borderRadius: BorderRadius.circular(14),
                       border: Border.all(
-                          color: isDark
-                              ? Colors.white.withOpacity(0.1)
-                              : Colors.grey.withOpacity(0.2)),
+                          color: isDark ? Colors.white.withOpacity(0.1) : Colors.grey.withOpacity(0.2)),
                       boxShadow: [
                         BoxShadow(
                             color: Colors.black.withOpacity(isDark ? 0.2 : 0.06),
@@ -1354,12 +1421,9 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
                       children: _streetSuggestions
                           .map((s) => ListTile(
                         dense: true,
-                        leading: const Icon(Icons.location_on_outlined,
-                            color: Color(0xFFF4B400), size: 20),
+                        leading: const Icon(Icons.location_on_outlined, color: Color(0xFFF4B400), size: 20),
                         title: Text(s.displayName,
-                            style: TextStyle(
-                                fontSize: 12,
-                                color: isDark ? Colors.white : Colors.black87),
+                            style: TextStyle(fontSize: 12, color: isDark ? Colors.white : Colors.black87),
                             maxLines: 2,
                             overflow: TextOverflow.ellipsis),
                         onTap: () => _onStreetSuggestionSelected(s),
@@ -1438,14 +1502,9 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
             const SizedBox(height: 8),
             if (!sendAsGift)
               TextButton.icon(
-                onPressed: isCalculatingFee || isAutoFillingAddress
-                    ? null
-                    : _handleGetCurrentLocation,
+                onPressed: isCalculatingFee || isAutoFillingAddress ? null : _handleGetCurrentLocation,
                 icon: (isCalculatingFee || isAutoFillingAddress)
-                    ? const SizedBox(
-                    width: 16,
-                    height: 16,
-                    child: CircularProgressIndicator(strokeWidth: 2))
+                    ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
                     : const Icon(Icons.my_location),
                 label: const Text('Get Current Location'),
               ),
@@ -1482,12 +1541,10 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
                     const DropdownMenuItem(value: 'maya', child: Text('Maya')),
                     DropdownMenuItem(
                       value: 'cod',
-                      // FIXED: COD is now disabled ONLY for gift orders —
-                      // matching web's codOption exactly. It's no longer
-                      // gated by fraud score/riskTier here; the real
-                      // enforcement (isRestricted requiring OTP) already
-                      // covers this account regardless of which payment
-                      // method they pick.
+                      // COD is disabled ONLY for gift orders — same rule as
+                      // web and submit_order.php. Account restrictions apply
+                      // to every payment method equally (phone OTP), so they
+                      // don't change which methods are listed here.
                       enabled: !sendAsGift,
                       child: Text(
                         sendAsGift ? 'Cash on Delivery (unavailable for gifts)' : 'Cash on Delivery',
@@ -1514,10 +1571,13 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
               SizedBox(
                 height: 58,
                 child: ElevatedButton(
-                  onPressed: _handlePlaceOrderTapped,
+                  // null = disabled: a blocked account can't order.
+                  onPressed: _isAccountBlocked ? null : _handlePlaceOrderTapped,
                   style: _actionButtonStyle(const Color(0xFFF4B400)),
-                  child: const Text('PLACE ORDER',
-                      style: TextStyle(fontWeight: FontWeight.w800, letterSpacing: 1)),
+                  child: Text(
+                    _isAccountBlocked ? 'ORDERING UNAVAILABLE' : 'PLACE ORDER',
+                    style: const TextStyle(fontWeight: FontWeight.w800, letterSpacing: 1),
+                  ),
                 ),
               ),
           ],
@@ -1537,8 +1597,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
       decoration: BoxDecoration(
         color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
         borderRadius: BorderRadius.circular(22),
-        border: Border.all(
-            color: isDark ? Colors.white.withOpacity(0.08) : Colors.grey.withOpacity(0.12)),
+        border: Border.all(color: isDark ? Colors.white.withOpacity(0.08) : Colors.grey.withOpacity(0.12)),
         boxShadow: [
           BoxShadow(
               color: Colors.black.withOpacity(isDark ? 0.3 : 0.03),
@@ -1662,8 +1721,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
         decoration: BoxDecoration(
           color: isDark ? Colors.white.withOpacity(0.04) : Colors.grey.withOpacity(0.06),
           borderRadius: BorderRadius.circular(20),
-          border: Border.all(
-              color: isDark ? Colors.white.withOpacity(0.08) : Colors.grey.withOpacity(0.15)),
+          border: Border.all(color: isDark ? Colors.white.withOpacity(0.08) : Colors.grey.withOpacity(0.15)),
         ),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -1676,9 +1734,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
                   : 'Your delivery route will appear here',
               textAlign: TextAlign.center,
               style: TextStyle(
-                  fontSize: 12,
-                  color: isDark ? Colors.grey[500] : Colors.grey[500],
-                  fontWeight: FontWeight.w600),
+                  fontSize: 12, color: isDark ? Colors.grey[500] : Colors.grey[500], fontWeight: FontWeight.w600),
             ),
           ],
         ),
@@ -1698,8 +1754,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
             FlutterMap(
               options: MapOptions(
                 initialCameraFit: CameraFit.bounds(bounds: bounds, padding: const EdgeInsets.all(48)),
-                interactionOptions:
-                const InteractionOptions(flags: InteractiveFlag.pinchZoom | InteractiveFlag.drag),
+                interactionOptions: const InteractionOptions(flags: InteractiveFlag.pinchZoom | InteractiveFlag.drag),
               ),
               children: [
                 TileLayer(
@@ -1778,8 +1833,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Text('TOTAL',
-                  style: TextStyle(
-                      fontWeight: FontWeight.bold, fontSize: 18, color: isDark ? Colors.white : Colors.black)),
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: isDark ? Colors.white : Colors.black)),
               Text('₱${total.toStringAsFixed(2)}',
                   style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: Colors.green)),
             ],

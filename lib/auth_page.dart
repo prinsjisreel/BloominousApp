@@ -14,6 +14,7 @@ import 'device_security_service.dart';
 import 'registration_risk_service.dart';
 import 'email_verification_service.dart';
 import 'email_verification_pending_page.dart';
+import 'forgot_password_page.dart';
 
 class AuthPage extends StatefulWidget {
   final bool returnAfterLogin;
@@ -71,6 +72,12 @@ class _AuthPageState extends State<AuthPage> {
   void dispose() {
     _lockoutTimer?.cancel();
     _termsTapRecognizer.dispose();
+    _emailController.dispose();
+    _passwordController.dispose();
+    _confirmPasswordController.dispose();
+    _firstNameController.dispose();
+    _middleNameController.dispose();
+    _lastNameController.dispose();
     super.dispose();
   }
 
@@ -255,32 +262,21 @@ class _AuthPageState extends State<AuthPage> {
     }
   }
 
-  Future<void> _forgotPassword() async {
-    final email = _emailController.text.trim().toLowerCase();
-    if (email.isEmpty || !email.contains('@')) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Please enter your email to reset password.')));
-      return;
-    }
-
-    if (await _isRateLimited()) return;
-
-    setState(() => _isLoading = true);
-    try {
-      await FirebaseAuth.instance.sendPasswordResetEmail(email: email);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Password reset link sent to your email!'), backgroundColor: Colors.green),
-        );
-      }
-    } catch (e) {
-      await _securityService.recordFailedAttempt();
-      await _isRateLimited();
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
-      }
-    } finally {
-      setState(() => _isLoading = false);
-    }
+  /// Opens the account-recovery screen, pre-filled with whatever email is
+  /// already typed. The reset email itself is requested there, through
+  /// request_password_reset.php (same endpoint as the web), so it is sent
+  /// from the shop's Gmail in the BLOOM design.
+  ///
+  /// Deliberately NOT blocked by the login lockout, and it no longer counts
+  /// as a failed login attempt: a locked-out customer is exactly the person
+  /// who needs a reset. The server has its own reset-specific rate limits.
+  void _openForgotPassword() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ForgotPasswordPage(initialEmail: _emailController.text.trim()),
+      ),
+    );
   }
 
   Future<void> _loginWithPassword() async {
@@ -304,14 +300,12 @@ class _AuthPageState extends State<AuthPage> {
           password: password,
         );
       } catch (authError) {
-        // NEW: a network failure during Auth itself means we genuinely
-        // don't know whether the password was right or wrong — Firebase
-        // never got far enough to check. Rethrow the ORIGINAL exception
-        // (not a wrapped generic one) so the outer catch below can still
-        // see its .code and recognize it as a connectivity failure,
-        // instead of falling into the Firestore fallback query, which
-        // needs the same connection that just failed and would just
-        // produce a second, more confusing error on top of it.
+        // A network failure during Auth itself means we genuinely don't
+        // know whether the password was right or wrong — Firebase never got
+        // far enough to check. Rethrow the ORIGINAL exception so the outer
+        // catch below can still see its .code and recognize it as a
+        // connectivity failure, instead of falling into the Firestore
+        // fallback query, which needs the same connection that just failed.
         if (authError is FirebaseAuthException && authError.code == 'network-request-failed') {
           rethrow;
         }
@@ -399,15 +393,11 @@ class _AuthPageState extends State<AuthPage> {
     } catch (e) {
       setState(() => _isLoading = false);
 
-      // NEW: distinguish "couldn't verify your credentials because
-      // Firebase/Firestore is unreachable" from "credentials are
-      // actually wrong" — same logic as web's index.php.
-      // network-request-failed is Firebase Auth's own code for "the
-      // request never made it to the server"; 'unavailable' is
-      // Firestore's equivalent, thrown by any .get()/.where() call
-      // above when the backend can't be reached. Neither means the
-      // password was wrong, so neither should burn a lockout attempt
-      // or show the generic credential-failure message.
+      // Distinguish "couldn't verify your credentials because
+      // Firebase/Firestore is unreachable" from "credentials are actually
+      // wrong" — same logic as web's index.php. Neither connectivity error
+      // means the password was wrong, so neither should burn a lockout
+      // attempt or show the generic credential-failure message.
       final isConnectivityError =
           (e is FirebaseAuthException && e.code == 'network-request-failed') ||
               (e is FirebaseException && e.code == 'unavailable');
@@ -991,7 +981,10 @@ class _AuthPageState extends State<AuthPage> {
                   Align(
                     alignment: Alignment.centerRight,
                     child: TextButton(
-                      onPressed: _forgotPassword,
+                      // Only disabled while a login is in progress. NOT
+                      // disabled by the login lockout: locked-out customers
+                      // are the ones who most need a reset.
+                      onPressed: _isLoading ? null : _openForgotPassword,
                       style: TextButton.styleFrom(
                         padding: EdgeInsets.zero,
                         minimumSize: const Size(50, 30),
