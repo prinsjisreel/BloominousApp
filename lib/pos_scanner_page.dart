@@ -2,10 +2,12 @@ import 'package:flutter/material.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'inventory_data.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_storage/firebase_storage.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:barcode_widget/barcode_widget.dart' as qr;
 import 'sound_helper.dart';
 import 'app_sidebar.dart';
+import 'proof_of_order_camera_page.dart';
 
 class POSScannerPage extends StatefulWidget {
   final String role;
@@ -21,6 +23,11 @@ class _POSScannerPageState extends State<POSScannerPage> {
   String? _selectedCustomerId;
   String? _selectedCustomerEmail;
   String? _lastScannedCode;
+
+  // NEW: true from "Confirm Payment" until the sale is saved or cancelled.
+  // Blocks barcode scans and double-taps from sneaking into a sale that is
+  // already being finalized.
+  bool _isProcessing = false;
 
   final MobileScannerController cameraController = MobileScannerController(
     formats: [BarcodeFormat.all],
@@ -80,7 +87,8 @@ class _POSScannerPageState extends State<POSScannerPage> {
   }
 
   void _onBarcodeDetected(BarcodeCapture capture) {
-    if (!_isScanning) return;
+    // NEW: ignore scans while a sale is being finalized.
+    if (!_isScanning || _isProcessing) return;
 
     final List<Barcode> barcodes = capture.barcodes;
     for (final barcode in barcodes) {
@@ -249,17 +257,6 @@ class _POSScannerPageState extends State<POSScannerPage> {
               children: [
                 Expanded(
                   flex: 2,
-                  // FIXED: LayoutBuilder measures the REAL pixel height/
-                  // width this camera section actually has, at the exact
-                  // moment it's laid out on this specific device — not a
-                  // guess based on MediaQuery's full-screen width like the
-                  // previous attempt. The viewfinder box is now sized as a
-                  // fraction of the SHORTER of the two available
-                  // dimensions (constraints.maxHeight vs maxWidth), which
-                  // is what actually determines whether it fits without
-                  // overflowing — a tall-but-narrow phone and a
-                  // short-but-wide tablet need different math, and this
-                  // reads the true numbers for whichever one it's on.
                   child: LayoutBuilder(
                     builder: (context, constraints) {
                       final shorterSide = constraints.maxHeight < constraints.maxWidth
@@ -271,12 +268,6 @@ class _POSScannerPageState extends State<POSScannerPage> {
                         children: [
                           MobileScanner(
                               controller: cameraController, onDetect: _onBarcodeDetected),
-                          // FIXED: Positioned.fill forces this tint overlay
-                          // to match the Stack's actual size (same as
-                          // MobileScanner above it) instead of trying to
-                          // size itself from its own empty content, which
-                          // is what was silently distorting the available
-                          // space and causing the bottom overflow.
                           const Positioned.fill(
                             child: DecoratedBox(
                               decoration: BoxDecoration(
@@ -512,7 +503,7 @@ class _POSScannerPageState extends State<POSScannerPage> {
                                 children: [
                                   Expanded(
                                     child: ElevatedButton(
-                                      onPressed: _checkoutItems.isEmpty
+                                      onPressed: (_checkoutItems.isEmpty || _isProcessing)
                                           ? null
                                           : _showPaymentDialog,
                                       style: ElevatedButton.styleFrom(
@@ -613,8 +604,13 @@ class _POSScannerPageState extends State<POSScannerPage> {
                   Row(
                     children: [
                       Expanded(
-                        child: ElevatedButton(
+                        child: ElevatedButton.icon(
                           onPressed: _processTransaction,
+                          icon: const Icon(Icons.photo_camera_rounded),
+                          label: const Text('CONFIRM & TAKE PROOF PHOTO',
+                              style: TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  letterSpacing: 1)),
                           style: ElevatedButton.styleFrom(
                             backgroundColor: Colors.green,
                             foregroundColor: Colors.white,
@@ -622,10 +618,6 @@ class _POSScannerPageState extends State<POSScannerPage> {
                             shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(16)),
                           ),
-                          child: const Text('CONFIRM PAYMENT',
-                              style: TextStyle(
-                                  fontWeight: FontWeight.bold,
-                                  letterSpacing: 1)),
                         ),
                       ),
                     ],
@@ -670,8 +662,88 @@ class _POSScannerPageState extends State<POSScannerPage> {
     );
   }
 
+  /// NEW: opens the camera-only proof screen. The barcode scanner is paused
+  /// first, because Android/iOS only let ONE part of the app use the
+  /// camera at a time. Returns null if the cashier closed the camera.
+  Future<ProofOfOrderPhoto?> _captureProofOfOrder(String orderId, String staffLabel) async {
+    try {
+      await cameraController.stop();
+    } catch (e) {
+      debugPrint('Could not pause barcode scanner: $e');
+    }
+
+    ProofOfOrderPhoto? proof;
+    try {
+      if (!mounted) return null;
+      proof = await Navigator.push<ProofOfOrderPhoto>(
+        context,
+        MaterialPageRoute(
+          fullscreenDialog: true,
+          builder: (_) => ProofOfOrderCameraPage(orderId: orderId, staffLabel: staffLabel),
+        ),
+      );
+    } finally {
+      // Always hand the camera back to the barcode scanner, even on error.
+      try {
+        if (mounted) await cameraController.start();
+      } catch (e) {
+        debugPrint('Could not restart barcode scanner: $e');
+      }
+    }
+    return proof;
+  }
+
+  /// NEW: uploads the stamped photo to Firebase Storage and returns
+  /// {url, path} for the order document.
+  Future<Map<String, String>> _uploadProofPhoto({
+    required ProofOfOrderPhoto proof,
+    required String orderId,
+    required String branchId,
+    required String staffLabel,
+  }) async {
+    final storagePath = 'pos_proof/$branchId/$orderId.jpg';
+    final ref = FirebaseStorage.instance.ref().child(storagePath);
+
+    // putData (not putFile) works on Android, iOS AND Flutter web.
+    await ref.putData(
+      proof.bytes,
+      SettableMetadata(
+        contentType: 'image/jpeg',
+        customMetadata: {
+          'orderId': orderId,
+          'branchId': branchId,
+          'capturedBy': staffLabel,
+          'capturedAtDevice': proof.capturedAt.toIso8601String(),
+        },
+      ),
+    );
+
+    final url = await ref.getDownloadURL();
+    return {'url': url, 'path': storagePath};
+  }
+
   Future<void> _processTransaction() async {
-    Navigator.pop(context);
+    if (_isProcessing) return;
+
+    Navigator.pop(context); // close the payment bottom sheet
+    setState(() => _isProcessing = true);
+
+    final orderId = "POS-${DateTime.now().millisecondsSinceEpoch}";
+    final employee = FirebaseAuth.instance.currentUser;
+    final staffLabel = employee?.email ?? 'Staff';
+    final branchId = InventoryData.selectedBranchId ?? 'main_branch';
+
+    // STEP 1: proof photo FIRST. Nothing is deducted or saved until it exists.
+    final proof = await _captureProofOfOrder(orderId, staffLabel);
+    if (!mounted) return;
+
+    if (proof == null) {
+      setState(() => _isProcessing = false);
+      _showStatusMessage(
+          'Sale not completed — a proof-of-order photo is required.',
+          isError: true);
+      return;
+    }
 
     showDialog(
       context: context,
@@ -681,13 +753,20 @@ class _POSScannerPageState extends State<POSScannerPage> {
     );
 
     try {
-      final orderId = "POS-${DateTime.now().millisecondsSinceEpoch}";
-      final employee = FirebaseAuth.instance.currentUser;
+      // STEP 2: upload the photo. If this fails, stock is still untouched.
+      final uploaded = await _uploadProofPhoto(
+        proof: proof,
+        orderId: orderId,
+        branchId: branchId,
+        staffLabel: staffLabel,
+      );
 
+      // STEP 3: deduct stock.
       for (var item in _checkoutItems) {
         await InventoryData.decrementStock(item['id'], item['quantity']);
       }
 
+      // STEP 4: write the order, now carrying the proof fields.
       await FirebaseFirestore.instance.collection('orders').doc(orderId).set({
         'orderId': orderId,
         'items': _checkoutItems,
@@ -697,11 +776,18 @@ class _POSScannerPageState extends State<POSScannerPage> {
         'createdAt': FieldValue.serverTimestamp(),
         'status': 'completed',
         'type': 'pos',
-        'processedBy': employee?.email ?? 'System',
+        'processedBy': staffLabel,
         'customerId': _selectedCustomerId,
         'branchId': InventoryData.selectedBranchId,
+        // --- Proof of order (shared contract with BloominousWeb) ---
+        'proofPhotoUrl': uploaded['url'],
+        'proofPhotoPath': uploaded['path'],
+        'proofCapturedAt': Timestamp.fromDate(proof.capturedAt), // phone clock
+        'proofUploadedAt': FieldValue.serverTimestamp(), // Google's clock
+        'proofCapturedBy': staffLabel,
       });
 
+      // STEP 5: loyalty points (unchanged logic).
       if (_selectedCustomerId != null) {
         int pointsGained = (_totalPrice / 100).floor();
 
@@ -737,14 +823,16 @@ class _POSScannerPageState extends State<POSScannerPage> {
       }
 
       if (mounted) {
-        Navigator.pop(context);
+        Navigator.pop(context); // close loading spinner
         _showSuccessDialog();
       }
     } catch (e) {
       if (mounted) {
-        Navigator.pop(context);
+        Navigator.pop(context); // close loading spinner
         _showStatusMessage('Transaction Failed: $e', isError: true);
       }
+    } finally {
+      if (mounted) setState(() => _isProcessing = false);
     }
   }
 
@@ -761,6 +849,9 @@ class _POSScannerPageState extends State<POSScannerPage> {
             const SizedBox(height: 20),
             const Text('Payment Successful',
                 style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            const Text('Proof of order photo saved.',
+                style: TextStyle(fontSize: 13, color: Colors.grey)),
             const SizedBox(height: 24),
             ElevatedButton(
               onPressed: () {
