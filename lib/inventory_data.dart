@@ -774,8 +774,17 @@ class InventoryData {
     });
   }
 
+  // --- CHANGED: Added a safety check for empty customer IDs. ---
+  // When the POS terminal sells to a walk-in customer (no QR scanned),
+  // the app would try to write to an empty document ID, which Firestore
+  // rejects with a permission-denied error. This check safely skips the
+  // database write and allows the transaction to complete successfully.
   static Future<void> updateCustomerLoyalty(
       {required String customerId, required int points}) async {
+    if (customerId.trim().isEmpty) {
+      return; // Silent exit if no customer is linked
+    }
+
     final ref = _db.collection('customers').doc(customerId);
     await _db.runTransaction((transaction) async {
       final snap = await transaction.get(ref);

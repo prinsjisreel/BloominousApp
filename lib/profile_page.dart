@@ -9,6 +9,7 @@ import 'package:intl/intl.dart';
 import 'inventory_data.dart';
 import 'app_sidebar.dart';
 import 'notification_bell.dart';
+import 'image_upload_service.dart';
 
 class ProfilePage extends StatefulWidget {
   final String role;
@@ -30,15 +31,29 @@ class _ProfilePageState extends State<ProfilePage> {
 
     setState(() => _isUploadingPhoto = true);
     try {
-      final ref = FirebaseStorage.instance.ref().child('profile_photos').child('$uid.jpg');
-      await ref.putFile(File(picked.path));
-      final url = await ref.getDownloadURL();
+      // Read the bytes ONCE. Works on Android, iOS, and web — the
+      // ImageUploadService will try Firebase Storage first and fall
+      // back to Cloudinary without us caring which one wins.
+      final bytes = await picked.readAsBytes();
 
-      await InventoryData.updateOwnProfile(uid, {'photoUrl': url});
+      final result = await ImageUploadService.uploadBytes(
+        bytes: bytes,
+        storagePath: 'profile_photos/$uid.jpg',
+        cloudinaryFolder: 'bloom/profile_photos',
+      );
+
+      await InventoryData.updateOwnProfile(uid, {'photoUrl': result.url});
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Profile photo updated!'), backgroundColor: Colors.green),
+          SnackBar(
+            content: Text(
+              result.isCloudinary
+                  ? 'Profile photo updated (via Cloudinary backup).'
+                  : 'Profile photo updated!',
+            ),
+            backgroundColor: Colors.green,
+          ),
         );
       }
     } catch (e) {
@@ -377,11 +392,6 @@ class _ProfilePageState extends State<ProfilePage> {
                                 subtitle: 'Update your login security',
                                 onTap: _showChangePasswordDialog,
                               ),
-                            // FIXED: was a placeholder snackbar ("coming
-                            // soon") — now opens the exact same live
-                            // notification panel as the top-bar bell icon,
-                            // via the shared openNotificationsSheet()
-                            // function.
                             _buildActionCard(
                               cardColor: cardColor,
                               borderColor: borderColor,

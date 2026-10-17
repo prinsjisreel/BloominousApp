@@ -6,6 +6,7 @@ import 'spoilage_tracker_page.dart';
 import 'kiri_service.dart';
 import 'app_sidebar.dart';
 import 'admin_audit_service.dart';
+import 'image_upload_service.dart'; // <-- ADDED IMPORT
 
 class InventoryPage extends StatefulWidget {
   final String role;
@@ -38,10 +39,6 @@ class _InventoryPageState extends State<InventoryPage> {
     TextEditingController(text: isEditing ? item['stock'].toString() : '');
     String? selectedCategory = isEditing ? item['category'] : 'Flowers';
 
-    // Captured BEFORE any edits, so a save can log "changed from X to Y"
-    // instead of just the new value — same reasoning as
-    // manage_employees_page.dart's role-change logging: you can't say
-    // what changed after you've already overwritten the old value.
     final double? originalPrice = isEditing ? (item['price'] as num?)?.toDouble() : null;
     final int? originalStock = isEditing ? (item['stock'] as num?)?.toInt() : null;
 
@@ -60,6 +57,9 @@ class _InventoryPageState extends State<InventoryPage> {
     final imageController =
     TextEditingController(text: isEditing ? (item['image'] ?? '') : '');
     String generationStatus = '';
+
+    // NEW: Tracks the upload state for the product image
+    bool isUploadingImage = false;
 
     final isAdmin = widget.role == 'admin' || widget.role == 'super-admin';
 
@@ -323,13 +323,63 @@ class _InventoryPageState extends State<InventoryPage> {
                       },
                     ),
                   ),
-                TextField(
-                    enabled: isAdmin,
-                    controller: imageController,
-                    decoration: const InputDecoration(
-                        labelText: 'Image URL',
-                        hintText: 'https://...',
-                        helperText: 'URL for the 2D preview image')),
+
+                // --- NEW: Image URL + Upload Button ---
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Expanded(
+                      child: TextField(
+                          enabled: isAdmin && !isUploadingImage,
+                          controller: imageController,
+                          decoration: const InputDecoration(
+                              labelText: 'Image URL',
+                              hintText: 'https://...',
+                              helperText: 'URL for the 2D preview image')),
+                    ),
+                    if (isAdmin)
+                      Padding(
+                        padding: const EdgeInsets.only(left: 8.0, bottom: 4.0),
+                        child: ElevatedButton(
+                          onPressed: isUploadingImage ? null : () async {
+                            final picker = ImagePicker();
+                            final picked = await picker.pickImage(source: ImageSource.gallery, maxWidth: 1024, imageQuality: 80);
+                            if (picked == null) return;
+
+                            setDialogState(() => isUploadingImage = true);
+                            try {
+                              final bytes = await picked.readAsBytes();
+                              final result = await ImageUploadService.uploadBytes(
+                                bytes: bytes,
+                                storagePath: 'product_images/${DateTime.now().millisecondsSinceEpoch}.jpg',
+                                cloudinaryFolder: 'bloom/product_images',
+                              );
+                              setDialogState(() {
+                                imageController.text = result.url;
+                              });
+                            } catch (e) {
+                              if (context.mounted) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(content: Text('Upload failed: $e'), backgroundColor: Colors.red),
+                                );
+                              }
+                            } finally {
+                              setDialogState(() => isUploadingImage = false);
+                            }
+                          },
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFFF59E0B),
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 16),
+                          ),
+                          child: isUploadingImage
+                              ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                              : const Icon(Icons.upload_file, size: 20),
+                        ),
+                      ),
+                  ],
+                ),
+
                 if (!isAdmin && isEditing) ...[
                   const SizedBox(height: 24),
                   const Divider(),
@@ -356,7 +406,7 @@ class _InventoryPageState extends State<InventoryPage> {
                 child: Text(isAdmin ? 'CANCEL' : 'CLOSE')),
             if (isAdmin)
               ElevatedButton(
-                onPressed: () async {
+                onPressed: isUploadingImage ? null : () async {
                   final newPrice = double.tryParse(priceController.text) ?? 0.0;
                   final newStock = int.tryParse(stockController.text) ?? 0;
                   final data = {
@@ -372,12 +422,6 @@ class _InventoryPageState extends State<InventoryPage> {
                   if (isEditing) {
                     await InventoryData.updateProduct(item['id'], data);
 
-                    // Logs price/stock edits specifically — this is the
-                    // classic insider-fraud vector in retail (mark a
-                    // price down, buy it yourself, mark it back up), so
-                    // the details always state old → new even when
-                    // unchanged, rather than only logging when something
-                    // moved.
                     await AdminAuditService.logAction(
                       action: 'inventory_item_updated',
                       targetUid: item['id'],
@@ -391,10 +435,6 @@ class _InventoryPageState extends State<InventoryPage> {
 
                     await AdminAuditService.logAction(
                       action: 'inventory_item_created',
-                      // addProduct's return type isn't visible from this
-                      // file, so the product's own code/name is used as
-                      // the target identifier rather than assuming an ID
-                      // comes back.
                       targetUid: codeController.text.isNotEmpty
                           ? codeController.text
                           : nameController.text,
@@ -403,7 +443,7 @@ class _InventoryPageState extends State<InventoryPage> {
                       'Created "${nameController.text}" at ₱${newPrice.toStringAsFixed(2)}, initial stock $newStock.',
                     );
                   }
-                  if (mounted) Navigator.pop(context);
+                  if (context.mounted) Navigator.pop(context);
                 },
                 child: const Text('SAVE'),
               ),
@@ -438,7 +478,7 @@ class _InventoryPageState extends State<InventoryPage> {
                     'Added $amount unit(s) to "${item['name']}" ($currentStock → $newStock).',
                   );
 
-                  if (mounted) Navigator.pop(context);
+                  if (context.mounted) Navigator.pop(context);
 
                   ScaffoldMessenger.of(context).showSnackBar(
                     SnackBar(
@@ -477,7 +517,7 @@ class _InventoryPageState extends State<InventoryPage> {
                 details: 'Archived "${item['name']}".',
               );
 
-              if (mounted) Navigator.pop(context);
+              if (context.mounted) Navigator.pop(context);
             },
             child: const Text('ARCHIVE', style: TextStyle(color: Colors.red)),
           ),

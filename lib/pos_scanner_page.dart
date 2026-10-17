@@ -2,12 +2,12 @@ import 'package:flutter/material.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'inventory_data.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:firebase_storage/firebase_storage.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:barcode_widget/barcode_widget.dart' as qr;
 import 'sound_helper.dart';
 import 'app_sidebar.dart';
 import 'proof_of_order_camera_page.dart';
+import 'image_upload_service.dart'; // <-- IMPORTED THIS
 
 class POSScannerPage extends StatefulWidget {
   final String role;
@@ -24,9 +24,6 @@ class _POSScannerPageState extends State<POSScannerPage> {
   String? _selectedCustomerEmail;
   String? _lastScannedCode;
 
-  // NEW: true from "Confirm Payment" until the sale is saved or cancelled.
-  // Blocks barcode scans and double-taps from sneaking into a sale that is
-  // already being finalized.
   bool _isProcessing = false;
 
   final MobileScannerController cameraController = MobileScannerController(
@@ -87,7 +84,6 @@ class _POSScannerPageState extends State<POSScannerPage> {
   }
 
   void _onBarcodeDetected(BarcodeCapture capture) {
-    // NEW: ignore scans while a sale is being finalized.
     if (!_isScanning || _isProcessing) return;
 
     final List<Barcode> barcodes = capture.barcodes;
@@ -662,9 +658,6 @@ class _POSScannerPageState extends State<POSScannerPage> {
     );
   }
 
-  /// NEW: opens the camera-only proof screen. The barcode scanner is paused
-  /// first, because Android/iOS only let ONE part of the app use the
-  /// camera at a time. Returns null if the cashier closed the camera.
   Future<ProofOfOrderPhoto?> _captureProofOfOrder(String orderId, String staffLabel) async {
     try {
       await cameraController.stop();
@@ -683,7 +676,6 @@ class _POSScannerPageState extends State<POSScannerPage> {
         ),
       );
     } finally {
-      // Always hand the camera back to the barcode scanner, even on error.
       try {
         if (mounted) await cameraController.start();
       } catch (e) {
@@ -693,8 +685,7 @@ class _POSScannerPageState extends State<POSScannerPage> {
     return proof;
   }
 
-  /// NEW: uploads the stamped photo to Firebase Storage and returns
-  /// {url, path} for the order document.
+  // --- THIS FUNCTION WAS UPDATED TO USE CLOUDINARY FALLBACK ---
   Future<Map<String, String>> _uploadProofPhoto({
     required ProofOfOrderPhoto proof,
     required String orderId,
@@ -702,30 +693,26 @@ class _POSScannerPageState extends State<POSScannerPage> {
     required String staffLabel,
   }) async {
     final storagePath = 'pos_proof/$branchId/$orderId.jpg';
-    final ref = FirebaseStorage.instance.ref().child(storagePath);
 
-    // putData (not putFile) works on Android, iOS AND Flutter web.
-    await ref.putData(
-      proof.bytes,
-      SettableMetadata(
-        contentType: 'image/jpeg',
-        customMetadata: {
-          'orderId': orderId,
-          'branchId': branchId,
-          'capturedBy': staffLabel,
-          'capturedAtDevice': proof.capturedAt.toIso8601String(),
-        },
-      ),
+    // Call our new service. It tries Firebase Storage, then falls back to Cloudinary.
+    final result = await ImageUploadService.uploadBytes(
+      bytes: proof.bytes,
+      storagePath: storagePath,
+      cloudinaryFolder: 'bloom/pos_proof/$branchId',
     );
 
-    final url = await ref.getDownloadURL();
-    return {'url': url, 'path': storagePath};
+    final map = <String, String>{'url': result.url};
+    if (result.firebasePath != null) {
+      map['path'] = result.firebasePath!;
+    }
+    map['provider'] = result.isCloudinary ? 'cloudinary' : 'firebase_storage';
+    return map;
   }
 
   Future<void> _processTransaction() async {
     if (_isProcessing) return;
 
-    Navigator.pop(context); // close the payment bottom sheet
+    Navigator.pop(context);
     setState(() => _isProcessing = true);
 
     final orderId = "POS-${DateTime.now().millisecondsSinceEpoch}";
@@ -733,7 +720,6 @@ class _POSScannerPageState extends State<POSScannerPage> {
     final staffLabel = employee?.email ?? 'Staff';
     final branchId = InventoryData.selectedBranchId ?? 'main_branch';
 
-    // STEP 1: proof photo FIRST. Nothing is deducted or saved until it exists.
     final proof = await _captureProofOfOrder(orderId, staffLabel);
     if (!mounted) return;
 
@@ -753,7 +739,7 @@ class _POSScannerPageState extends State<POSScannerPage> {
     );
 
     try {
-      // STEP 2: upload the photo. If this fails, stock is still untouched.
+      // STEP 2: upload the photo (Firebase Storage first, Cloudinary fallback).
       final uploaded = await _uploadProofPhoto(
         proof: proof,
         orderId: orderId,
@@ -761,12 +747,10 @@ class _POSScannerPageState extends State<POSScannerPage> {
         staffLabel: staffLabel,
       );
 
-      // STEP 3: deduct stock.
       for (var item in _checkoutItems) {
         await InventoryData.decrementStock(item['id'], item['quantity']);
       }
 
-      // STEP 4: write the order, now carrying the proof fields.
       await FirebaseFirestore.instance.collection('orders').doc(orderId).set({
         'orderId': orderId,
         'items': _checkoutItems,
@@ -779,15 +763,14 @@ class _POSScannerPageState extends State<POSScannerPage> {
         'processedBy': staffLabel,
         'customerId': _selectedCustomerId,
         'branchId': InventoryData.selectedBranchId,
-        // --- Proof of order (shared contract with BloominousWeb) ---
         'proofPhotoUrl': uploaded['url'],
         'proofPhotoPath': uploaded['path'],
-        'proofCapturedAt': Timestamp.fromDate(proof.capturedAt), // phone clock
-        'proofUploadedAt': FieldValue.serverTimestamp(), // Google's clock
+        'proofProvider': uploaded['provider'],
+        'proofCapturedAt': Timestamp.fromDate(proof.capturedAt),
+        'proofUploadedAt': FieldValue.serverTimestamp(),
         'proofCapturedBy': staffLabel,
       });
 
-      // STEP 5: loyalty points (unchanged logic).
       if (_selectedCustomerId != null) {
         int pointsGained = (_totalPrice / 100).floor();
 
@@ -823,12 +806,12 @@ class _POSScannerPageState extends State<POSScannerPage> {
       }
 
       if (mounted) {
-        Navigator.pop(context); // close loading spinner
+        Navigator.pop(context);
         _showSuccessDialog();
       }
     } catch (e) {
       if (mounted) {
-        Navigator.pop(context); // close loading spinner
+        Navigator.pop(context);
         _showStatusMessage('Transaction Failed: $e', isError: true);
       }
     } finally {

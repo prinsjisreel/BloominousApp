@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data'; // <-- ADDED for Uint8List
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -8,6 +9,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:intl/intl.dart';
 import 'inventory_data.dart';
+import 'image_upload_service.dart'; // <-- ADDED IMPORT
 
 class DeliveryDashboard extends StatefulWidget {
   const DeliveryDashboard({super.key});
@@ -92,7 +94,7 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
     if (activeOrders.length <= 1) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
           content:
-              Text('At least 2 active stops are required to optimize route.')));
+          Text('At least 2 active stops are required to optimize route.')));
       return;
     }
 
@@ -116,9 +118,9 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
         for (int i = 0; i < unvisited.length; i++) {
           final order = unvisited[i];
           final lat =
-              (order['deliveryLat'] ?? order['lat'] ?? 14.7410) as double;
+          (order['deliveryLat'] ?? order['lat'] ?? 14.7410) as double;
           final lng =
-              (order['deliveryLng'] ?? order['lng'] ?? 120.9634) as double;
+          (order['deliveryLng'] ?? order['lng'] ?? 120.9634) as double;
 
           double d = _calculateHaversine(currLat, currLng, lat, lng);
           if (d < minDistance) {
@@ -131,9 +133,9 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
         sortedRoute.add(nextStop);
 
         currLat =
-            (nextStop['deliveryLat'] ?? nextStop['lat'] ?? 14.7410) as double;
+        (nextStop['deliveryLat'] ?? nextStop['lat'] ?? 14.7410) as double;
         currLng =
-            (nextStop['deliveryLng'] ?? nextStop['lng'] ?? 120.9634) as double;
+        (nextStop['deliveryLng'] ?? nextStop['lng'] ?? 120.9634) as double;
       }
 
       await InventoryData.updateDeliverySequence(sortedRoute);
@@ -167,7 +169,7 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
   void _launchNavigation(String address) async {
     final query = Uri.encodeComponent(address);
     final url =
-        Uri.parse('https://www.google.com/maps/search/?api=1&query=$query');
+    Uri.parse('https://www.google.com/maps/search/?api=1&query=$query');
     if (await canLaunchUrl(url)) {
       await launchUrl(url, mode: LaunchMode.externalApplication);
     } else {
@@ -197,7 +199,7 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
 
     return Scaffold(
       backgroundColor:
-          isDark ? const Color(0xFF121212) : const Color(0xFFF9FAFB),
+      isDark ? const Color(0xFF121212) : const Color(0xFFF9FAFB),
       appBar: AppBar(
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -240,7 +242,7 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
           labelColor: Colors.amber,
           unselectedLabelColor: Colors.white60,
           labelStyle:
-              const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+          const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
           tabs: const [
             Tab(icon: Icon(Icons.alt_route), text: 'ACTIVE MULTI-STOP ROUTE'),
             Tab(icon: Icon(Icons.task_alt), text: 'DELIVERED & POD HISTORY'),
@@ -258,10 +260,10 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
           final allOrders = snapshot.data ?? [];
           final activeOrders = allOrders
               .where((o) =>
-                  (o['status'] ?? '').toString().toLowerCase() != 'delivered' &&
-                  (o['delivery_status'] ?? '').toString().toLowerCase() !=
-                      'delivered' &&
-                  (o['status'] ?? '').toString().toLowerCase() != 'cancelled')
+          (o['status'] ?? '').toString().toLowerCase() != 'delivered' &&
+              (o['delivery_status'] ?? '').toString().toLowerCase() !=
+                  'delivered' &&
+              (o['status'] ?? '').toString().toLowerCase() != 'cancelled')
               .toList();
 
           // Sort active orders by stopSequence if present
@@ -273,9 +275,9 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
 
           final deliveredOrders = allOrders
               .where((o) =>
-                  (o['status'] ?? '').toString().toLowerCase() == 'delivered' ||
-                  (o['delivery_status'] ?? '').toString().toLowerCase() ==
-                      'delivered')
+          (o['status'] ?? '').toString().toLowerCase() == 'delivered' ||
+              (o['delivery_status'] ?? '').toString().toLowerCase() ==
+                  'delivered')
               .toList();
 
           return TabBarView(
@@ -317,7 +319,7 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
 
     final outForDeliveryCount = activeOrders
         .where((o) =>
-            (o['status'] ?? '').toString().toLowerCase() == 'out_for_delivery')
+    (o['status'] ?? '').toString().toLowerCase() == 'out_for_delivery')
         .length;
 
     return SingleChildScrollView(
@@ -367,13 +369,13 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
                           : () => _optimizeRoute(activeOrders),
                       icon: _isOptimizing
                           ? const SizedBox(
-                              width: 14,
-                              height: 14,
-                              child: CircularProgressIndicator(
-                                  strokeWidth: 2, color: Colors.black))
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(
+                              strokeWidth: 2, color: Colors.black))
                           : const Icon(Icons.auto_awesome, size: 16),
                       label:
-                          Text(_isOptimizing ? 'SORTING...' : 'OPTIMIZE ROUTE'),
+                      Text(_isOptimizing ? 'SORTING...' : 'OPTIMIZE ROUTE'),
                       style: ElevatedButton.styleFrom(
                         backgroundColor: Colors.amber,
                         foregroundColor: Colors.black,
@@ -469,7 +471,7 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
         order['recipientName'] ?? order['customerName'] ?? 'Customer';
     final phone = order['recipientPhone'] ?? order['phone'] ?? 'N/A';
     final total =
-        (order['totalAmount'] ?? order['totalPrice'] ?? 0.0).toDouble();
+    (order['totalAmount'] ?? order['totalPrice'] ?? 0.0).toDouble();
     final items = (order['items'] ?? order['flowers'] ?? []) as List<dynamic>;
 
     Color statusColor;
@@ -576,7 +578,7 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
                 if (phone != 'N/A')
                   IconButton(
                     icon:
-                        const Icon(Icons.phone_forwarded, color: Colors.green),
+                    const Icon(Icons.phone_forwarded, color: Colors.green),
                     tooltip: 'Call Recipient',
                     onPressed: () => _callCustomer(phone),
                   ),
@@ -640,7 +642,7 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
                 'Items (${items.length}): ' +
                     items
                         .map((i) =>
-                            '${i['name'] ?? 'Item'} x${i['qty'] ?? i['quantity'] ?? 1}')
+                    '${i['name'] ?? 'Item'} x${i['qty'] ?? i['quantity'] ?? 1}')
                         .join(', '),
                 style: TextStyle(fontSize: 12, color: Colors.grey[600]),
                 maxLines: 2,
@@ -724,18 +726,18 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
         final courier = order['courierName'] ?? order['driverName'] ?? 'Driver';
         final address = order['deliveryAddress'] ?? 'No address';
         final photo =
-            (order['proofOfDeliveryPhoto'] ?? order['podPhotoUrl']) as String?;
+        (order['proofOfDeliveryPhoto'] ?? order['podPhotoUrl']) as String?;
         final notes = order['deliveryNotes'] as String?;
         final rawTime = order['podTimestamp'] ?? order['deliveredAt'];
         final timestamp = rawTime != null
             ? DateFormat('MMM dd, yyyy - h:mm a')
-                .format((rawTime as dynamic).toDate())
+            .format((rawTime as dynamic).toDate())
             : 'Recently Delivered';
 
         return Card(
           margin: const EdgeInsets.only(bottom: 16),
           shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
           child: Padding(
             padding: const EdgeInsets.all(16),
             child: Column(
@@ -757,7 +759,7 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
                     ),
                     Text(timestamp,
                         style:
-                            const TextStyle(fontSize: 11, color: Colors.grey)),
+                        const TextStyle(fontSize: 11, color: Colors.grey)),
                   ],
                 ),
                 const SizedBox(height: 8),
@@ -871,7 +873,7 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
         return Image.network(strData,
             fit: BoxFit.cover,
             errorBuilder: (c, e, s) =>
-                const Icon(Icons.broken_image, size: 40));
+            const Icon(Icons.broken_image, size: 40));
       } else {
         final bytes = base64Decode(strData);
         return Image.memory(bytes, fit: BoxFit.cover);
@@ -887,18 +889,18 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
 
   void _showFullPhotoDialog(BuildContext context, Map<String, dynamic> order) {
     final photo =
-        (order['proofOfDeliveryPhoto'] ?? order['podPhotoUrl']) as String?;
+    (order['proofOfDeliveryPhoto'] ?? order['podPhotoUrl']) as String?;
     final notes = order['deliveryNotes'] as String?;
     final recipient = (order['podRecipient'] ??
-            order['recipientName'] ??
-            order['customerName']) as String? ??
+        order['recipientName'] ??
+        order['customerName']) as String? ??
         'N/A';
     final courier =
         (order['courierName'] ?? order['driverName']) as String? ?? 'N/A';
     final rawTime = order['podTimestamp'] ?? order['deliveredAt'];
     final timestamp = rawTime != null
         ? DateFormat('MMMM dd, yyyy - h:mm:ss a')
-            .format((rawTime as dynamic).toDate())
+        .format((rawTime as dynamic).toDate())
         : 'N/A';
 
     showDialog(
@@ -916,7 +918,7 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
                 children: [
                   const Text('Proof of Delivery (POD)',
                       style:
-                          TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                      TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
                   IconButton(
                       icon: const Icon(Icons.close),
                       onPressed: () => Navigator.pop(context)),
@@ -970,7 +972,7 @@ class _PODCaptureSheet extends StatefulWidget {
 }
 
 class _PODCaptureSheetState extends State<_PODCaptureSheet> {
-  String? _base64Photo;
+  Uint8List? _imageBytes; // CHANGED: Store bytes instead of a base64 string
   bool _isSubmitting = false;
   final _notesController = TextEditingController();
   late TextEditingController _recipientController;
@@ -1008,9 +1010,8 @@ class _PODCaptureSheetState extends State<_PODCaptureSheet> {
       );
       if (image != null) {
         final bytes = await image.readAsBytes();
-        final base64Str = 'data:image/jpeg;base64,${base64Encode(bytes)}';
         setState(() {
-          _base64Photo = base64Str;
+          _imageBytes = bytes;
         });
       }
     } catch (e) {
@@ -1022,7 +1023,7 @@ class _PODCaptureSheetState extends State<_PODCaptureSheet> {
   }
 
   Future<void> _submitDelivery() async {
-    if (_base64Photo == null) {
+    if (_imageBytes == null) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
         content: Text(
             '📸 Please capture or select a Proof of Delivery photo before completing!'),
@@ -1034,11 +1035,19 @@ class _PODCaptureSheetState extends State<_PODCaptureSheet> {
     setState(() => _isSubmitting = true);
 
     try {
+      // CHANGED: Upload to Firebase Storage / Cloudinary fallback
+      final result = await ImageUploadService.uploadBytes(
+        bytes: _imageBytes!,
+        storagePath: 'pos_proof/${widget.order['branchId'] ?? 'main'}/${widget.order['id']}.jpg',
+        cloudinaryFolder: 'bloom/delivery_proof',
+      );
+
+      // Pass the resulting URL to the database
       await InventoryData.updateDeliveryStatus(
         widget.order['id'],
         'delivered',
         deliveryNotes: _notesController.text.trim(),
-        proofOfDeliveryPhoto: _base64Photo,
+        proofOfDeliveryPhoto: result.url, // CHANGED: Pass the URL
         deliveredLat: widget.currentPos?.latitude,
         deliveredLng: widget.currentPos?.longitude,
         driverName: _courierController.text.trim().isNotEmpty
@@ -1131,91 +1140,91 @@ class _PODCaptureSheetState extends State<_PODCaptureSheet> {
                 color: isDark ? Colors.black38 : Colors.grey[100],
                 borderRadius: BorderRadius.circular(16),
                 border: Border.all(
-                  color: _base64Photo != null
+                  color: _imageBytes != null
                       ? Colors.green
                       : Colors.grey.shade400,
-                  width: _base64Photo != null ? 2 : 1,
+                  width: _imageBytes != null ? 2 : 1,
                 ),
               ),
-              child: _base64Photo != null
+              child: _imageBytes != null
                   ? ClipRRect(
-                      borderRadius: BorderRadius.circular(14),
-                      child: Stack(
-                        fit: StackFit.expand,
-                        children: [
-                          Image.memory(
-                            base64Decode(_base64Photo!.split(',').last),
-                            fit: BoxFit.cover,
-                          ),
-                          Positioned(
-                            top: 8,
-                            right: 8,
-                            child: CircleAvatar(
-                              backgroundColor: Colors.black54,
-                              child: IconButton(
-                                icon: const Icon(Icons.refresh,
-                                    color: Colors.white, size: 20),
-                                onPressed: () =>
-                                    setState(() => _base64Photo = null),
-                              ),
-                            ),
-                          ),
-                          Positioned(
-                            bottom: 8,
-                            left: 8,
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(
-                                  horizontal: 10, vertical: 4),
-                              decoration: BoxDecoration(
-                                  color: Colors.green,
-                                  borderRadius: BorderRadius.circular(12)),
-                              child: const Row(
-                                children: [
-                                  Icon(Icons.check,
-                                      color: Colors.white, size: 14),
-                                  SizedBox(width: 4),
-                                  Text('Photo Attached',
-                                      style: TextStyle(
-                                          color: Colors.white,
-                                          fontWeight: FontWeight.bold,
-                                          fontSize: 11)),
-                                ],
-                              ),
-                            ),
-                          ),
-                        ],
+                borderRadius: BorderRadius.circular(14),
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    Image.memory(
+                      _imageBytes!,
+                      fit: BoxFit.cover,
+                    ),
+                    Positioned(
+                      top: 8,
+                      right: 8,
+                      child: CircleAvatar(
+                        backgroundColor: Colors.black54,
+                        child: IconButton(
+                          icon: const Icon(Icons.refresh,
+                              color: Colors.white, size: 20),
+                          onPressed: () =>
+                              setState(() => _imageBytes = null),
+                        ),
                       ),
-                    )
-                  : Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(Icons.add_a_photo_outlined,
-                            size: 48, color: Colors.grey[400]),
-                        const SizedBox(height: 12),
-                        const Text('Capture photo of delivered bouquet',
-                            style: TextStyle(color: Colors.grey, fontSize: 12)),
-                        const SizedBox(height: 16),
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
+                    ),
+                    Positioned(
+                      bottom: 8,
+                      left: 8,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 4),
+                        decoration: BoxDecoration(
+                            color: Colors.green,
+                            borderRadius: BorderRadius.circular(12)),
+                        child: const Row(
                           children: [
-                            ElevatedButton.icon(
-                              onPressed: () => _pickImage(ImageSource.camera),
-                              icon: const Icon(Icons.camera_alt, size: 16),
-                              label: const Text('CAMERA'),
-                              style: ElevatedButton.styleFrom(
-                                  backgroundColor: Colors.amber,
-                                  foregroundColor: Colors.black),
-                            ),
-                            const SizedBox(width: 12),
-                            OutlinedButton.icon(
-                              onPressed: () => _pickImage(ImageSource.gallery),
-                              icon: const Icon(Icons.photo_library, size: 16),
-                              label: const Text('GALLERY'),
-                            ),
+                            Icon(Icons.check,
+                                color: Colors.white, size: 14),
+                            SizedBox(width: 4),
+                            Text('Photo Attached',
+                                style: TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 11)),
                           ],
                         ),
-                      ],
+                      ),
                     ),
+                  ],
+                ),
+              )
+                  : Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.add_a_photo_outlined,
+                      size: 48, color: Colors.grey[400]),
+                  const SizedBox(height: 12),
+                  const Text('Capture photo of delivered bouquet',
+                      style: TextStyle(color: Colors.grey, fontSize: 12)),
+                  const SizedBox(height: 16),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      ElevatedButton.icon(
+                        onPressed: () => _pickImage(ImageSource.camera),
+                        icon: const Icon(Icons.camera_alt, size: 16),
+                        label: const Text('CAMERA'),
+                        style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.amber,
+                            foregroundColor: Colors.black),
+                      ),
+                      const SizedBox(width: 12),
+                      OutlinedButton.icon(
+                        onPressed: () => _pickImage(ImageSource.gallery),
+                        icon: const Icon(Icons.photo_library, size: 16),
+                        label: const Text('GALLERY'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
             ),
             const SizedBox(height: 16),
 
@@ -1229,9 +1238,9 @@ class _PODCaptureSheetState extends State<_PODCaptureSheet> {
               decoration: InputDecoration(
                 hintText: 'e.g. Maria Santos',
                 border:
-                    OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                 contentPadding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
               ),
             ),
             const SizedBox(height: 12),
@@ -1245,9 +1254,9 @@ class _PODCaptureSheetState extends State<_PODCaptureSheet> {
               decoration: InputDecoration(
                 hintText: 'e.g. Super Admin / Driver Name',
                 border:
-                    OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                 contentPadding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
               ),
             ),
             const SizedBox(height: 12),
@@ -1262,7 +1271,7 @@ class _PODCaptureSheetState extends State<_PODCaptureSheet> {
               decoration: InputDecoration(
                 hintText: 'e.g. Handed directly to recipient at main entrance',
                 border:
-                    OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                 contentPadding: const EdgeInsets.all(12),
               ),
               maxLines: 2,
@@ -1286,13 +1295,13 @@ class _PODCaptureSheetState extends State<_PODCaptureSheet> {
                 child: _isSubmitting
                     ? const CircularProgressIndicator(color: Colors.white)
                     : const Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Icon(Icons.check_circle_outline),
-                          SizedBox(width: 8),
-                          Text('CONFIRM & COMPLETE DELIVERY'),
-                        ],
-                      ),
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.check_circle_outline),
+                    SizedBox(width: 8),
+                    Text('CONFIRM & COMPLETE DELIVERY'),
+                  ],
+                ),
               ),
             ),
           ],
