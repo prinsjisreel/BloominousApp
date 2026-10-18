@@ -1,13 +1,18 @@
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
-import 'package:model_viewer_plus/model_viewer_plus.dart'; // New import
+import 'package:model_viewer_plus/model_viewer_plus.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 
 class ARPreviewPage extends StatefulWidget {
-  final Map<String, int> selectedFlowers;
+  // We now pass the full list of products
+  final List<Map<String, dynamic>> selectedProducts;
   final Color wrapColor;
 
-  const ARPreviewPage({super.key, required this.selectedFlowers, required this.wrapColor});
+  const ARPreviewPage({
+    super.key,
+    required this.selectedProducts,
+    required this.wrapColor,
+  });
 
   @override
   State<ARPreviewPage> createState() => _ARPreviewPageState();
@@ -44,13 +49,11 @@ class _ARPreviewPageState extends State<ARPreviewPage> {
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          // 1. Camera Background
           if (_isInitialized)
             SizedBox.expand(child: CameraPreview(_controller!))
           else
             const Center(child: CircularProgressIndicator(color: Colors.white)),
 
-          // 2. Close Button
           Positioned(
             top: 60,
             left: 24,
@@ -60,7 +63,6 @@ class _ARPreviewPageState extends State<ARPreviewPage> {
             ),
           ),
 
-          // 3. 3D Bouquet Model
           Center(
             child: Container(
               width: 350,
@@ -68,7 +70,6 @@ class _ARPreviewPageState extends State<ARPreviewPage> {
               child: Stack(
                 alignment: Alignment.bottomCenter,
                 children: [
-                  // 3D Wrapping (Semi-transparent with gradient)
                   Positioned(
                     bottom: 80,
                     child: Container(
@@ -83,22 +84,17 @@ class _ARPreviewPageState extends State<ARPreviewPage> {
                             widget.wrapColor.withOpacity(0.7),
                           ],
                         ),
-                        borderRadius: const BorderRadius.vertical(
-                          bottom: Radius.circular(120),
-                        ),
+                        borderRadius: const BorderRadius.vertical(bottom: Radius.circular(120)),
                         border: Border.all(color: Colors.white.withOpacity(0.3), width: 1),
                       ),
                     ).animate().fadeIn().scale(delay: 200.ms),
                   ),
-
-                  // 3D GLB Models
                   ..._build3DFlowers(),
                 ],
               ),
             ),
           ),
 
-          // 4. Status Indicator
           Positioned(
             bottom: 60,
             left: 0,
@@ -140,13 +136,16 @@ class _ARPreviewPageState extends State<ARPreviewPage> {
 
   List<Widget> _build3DFlowers() {
     List<Widget> flowerWidgets = [];
-    int index = 0;
+    int globalIndex = 0;
 
-    widget.selectedFlowers.forEach((name, count) {
+    widget.selectedProducts.forEach((product) {
+      final int count = product['qty'] ?? 1;
+      final String? modelUrl = product['model'];
+      final String name = product['name'] ?? 'Flower';
+
       for (int i = 0; i < count; i++) {
-        // Position them in a cluster
-        double xOffset = (index % 3 - 1) * 70.0 + (i * 10);
-        double yOffset = (index / 3).floor() * -40.0 - 220;
+        double xOffset = (globalIndex % 3 - 1) * 70.0 + (i * 10);
+        double yOffset = (globalIndex / 3).floor() * -40.0 - 220;
 
         flowerWidgets.add(
           Positioned(
@@ -155,145 +154,38 @@ class _ARPreviewPageState extends State<ARPreviewPage> {
             child: Container(
               width: 150,
               height: 300,
-              child: ModelViewer(
-                src: _getModelPath(name),
+              child: (modelUrl != null && modelUrl.isNotEmpty)
+                  ? ModelViewer(
+                // THE GUARANTEE: We pass the exact URL from Firestore
+                src: modelUrl,
                 alt: name,
                 autoRotate: true,
                 cameraControls: false,
                 backgroundColor: Colors.transparent,
                 disableZoom: true,
                 autoPlay: true,
+              )
+                  : Container(
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: Colors.white24),
+                ),
+                child: const Center(
+                  child: Text(
+                    'No 3D Model\nYet',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.white54, fontSize: 12),
+                  ),
+                ),
               ),
             ),
-          ).animate().fadeIn(delay: (index * 150).ms).scale(),
+          ).animate().fadeIn(delay: (globalIndex * 150).ms).scale(),
         );
-        index++;
+        globalIndex++;
       }
     });
+
     return flowerWidgets;
   }
-
-  String _getModelPath(String name) {
-    if (name.contains('Rose')) return 'assets/models/Rose.glb';
-    if (name.contains('Sunflower')) return 'assets/models/Sunflower.glb';
-    if (name.contains('Lily')) return 'assets/models/lily.glb';
-    return 'assets/models/rose.glb'; // Default
-  }
 }
-
-
-          
-
-         
-              
-                  
-               
-
-     
-                
-                
-                    
-                  
-
-  
-    
-
-    
-      
-        
-
-        
-            
-                
-                
-                
-        
- 
-            
-                
-             
-                      
-                    
-                  
-                
-              
-           
-          
-        
-      
-    
-  
-
-
-
-
-  
-
-
-
-
-
-
-  
-    
-
-
-
-
-      
-            
-            
-          
-
-          
-                
-                  
-                       
-                        
-                      
-                    
-                  
-
-              
-                  
-            
-          
-
-        
-          
-              
-                    
-                  
-                
-                
-                  
-                  
-                      
-                    
-                      
-
-  
-    
-      
-        
-        
-              
-                 
-              
-                
-      
-  
-
-
-          
-                  
-
-                    
-                          
-                        
-                      
-                    
-         
-          
-          
-                

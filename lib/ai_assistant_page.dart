@@ -1,3 +1,4 @@
+// lib/ai_assistant_page.dart
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
@@ -20,6 +21,9 @@ import 'product_catalog_page.dart';
 import 'inventory_data.dart';
 import 'payment_service.dart';
 import 'auth_page.dart';
+// ← UPDATED: import YOUR existing Cloudinary service.
+// Adjust the path below if your file is NOT at lib/services/cloudinary_service.dart.
+import 'cloudinary_service.dart';
 
 class AIAssistantPage extends StatefulWidget {
   const AIAssistantPage({super.key});
@@ -51,11 +55,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
   final TextEditingController _phoneController = TextEditingController();
   DateTime? _selectedEventDate;
 
-  // Separate from _selectedEventDate. This is the date the customer
-  // will actually come into the branch -- the one thing the shop has a
-  // real, finite daily capacity for. _selectedEventDate (the wedding,
-  // birthday, whatever) can be any future date; the branch has no
-  // capacity constraint tied to it at all.
   DateTime? _selectedAppointmentDate;
 
   bool _isSubmittingReservation = false;
@@ -66,9 +65,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
   String _selectedPaymentMethod = 'physical';
   bool _isProcessingPayment = false;
 
-  // Shows a brief spinner on the date field while the availability
-  // check below runs, so the customer isn't left wondering why the
-  // picker "did nothing" for a moment.
   bool _isCheckingAvailability = false;
 
   final TextEditingController _budgetController = TextEditingController();
@@ -85,30 +81,9 @@ class _AIAssistantPageState extends State<AIAssistantPage>
   List<String> _flowerReferencePhotos = [];
   bool _isLoadingFlowerPhotos = false;
 
-  // Single shared date-string formatter, used both when checking
-  // availability and when writing the final reservation -- keeping this
-  // in one place means the two can never drift into different formats
-  // and silently fail to match each other in Firestore.
   String _formatDateStr(DateTime d) =>
       '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
 
-  // Checks availability for the APPOINTMENT date -- Reservation
-  // Settings' blocked dates and daily capacity cap exist to limit how
-  // many customers the branch can see in person on a given day, not
-  // how many customer events happen to fall on the same calendar date.
-  // Checks blocked_dates/{dateStr} for an owner-set block, and counts
-  // how many reservations already share that same appointment_date to
-  // see if the daily slot cap is full. Fails OPEN on any error (network
-  // blip, etc.) -- an availability check that can't complete should
-  // never be the reason a legitimate customer can't book at all.
-  //
-  // CHANGED: counts from the top-level `reservations` collection (every
-  // branch's reservations live there now, each with a branchId field).
-  // Previously this used collectionGroup('reservations') + where(), which
-  // needs a special collection-group index; without that index the query
-  // failed, the catch below allowed the booking, and the daily cap was
-  // silently never enforced. A plain collection + one where() uses the
-  // index Firestore creates automatically.
   Future<Map<String, dynamic>> _checkDateAvailability(DateTime date) async {
     final dateStr = _formatDateStr(date);
 
@@ -144,6 +119,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
       return {'available': true};
     }
   }
+
   Future<void> _fetchPexelsPhotos(String query) async {
     try {
       final url = Uri.parse(
@@ -428,20 +404,11 @@ class _AIAssistantPageState extends State<AIAssistantPage>
   bool _isGeneratingMatch = false;
   Map<String, dynamic>? _matchResult;
 
-  // "Others" free-text fallback controllers for the recipient and
-  // occasion dropdowns -- only ever read from when their dropdown's
-  // value is literally 'Others', so they never interfere with the
-  // preset options.
   final TextEditingController _customRecipientController =
   TextEditingController();
   final TextEditingController _customOccasionController =
   TextEditingController();
 
-  // Replaces the old fixed "_selectedVibe" dropdown. The vibe is now a
-  // free-text description in the customer's own words, sent to Gemini
-  // as-is so the AI can both NAME it (see 'vibeName' in the Gemini
-  // response) AND base its flower/color choices on the actual
-  // description rather than a rigid preset label.
   final TextEditingController _vibeController =
   TextEditingController(text: 'Soft, romantic pastel tones');
 
@@ -656,9 +623,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     final phone = _phoneController.text.trim();
     final email = _emailController.text.trim();
 
-    // Requires an appointment date in addition to the event date -- the
-    // two answer different questions ("when's the event?" vs. "when
-    // will you come to the branch?") and both are needed to submit.
     if (firstName.isEmpty ||
         lastName.isEmpty ||
         phone.isEmpty ||
@@ -707,18 +671,31 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     });
 
     try {
-      // Photo upload is isolated in its own try/catch, separate from the
-      // reservation-submission logic below. If Firebase Storage isn't
-      // enabled yet, the upload throws -- a failed upload now just means
-      // no photo attaches; the reservation still gets written to Firestore.
+      // ────────────────────────────────────────────────────────────────
+      // PHOTO UPLOAD (Firebase Storage → Cloudinary fallback)
+      //
+      // 1) Try Firebase Storage first — it's the primary path, same
+      //    project, fastest CDN, and existing rules already cover it.
+      // 2) If Firebase throws for ANY reason (rules, disabled service,
+      //    network blip), fall back to Cloudinary via CloudinaryService.
+      //    That service returns CloudinaryUploadResult — we take `.url`.
+      // 3) If BOTH fail, continue without a photo. The reservation is
+      //    still written; the SnackBar explains what happened.
+      //
+      // Either way, `style_photo_url` remains a single HTTPS string.
+      // BloominousWeb needs no change.
+      // ────────────────────────────────────────────────────────────────
       String? uploadedPhotoUrl;
+      String? photoUploadProvider;
       bool photoUploadFailed = false;
       final imageToUpload = _aiSynthesizedImageBytes ?? _imageBytes;
       if (imageToUpload != null) {
+        final uid = currentUser.uid;
+        final fileName =
+            '${DateTime.now().millisecondsSinceEpoch}_$uid.png';
+
+        // ── Attempt 1: Firebase Storage (PRIMARY) ──
         try {
-          final uid = currentUser.uid;
-          final fileName =
-              '${DateTime.now().millisecondsSinceEpoch}_$uid.png';
           final ref = FirebaseStorage.instance
               .ref()
               .child('reservation_designs')
@@ -728,11 +705,41 @@ class _AIAssistantPageState extends State<AIAssistantPage>
             SettableMetadata(contentType: 'image/png'),
           );
           uploadedPhotoUrl = await uploadTask.ref.getDownloadURL();
+          photoUploadProvider = 'firebase';
         } catch (storageError) {
-          print(
-              "Photo upload failed (Firebase Storage may not be enabled yet) -- continuing without a photo: $storageError");
-          uploadedPhotoUrl = null;
-          photoUploadFailed = true;
+          debugPrint(
+              'Firebase Storage upload failed — falling back to Cloudinary: $storageError');
+
+          // ── Attempt 2: Cloudinary (FALLBACK) ──
+          // NOTE: your service is named uploadBytes(...) and returns a
+          // CloudinaryUploadResult object with a `.url` field — NOT a
+          // plain String. That's why we read `.url` explicitly.
+          try {
+            final result = await CloudinaryService.uploadBytes(
+              imageToUpload,
+              fileName: fileName,
+              folder: 'bloominous/reservation_designs',
+              contentType: 'image/png',
+            );
+            uploadedPhotoUrl = result.url;
+            photoUploadProvider = 'cloudinary';
+            debugPrint('Cloudinary fallback succeeded: ${result.url}');
+          } on CloudinaryException catch (cloudErr) {
+            debugPrint(
+                'Cloudinary fallback failed [${cloudErr.code}]: ${cloudErr.message}');
+            uploadedPhotoUrl = null;
+            photoUploadProvider = null;
+            photoUploadFailed = true;
+          } catch (unexpectedCloudErr) {
+            // Catch-all in case a non-CloudinaryException leaks through
+            // (e.g., an OOM on huge bytes). We still never want a photo
+            // failure to kill the reservation.
+            debugPrint(
+                'Unexpected Cloudinary error: $unexpectedCloudErr');
+            uploadedPhotoUrl = null;
+            photoUploadProvider = null;
+            photoUploadFailed = true;
+          }
         }
       }
 
@@ -741,9 +748,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
           .where((s) => s.isNotEmpty)
           .join(' ');
       final eventDateStr = _formatDateStr(_selectedEventDate!);
-      // The appointment date, formatted the same shared way, so it
-      // matches exactly against blocked_dates doc IDs and the capacity
-      // count in _checkDateAvailability.
       final appointmentDateStr = _formatDateStr(_selectedAppointmentDate!);
       final appointmentTimeStr =
       _selectedEventTime != null ? _selectedEventTime!.format(context) : null;
@@ -777,11 +781,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
         if (mounted) setState(() => _isProcessingPayment = false);
       }
 
-      // CHANGED: saved to the TOP-LEVEL `reservations` collection, with
-      // the branch stored as a `branchId` FIELD. Previously this wrote to
-      // branches/{branchId}/reservations, where the branch was part of the
-      // document's address instead of its data. The web Event Organizer
-      // page and preorder_reservations_page.dart both read from here now.
       await FirebaseFirestore.instance
           .collection('reservations')
           .add({
@@ -793,17 +792,16 @@ class _AIAssistantPageState extends State<AIAssistantPage>
         'customer_phone': phone,
         if (email.isNotEmpty) 'customer_email': email,
         'customer_uid': currentUser.uid,
-        // fulfillment_date: the day of the customer's actual event --
-        // shown to staff as "Fulfillment Target". Not capacity-checked.
         'fulfillment_date': eventDateStr,
-        // appointment_date: the day the customer visits the branch --
-        // THIS is what blocked_dates and the daily capacity cap govern.
         'appointment_date': appointmentDateStr,
         if (appointmentTimeStr != null) 'appointment_time': appointmentTimeStr,
         'arrangement_details': _visualNoteController.text.trim(),
         'status': 'Pending Review',
         'source': 'visual_stylist',
         if (uploadedPhotoUrl != null) 'style_photo_url': uploadedPhotoUrl,
+        // Optional but useful for debugging / web badge:
+        if (photoUploadProvider != null)
+          'style_photo_provider': photoUploadProvider,
         if (_visualResult?['detectedTheme'] != null)
           'detected_theme': _visualResult!['detectedTheme'],
         if (_visualResult?['recommendedFlowers'] != null)
@@ -829,8 +827,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
           _isSubmittingReservation = false;
           _reservationSubmitted = true;
         });
-        // The success message mentions the missing photo ONLY when the
-        // upload genuinely failed.
         final baseMessage = isEWallet
             ? '✨ Reservation created! Complete your ₱${depositAmount.toStringAsFixed(0)} deposit in the page that just opened.'
             : '✨ Reservation submitted! Please settle the ₱${depositAmount.toStringAsFixed(0)} deposit at the branch.';
@@ -1589,10 +1585,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                           ),
                           const SizedBox(height: 10),
 
-                          // Plain date picker -- no availability check
-                          // here. This date is about the customer's
-                          // event, which the branch has no capacity
-                          // constraint on.
                           InkWell(
                             onTap: () async {
                               final picked = await showDatePicker(
@@ -1647,12 +1639,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                           ),
                           const SizedBox(height: 10),
 
-                          // Appointment Date -- separate from Event
-                          // Date. This is the one that runs the
-                          // availability check (blocked dates + daily
-                          // capacity cap from Reservation Settings),
-                          // because it's the date the branch actually
-                          // has to plan around.
                           InkWell(
                             onTap: () async {
                               final picked = await showDatePicker(
@@ -1823,9 +1809,6 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                                         borderRadius: BorderRadius.circular(10)),
                                   ),
                                 ),
-                                // Standing note, always visible so the
-                                // 50% deposit expectation is clear before
-                                // the customer even types a number.
                                 const SizedBox(height: 6),
                                 Text(
                                   'A 50% deposit of your budget is required to confirm this reservation.',
