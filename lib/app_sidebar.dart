@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
-import 'package:firebase_auth/firebase_auth.dart';
 
 import 'admin_dashboard.dart';
 import 'orders_page.dart';
@@ -22,6 +21,7 @@ import 'delivery_status_page.dart'; // must export a public `DeliveryStatusPage`
 import 'invoice_portal_page.dart';
 import 'admin_audit_log_page.dart';
 import 'override_codes_page.dart';
+import 'session_helper.dart';
 
 class AppSidebar extends StatelessWidget {
   final String role;
@@ -145,8 +145,9 @@ class AppSidebar extends StatelessWidget {
                       LowStockAlertsPage(role: role), isDark, textColor),
                   _item(context, 'POS Scanner', Icons.qr_code_scanner, 'pos',
                       const POSScannerPage(), isDark, textColor),
+                  // Admin-only: employees don't need the barcode generator.
                   _item(context, 'Barcode Gen', Icons.barcode_reader, 'barcode',
-                      const BarcodeGeneratorPage(), isDark, textColor),
+                      const BarcodeGeneratorPage(), isDark, textColor, isHidden: !isAdmin),
                   // Mobile equivalent of delivery_status.php on web.
                   _item(context, 'Delivery Status', Icons.local_shipping, 'delivery',
                       DeliveryStatusPage(role: role), isDark, textColor),
@@ -156,8 +157,9 @@ class AppSidebar extends StatelessWidget {
                       ManageEmployeesPage(role: role), isDark, textColor, isHidden: !isAdmin),
                   _item(context, 'Sales Report', Icons.analytics, 'sales_report',
                       SalesReportPage(role: role), isDark, textColor, isHidden: !isAdmin),
+                  // Admin-only: employees don't need the 3D Realism Hub.
                   _item(context, '3D Realism Hub', Icons.auto_awesome_mosaic, 'kiri',
-                      KiriGeneratorPage(role: role), isDark, textColor),
+                      KiriGeneratorPage(role: role), isDark, textColor, isHidden: !isAdmin),
                   _item(context, 'Settings', Icons.settings, 'settings',
                       SettingsPage(role: role), isDark, textColor),
                 ],
@@ -176,13 +178,8 @@ class AppSidebar extends StatelessWidget {
                   'Logout',
                   style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Colors.redAccent),
                 ),
-                onTap: () async {
-                  await FirebaseAuth.instance.signOut();
-                  if (context.mounted) {
-                    Navigator.of(context, rootNavigator: true)
-                        .popUntil((route) => route.isFirst);
-                  }
-                },
+                // Closes every open page FIRST, then signs out (see session_helper.dart).
+                onTap: () => logoutToHome(context),
               ),
             ),
           ],

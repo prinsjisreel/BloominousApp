@@ -10,6 +10,7 @@ import 'inventory_data.dart';
 import 'app_sidebar.dart';
 import 'notification_bell.dart';
 import 'image_upload_service.dart';
+import 'session_service.dart';
 
 class ProfilePage extends StatefulWidget {
   final String role;
@@ -406,12 +407,8 @@ class _ProfilePageState extends State<ProfilePage> {
                             SizedBox(
                               width: double.infinity,
                               child: ElevatedButton(
-                                onPressed: () async {
-                                  await FirebaseAuth.instance.signOut();
-                                  if (context.mounted) {
-                                    Navigator.of(context, rootNavigator: true).popUntil((route) => route.isFirst);
-                                  }
-                                },
+                                // One shared logout that rebuilds the whole screen stack.
+                                onPressed: () => SessionService.logout(context),
                                 style: ElevatedButton.styleFrom(
                                   backgroundColor: Colors.red.withValues(alpha: 0.08),
                                   foregroundColor: Colors.redAccent,

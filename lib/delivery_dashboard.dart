@@ -204,16 +204,25 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              'REAL-TIME DELIVERY ROUTING',
-              style: GoogleFonts.cormorantGaramond(
-                fontWeight: FontWeight.bold,
-                fontSize: 18,
-                letterSpacing: 1.5,
+            // FittedBox shrinks the title to fit instead of cutting it off
+            // with "..." when the phone screen is narrow.
+            FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.centerLeft,
+              child: Text(
+                'REAL-TIME DELIVERY ROUTING',
+                maxLines: 1,
+                style: GoogleFonts.cormorantGaramond(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 18,
+                  letterSpacing: 1.2,
+                ),
               ),
             ),
             Text(
               'Driver: $_driverName',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
               style: GoogleFonts.inter(fontSize: 11, color: Colors.white70),
             ),
           ],
@@ -242,10 +251,11 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
           labelColor: Colors.amber,
           unselectedLabelColor: Colors.white60,
           labelStyle:
-          const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+          const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+          // Short labels so both tabs fit on a small phone without being cut off.
           tabs: const [
-            Tab(icon: Icon(Icons.alt_route), text: 'ACTIVE MULTI-STOP ROUTE'),
-            Tab(icon: Icon(Icons.task_alt), text: 'DELIVERED & POD HISTORY'),
+            Tab(icon: Icon(Icons.alt_route), text: 'ACTIVE ROUTE'),
+            Tab(icon: Icon(Icons.task_alt), text: 'DELIVERED / POD'),
           ],
         ),
       ),
@@ -258,13 +268,10 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
           }
 
           final allOrders = snapshot.data ?? [];
-          final activeOrders = allOrders
-              .where((o) =>
-          (o['status'] ?? '').toString().toLowerCase() != 'delivered' &&
-              (o['delivery_status'] ?? '').toString().toLowerCase() !=
-                  'delivered' &&
-              (o['status'] ?? '').toString().toLowerCase() != 'cancelled')
-              .toList();
+          // Only orders an admin has released for dispatch appear on the
+          // driver's route (see _isReadyForDriver). Pending / processing
+          // orders and walk-in orders stay hidden until then.
+          final activeOrders = allOrders.where(_isReadyForDriver).toList();
 
           // Sort active orders by stopSequence if present
           activeOrders.sort((a, b) {
@@ -279,6 +286,16 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
               (o['delivery_status'] ?? '').toString().toLowerCase() ==
                   'delivered')
               .toList();
+
+          // Newest delivery first (latest POD time / delivered time on top).
+          deliveredOrders.sort((a, b) {
+            final ta = _deliveredTime(a);
+            final tb = _deliveredTime(b);
+            if (ta == null && tb == null) return 0;
+            if (ta == null) return 1; // no time -> bottom
+            if (tb == null) return -1;
+            return tb.compareTo(ta); // bigger (newer) time first
+          });
 
           return TabBarView(
             controller: _tabController,
@@ -346,23 +363,32 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text('DISPATCH RUN SUMMARY',
-                            style: GoogleFonts.inter(
-                                color: Colors.amber,
-                                fontWeight: FontWeight.w900,
-                                fontSize: 11,
-                                letterSpacing: 1.2)),
-                        const SizedBox(height: 4),
-                        Text('${activeOrders.length} Remaining Stops',
-                            style: GoogleFonts.inter(
-                                color: Colors.white,
-                                fontSize: 18,
-                                fontWeight: FontWeight.bold)),
-                      ],
+                    // Expanded = "take only the space the button leaves free",
+                    // so the text can never push the button off the screen.
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('DISPATCH RUN SUMMARY',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: GoogleFonts.inter(
+                                  color: Colors.amber,
+                                  fontWeight: FontWeight.w900,
+                                  fontSize: 11,
+                                  letterSpacing: 1.0)),
+                          const SizedBox(height: 4),
+                          Text('${activeOrders.length} Remaining Stops',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: GoogleFonts.inter(
+                                  color: Colors.white,
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.bold)),
+                        ],
+                      ),
                     ),
+                    const SizedBox(width: 8),
                     ElevatedButton.icon(
                       onPressed: _isOptimizing
                           ? null
@@ -375,10 +401,12 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
                               strokeWidth: 2, color: Colors.black))
                           : const Icon(Icons.auto_awesome, size: 16),
                       label:
-                      Text(_isOptimizing ? 'SORTING...' : 'OPTIMIZE ROUTE'),
+                      Text(_isOptimizing ? 'SORTING...' : 'OPTIMIZE'),
                       style: ElevatedButton.styleFrom(
                         backgroundColor: Colors.amber,
                         foregroundColor: Colors.black,
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                         shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(20)),
                         textStyle: const TextStyle(
@@ -391,7 +419,6 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
                 const Divider(color: Colors.white24),
                 const SizedBox(height: 8),
                 Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceAround,
                   children: [
                     _buildRouteMetric('In Transit', '$outForDeliveryCount',
                         Icons.directions_car, Colors.lightBlue),
@@ -412,13 +439,17 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(
-                'MULTI-STOP SEQUENCE',
-                style: GoogleFonts.inter(
-                    fontSize: 12,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 1.2,
-                    color: Colors.grey[600]),
+              Flexible(
+                child: Text(
+                  'MULTI-STOP SEQUENCE',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: GoogleFonts.inter(
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 1.0,
+                      color: Colors.grey[600]),
+                ),
               ),
               Text(
                 'Stop 1 to ${activeOrders.length}',
@@ -443,35 +474,61 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
     );
   }
 
+  // One of three equal-width stats. Expanded gives each the same share of
+  // the row; FittedBox shrinks the content if the phone is narrow, so
+  // nothing can overflow.
   Widget _buildRouteMetric(
       String label, String value, IconData icon, Color color) {
-    return Row(
-      children: [
-        Icon(icon, color: color, size: 16),
-        const SizedBox(width: 6),
-        Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+    return Expanded(
+      child: FittedBox(
+        fit: BoxFit.scaleDown,
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            Text(label,
-                style: const TextStyle(color: Colors.white54, fontSize: 10)),
-            Text(value,
-                style: TextStyle(
-                    color: color, fontWeight: FontWeight.bold, fontSize: 12)),
+            Icon(icon, color: color, size: 16),
+            const SizedBox(width: 6),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(label,
+                    style: const TextStyle(color: Colors.white54, fontSize: 10)),
+                Text(value,
+                    style: TextStyle(
+                        color: color, fontWeight: FontWeight.bold, fontSize: 12)),
+              ],
+            ),
           ],
         ),
-      ],
+      ),
     );
   }
 
   Widget _buildStopCard(BuildContext context, Map<String, dynamic> order,
       int stopIndex, int totalStops, bool isDark) {
-    final status = (order['status'] ?? 'pending').toString().toLowerCase();
-    final address = order['deliveryAddress'] ?? 'No address provided';
-    final recipient =
-        order['recipientName'] ?? order['customerName'] ?? 'Customer';
+    final status = _normStatus(order);
+    // Website orders and app orders name the same thing differently, so each
+    // line tries every known spelling. (The web checkout saves 'address',
+    // 'customer_name' and 'total_price'.)
+    final address = (order['deliveryAddress'] ?? order['delivery_address'] ?? order['address'] ?? '')
+        .toString()
+        .trim()
+        .isEmpty
+        ? 'No address provided'
+        : (order['deliveryAddress'] ?? order['delivery_address'] ?? order['address']).toString();
+    final recipient = order['recipientName'] ??
+        order['customerName'] ??
+        order['customer_name'] ??
+        'Customer';
     final phone = order['recipientPhone'] ?? order['phone'] ?? 'N/A';
-    final total =
-    (order['totalAmount'] ?? order['totalPrice'] ?? 0.0).toDouble();
+    // num.tryParse also copes with a price that was saved as text.
+    final total = num.tryParse((order['totalAmount'] ??
+        order['totalPrice'] ??
+        order['total_price'] ??
+        order['total_amount'] ??
+        0)
+        .toString())
+        ?.toDouble() ??
+        0.0;
     final items = (order['items'] ?? order['flowers'] ?? []) as List<dynamic>;
 
     Color statusColor;
@@ -481,10 +538,10 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
         statusColor = Colors.indigo;
         statusLabel = 'IN TRANSIT';
         break;
-      case 'processing':
-      case 'confirmed':
+      case 'in_transit':
+      // Released by the shop, driver has not started yet.
         statusColor = Colors.orange;
-        statusLabel = 'READY FOR PICKUP';
+        statusLabel = 'READY TO GO';
         break;
       default:
         statusColor = Colors.blue;
@@ -511,41 +568,47 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Row(
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 10, vertical: 4),
-                      decoration: BoxDecoration(
-                        color: Colors.amber,
-                        borderRadius: BorderRadius.circular(20),
+                // Wrap = "put the next chip on a new line if there's no room".
+                Expanded(
+                  child: Wrap(
+                    spacing: 8,
+                    runSpacing: 6,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: Colors.amber,
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Text(
+                          'STOP #$stopIndex of $totalStops',
+                          style: const TextStyle(
+                              color: Colors.black,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 11),
+                        ),
                       ),
-                      child: Text(
-                        'STOP #$stopIndex of $totalStops',
-                        style: const TextStyle(
-                            color: Colors.black,
-                            fontWeight: FontWeight.bold,
-                            fontSize: 11),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 8, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: statusColor.withOpacity(0.15),
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Text(
+                          statusLabel,
+                          style: TextStyle(
+                              color: statusColor,
+                              fontSize: 10,
+                              fontWeight: FontWeight.bold),
+                        ),
                       ),
-                    ),
-                    const SizedBox(width: 8),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 8, vertical: 4),
-                      decoration: BoxDecoration(
-                        color: statusColor.withOpacity(0.15),
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                      child: Text(
-                        statusLabel,
-                        style: TextStyle(
-                            color: statusColor,
-                            fontSize: 10,
-                            fontWeight: FontWeight.bold),
-                      ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
+                const SizedBox(width: 8),
                 Text(
                   '₱${total.toStringAsFixed(2)}',
                   style: const TextStyle(
@@ -728,10 +791,9 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
         final photo =
         (order['proofOfDeliveryPhoto'] ?? order['podPhotoUrl']) as String?;
         final notes = order['deliveryNotes'] as String?;
-        final rawTime = order['podTimestamp'] ?? order['deliveredAt'];
-        final timestamp = rawTime != null
-            ? DateFormat('MMM dd, yyyy - h:mm a')
-            .format((rawTime as dynamic).toDate())
+        final time = _deliveredTime(order);
+        final timestamp = time != null
+            ? DateFormat('MMM dd, yyyy - h:mm a').format(time)
             : 'Recently Delivered';
 
         return Card(
@@ -832,6 +894,48 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
     );
   }
 
+  // The only statuses that mean "the shop has released this order to the
+  // driver". Admins set 'in transit' on the Orders page (web writes
+  // 'in transit', the app writes 'IN TRANSIT'); once the driver taps
+  // START DRIVE the order becomes 'out_for_delivery'.
+  static const Set<String> _dispatchStatuses = {'in_transit', 'out_for_delivery'};
+
+  /// Reads the moment an order was delivered, whatever type it was saved as
+  /// (Firestore Timestamp, DateTime, milliseconds number or text).
+  /// Returns null when there is no usable time.
+  DateTime? _deliveredTime(Map<String, dynamic> o) {
+    final raw = o['podTimestamp'] ?? o['deliveredAt'];
+    if (raw == null) return null;
+    try {
+      if (raw is DateTime) return raw;
+      if (raw is num) return DateTime.fromMillisecondsSinceEpoch(raw.toInt());
+      if (raw is String) return DateTime.tryParse(raw);
+      return (raw as dynamic).toDate() as DateTime; // Firestore Timestamp
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Lower-cases a status and turns spaces into underscores, so
+  /// 'IN TRANSIT', 'in transit' and 'in_transit' are all the same word.
+  String _normStatus(Map<String, dynamic> o) =>
+      (o['status'] ?? '').toString().toLowerCase().trim().replaceAll(RegExp(r'\s+'), '_');
+
+  /// True when this order belongs on the driver's active route.
+  bool _isReadyForDriver(Map<String, dynamic> o) {
+    final status = _normStatus(o);
+    final deliveryStatus = (o['delivery_status'] ?? '').toString().toLowerCase();
+
+    // Finished orders belong to the history tab, not the route.
+    if (status == 'delivered' || deliveryStatus == 'delivered' || status == 'cancelled') {
+      return false;
+    }
+    // Walk-in (POS) orders are handed over in the shop, never delivered.
+    if ((o['type'] ?? 'WEB').toString().toUpperCase() == 'POS') return false;
+
+    return _dispatchStatuses.contains(status);
+  }
+
   void _updateStatus(String orderId, String status) async {
     try {
       await InventoryData.updateDeliveryStatus(orderId, status);
@@ -862,21 +966,22 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
     );
   }
 
-  Widget _buildImageFromBase64OrUrl(String strData) {
+  Widget _buildImageFromBase64OrUrl(String strData,
+      {BoxFit fit = BoxFit.cover}) {
     try {
       if (strData.startsWith('data:image') || strData.contains(';base64,')) {
         final base64Str = strData.split(',').last;
         final bytes = base64Decode(base64Str);
-        return Image.memory(bytes, fit: BoxFit.cover);
+        return Image.memory(bytes, fit: fit);
       } else if (strData.startsWith('http://') ||
           strData.startsWith('https://')) {
         return Image.network(strData,
-            fit: BoxFit.cover,
+            fit: fit,
             errorBuilder: (c, e, s) =>
             const Icon(Icons.broken_image, size: 40));
       } else {
         final bytes = base64Decode(strData);
-        return Image.memory(bytes, fit: BoxFit.cover);
+        return Image.memory(bytes, fit: fit);
       }
     } catch (e) {
       return Container(
@@ -893,69 +998,150 @@ class _DeliveryDashboardState extends State<DeliveryDashboard>
     final notes = order['deliveryNotes'] as String?;
     final recipient = (order['podRecipient'] ??
         order['recipientName'] ??
-        order['customerName']) as String? ??
+        order['customerName'] ??
+        order['customer_name'])
+        ?.toString() ??
         'N/A';
     final courier =
-        (order['courierName'] ?? order['driverName']) as String? ?? 'N/A';
-    final rawTime = order['podTimestamp'] ?? order['deliveredAt'];
-    final timestamp = rawTime != null
-        ? DateFormat('MMMM dd, yyyy - h:mm:ss a')
-        .format((rawTime as dynamic).toDate())
+        (order['courierName'] ?? order['driverName'])?.toString() ?? 'N/A';
+    final time = _deliveredTime(order);
+    final timestamp = time != null
+        ? DateFormat('MMM dd, yyyy - h:mm a').format(time)
         : 'N/A';
+
+    const amber = Color(0xFFF59E0B);
 
     showDialog(
       context: context,
-      builder: (context) => Dialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        child: Padding(
-          padding: const EdgeInsets.all(20.0),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      builder: (dialogContext) {
+        final isDark = Theme.of(dialogContext).brightness == Brightness.dark;
+        final bg = isDark ? const Color(0xFF1A1A1A) : const Color(0xFFFFFDF7);
+        final textColor = isDark ? Colors.white : const Color(0xFF1F2937);
+        final muted = isDark ? Colors.white60 : Colors.black54;
+        final screen = MediaQuery.of(dialogContext).size;
+
+        return Dialog(
+          backgroundColor: bg,
+          // Keeps a comfortable margin from the screen edges on any phone.
+          insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+            side: BorderSide(color: amber.withOpacity(0.6), width: 1.5),
+          ),
+          // The dialog can never be taller than 85% of the screen or wider
+          // than 480px (tablets), and its content scrolls if it still does
+          // not fit (small phones, landscape).
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxHeight: screen.height * 0.85,
+              maxWidth: 480,
+            ),
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(18, 12, 18, 18),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text('Proof of Delivery (POD)',
-                      style:
-                      TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                  IconButton(
-                      icon: const Icon(Icons.close),
-                      onPressed: () => Navigator.pop(context)),
+                  Row(
+                    children: [
+                      const Icon(Icons.verified, color: amber, size: 20),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text('PROOF OF DELIVERY',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: GoogleFonts.cormorantGaramond(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 19,
+                                letterSpacing: 1.1,
+                                color: textColor)),
+                      ),
+                      IconButton(
+                        icon: Icon(Icons.close, color: muted),
+                        onPressed: () => Navigator.pop(dialogContext),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  if (photo != null && photo.isNotEmpty)
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(16),
+                      child: Container(
+                        // Photo takes at most 45% of the screen height and
+                        // is shown WHOLE (contain), never cropped. Pinch to zoom.
+                        constraints:
+                        BoxConstraints(maxHeight: screen.height * 0.45),
+                        width: double.infinity,
+                        color: Colors.black,
+                        child: InteractiveViewer(
+                          minScale: 1,
+                          maxScale: 4,
+                          child: _buildImageFromBase64OrUrl(photo,
+                              fit: BoxFit.contain),
+                        ),
+                      ),
+                    ),
+                  const SizedBox(height: 14),
+                  _podInfoRow(Icons.person_outline, 'Received by', recipient,
+                      textColor, muted),
+                  _podInfoRow(Icons.local_shipping_outlined, 'Delivered by',
+                      courier, textColor, muted),
+                  _podInfoRow(Icons.schedule, 'Delivered on', timestamp,
+                      textColor, muted),
+                  if (notes != null && notes.isNotEmpty)
+                    _podInfoRow(Icons.notes, 'Notes', notes, textColor, muted),
                 ],
               ),
-              const SizedBox(height: 12),
-              if (photo != null && photo.isNotEmpty)
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(16),
-                  child: Container(
-                    constraints: const BoxConstraints(maxHeight: 350),
-                    width: double.infinity,
-                    color: Colors.black,
-                    child: _buildImageFromBase64OrUrl(photo),
-                  ),
-                ),
-              const SizedBox(height: 12),
-              Text('Received By: $recipient',
-                  style: const TextStyle(
-                      fontSize: 13, fontWeight: FontWeight.bold)),
-              Text('Courier / Driver: $courier',
-                  style: const TextStyle(fontSize: 12, color: Colors.grey)),
-              Text('Timestamp: $timestamp',
-                  style: const TextStyle(fontSize: 12, color: Colors.grey)),
-              if (notes != null && notes.isNotEmpty)
-                Text('Notes: $notes',
-                    style: const TextStyle(
-                        fontSize: 12, fontStyle: FontStyle.italic)),
-            ],
+            ),
           ),
-        ),
+        );
+      },
+    );
+  }
+
+  // One "icon  label / value" line. Expanded + soft wrapping means long
+  // names or notes wrap onto the next line instead of overflowing.
+  Widget _podInfoRow(IconData icon, String label, String value,
+      Color textColor, Color muted) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 18, color: const Color(0xFFF59E0B)),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(label.toUpperCase(),
+                    style: TextStyle(
+                        fontSize: 10,
+                        letterSpacing: 0.8,
+                        fontWeight: FontWeight.w700,
+                        color: muted)),
+                const SizedBox(height: 2),
+                Text(value,
+                    style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                        color: textColor)),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
 }
 
 // Stateful Bottom Sheet for Capturing Proof Photo & Notes
+//
+// Rules for the rider (enforced by this screen):
+//  * Photo can ONLY come from the live camera (no gallery).
+//  * "Received By" is the customer's name from the order - read-only.
+//  * "Delivered By" is the logged-in rider's own name - read-only.
+//  * The rider can only type optional delivery notes.
 class _PODCaptureSheet extends StatefulWidget {
   final Map<String, dynamic> order;
   final String driverName;
@@ -972,52 +1158,63 @@ class _PODCaptureSheet extends StatefulWidget {
 }
 
 class _PODCaptureSheetState extends State<_PODCaptureSheet> {
-  Uint8List? _imageBytes; // CHANGED: Store bytes instead of a base64 string
+  // Brand colours (same amber as the app theme in main.dart).
+  static const Color _amber = Color(0xFFF59E0B);
+
+  Uint8List? _imageBytes; // the captured photo, kept in memory until upload
   bool _isSubmitting = false;
   final _notesController = TextEditingController();
-  late TextEditingController _recipientController;
-  late TextEditingController _courierController;
   final ImagePicker _picker = ImagePicker();
+
+  // Locked values - plain Strings (not TextEditingControllers) because
+  // nothing on screen is allowed to change them.
+  late final String _recipientName;
+  late final String _courierName;
 
   @override
   void initState() {
     super.initState();
-    _recipientController = TextEditingController(
-      text: widget.order['podRecipient'] ??
-          widget.order['recipientName'] ??
-          widget.order['customerName'] ??
-          '',
-    );
-    _courierController = TextEditingController(
-      text: widget.order['courierName'] ?? widget.driverName,
-    );
+    // The website saves 'customer_name', the app saves 'customerName' /
+    // 'recipientName', so we try every spelling and take the first one
+    // that actually has text in it.
+    String pick(List<String> keys, String fallback) {
+      for (final k in keys) {
+        final v = (widget.order[k] ?? '').toString().trim();
+        if (v.isNotEmpty) return v;
+      }
+      return fallback;
+    }
+
+    _recipientName = pick(
+        ['recipientName', 'customerName', 'customer_name'], 'Customer');
+    // Always the signed-in rider - never a value typed by hand.
+    _courierName = widget.driverName;
   }
 
   @override
   void dispose() {
-    _recipientController.dispose();
-    _courierController.dispose();
     _notesController.dispose();
     super.dispose();
   }
 
-  Future<void> _pickImage(ImageSource source) async {
+  // Opens the phone camera. ImageSource.camera is hard-coded on purpose:
+  // there is no way to pick an old photo from the gallery.
+  Future<void> _takePhoto() async {
     try {
       final XFile? image = await _picker.pickImage(
-        source: source,
+        source: ImageSource.camera,
+        preferredCameraDevice: CameraDevice.rear,
         maxWidth: 1024,
         imageQuality: 75,
       );
       if (image != null) {
         final bytes = await image.readAsBytes();
-        setState(() {
-          _imageBytes = bytes;
-        });
+        if (mounted) setState(() => _imageBytes = bytes);
       }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Could not capture image: $e')));
+            SnackBar(content: Text('Could not open camera: $e')));
       }
     }
   }
@@ -1025,8 +1222,8 @@ class _PODCaptureSheetState extends State<_PODCaptureSheet> {
   Future<void> _submitDelivery() async {
     if (_imageBytes == null) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-        content: Text(
-            '📸 Please capture or select a Proof of Delivery photo before completing!'),
+        content:
+        Text('📸 Please take a Proof of Delivery photo before completing!'),
         backgroundColor: Colors.redAccent,
       ));
       return;
@@ -1035,32 +1232,28 @@ class _PODCaptureSheetState extends State<_PODCaptureSheet> {
     setState(() => _isSubmitting = true);
 
     try {
-      // CHANGED: Upload to Firebase Storage / Cloudinary fallback
       final result = await ImageUploadService.uploadBytes(
         bytes: _imageBytes!,
-        storagePath: 'pos_proof/${widget.order['branchId'] ?? 'main'}/${widget.order['id']}.jpg',
+        storagePath:
+        'pos_proof/${widget.order['branchId'] ?? 'main'}/${widget.order['id']}.jpg',
         cloudinaryFolder: 'bloom/delivery_proof',
       );
 
-      // Pass the resulting URL to the database
       await InventoryData.updateDeliveryStatus(
         widget.order['id'],
         'delivered',
         deliveryNotes: _notesController.text.trim(),
-        proofOfDeliveryPhoto: result.url, // CHANGED: Pass the URL
+        proofOfDeliveryPhoto: result.url,
         deliveredLat: widget.currentPos?.latitude,
         deliveredLng: widget.currentPos?.longitude,
-        driverName: _courierController.text.trim().isNotEmpty
-            ? _courierController.text.trim()
-            : widget.driverName,
-        recipientName: _recipientController.text.trim(),
+        driverName: _courierName, // locked: the signed-in rider
+        recipientName: _recipientName, // locked: the order's customer
       );
 
       if (mounted) {
         Navigator.pop(context);
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text(
-              '🎉 Order marked as DELIVERED with Proof of Delivery photo!'),
+          content: Text('🎉 Order marked as DELIVERED with Proof of Delivery!'),
           backgroundColor: Colors.green,
         ));
       }
@@ -1073,238 +1266,304 @@ class _PODCaptureSheetState extends State<_PODCaptureSheet> {
     }
   }
 
+  // ---------- small reusable UI pieces ----------
+
+  Widget _sectionLabel(String text, Color textColor) => Padding(
+    padding: const EdgeInsets.only(bottom: 8),
+    child: Text(text,
+        style: GoogleFonts.inter(
+            fontWeight: FontWeight.w700,
+            fontSize: 12,
+            letterSpacing: 0.6,
+            color: textColor)),
+  );
+
+  // A "looks like an input but cannot be edited" row with a lock icon.
+  Widget _lockedField({
+    required String value,
+    required IconData icon,
+    required Color fill,
+    required Color border,
+    required Color textColor,
+  }) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+      decoration: BoxDecoration(
+        color: fill,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: border),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, size: 18, color: _amber),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(value,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: GoogleFonts.inter(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                    color: textColor)),
+          ),
+          Icon(Icons.lock_outline, size: 16, color: textColor.withOpacity(0.4)),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final isDark = theme.brightness == Brightness.dark;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
 
-    return Container(
-      decoration: BoxDecoration(
-        color: isDark ? const Color(0xFF1E293B) : Colors.white,
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
-      ),
-      padding: EdgeInsets.only(
-        left: 20,
-        right: 20,
-        top: 20,
-        bottom: MediaQuery.of(context).viewInsets.bottom + 20,
-      ),
-      child: SingleChildScrollView(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Center(
-              child: Container(
-                width: 40,
-                height: 4,
-                decoration: BoxDecoration(
-                    color: Colors.grey[400],
-                    borderRadius: BorderRadius.circular(2)),
-              ),
-            ),
-            const SizedBox(height: 16),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+    // Same palette family as the rest of the app (amber + warm light /
+    // near-black dark).
+    final sheetBg = isDark ? const Color(0xFF1A1A1A) : const Color(0xFFFFFDF7);
+    final fieldFill =
+    isDark ? const Color(0xFF262626) : const Color(0xFFF5F1E6);
+    final borderCol = isDark ? Colors.white12 : Colors.black12;
+    final textColor = isDark ? Colors.white : const Color(0xFF1F2937);
+    final mutedColor = isDark ? Colors.white60 : Colors.black54;
+
+    final media = MediaQuery.of(context);
+
+    return ConstrainedBox(
+      // Never taller than 92% of the screen, so the top never gets cut off.
+      constraints: BoxConstraints(maxHeight: media.size.height * 0.92),
+      child: Container(
+        decoration: BoxDecoration(
+          color: sheetBg,
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+          border: Border(top: BorderSide(color: _amber.withOpacity(0.6), width: 2)),
+        ),
+        // SafeArea keeps the button above the phone's navigation bar;
+        // viewInsets lifts the sheet when the keyboard opens.
+        child: SafeArea(
+          top: false,
+          child: SingleChildScrollView(
+            padding: EdgeInsets.fromLTRB(
+                20, 12, 20, media.viewInsets.bottom + 20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                // drag handle
+                Center(
+                  child: Container(
+                    width: 40,
+                    height: 4,
+                    decoration: BoxDecoration(
+                        color: mutedColor.withOpacity(0.4),
+                        borderRadius: BorderRadius.circular(2)),
+                  ),
+                ),
+                const SizedBox(height: 14),
+
+                // header
                 Row(
                   children: [
-                    const Icon(Icons.verified, color: Colors.green, size: 22),
+                    const Icon(Icons.verified, color: _amber, size: 22),
                     const SizedBox(width: 8),
-                    Text(
-                      'PROOF OF DELIVERY (POD)',
-                      style: GoogleFonts.inter(
-                          fontWeight: FontWeight.bold, fontSize: 16),
+                    Expanded(
+                      child: Text('PROOF OF DELIVERY',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: GoogleFonts.cormorantGaramond(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 20,
+                              letterSpacing: 1.2,
+                              color: textColor)),
+                    ),
+                    IconButton(
+                      icon: Icon(Icons.close, color: mutedColor),
+                      onPressed: () => Navigator.pop(context),
                     ),
                   ],
                 ),
-                IconButton(
-                    icon: const Icon(Icons.close),
-                    onPressed: () => Navigator.pop(context)),
-              ],
-            ),
-            Text('Customer: ${widget.order['recipientName'] ?? "Customer"}',
-                style: const TextStyle(color: Colors.grey, fontSize: 13)),
-            const SizedBox(height: 16),
+                const SizedBox(height: 4),
 
-            // Photo Capture Preview Area
-            Text('1. Delivery Photo Proof (Required)*',
-                style: GoogleFonts.inter(
-                    fontWeight: FontWeight.bold, fontSize: 13)),
-            const SizedBox(height: 8),
-
-            Container(
-              height: 200,
-              width: double.infinity,
-              decoration: BoxDecoration(
-                color: isDark ? Colors.black38 : Colors.grey[100],
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(
-                  color: _imageBytes != null
-                      ? Colors.green
-                      : Colors.grey.shade400,
-                  width: _imageBytes != null ? 2 : 1,
-                ),
-              ),
-              child: _imageBytes != null
-                  ? ClipRRect(
-                borderRadius: BorderRadius.circular(14),
-                child: Stack(
-                  fit: StackFit.expand,
-                  children: [
-                    Image.memory(
-                      _imageBytes!,
-                      fit: BoxFit.cover,
+                // 1. PHOTO (camera only)
+                _sectionLabel('1. DELIVERY PHOTO (REQUIRED)', mutedColor),
+                Container(
+                  height: 200,
+                  width: double.infinity,
+                  decoration: BoxDecoration(
+                    color: fieldFill,
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(
+                      color: _imageBytes != null ? Colors.green : _amber.withOpacity(0.5),
+                      width: _imageBytes != null ? 2 : 1.2,
                     ),
-                    Positioned(
-                      top: 8,
-                      right: 8,
-                      child: CircleAvatar(
-                        backgroundColor: Colors.black54,
-                        child: IconButton(
-                          icon: const Icon(Icons.refresh,
-                              color: Colors.white, size: 20),
-                          onPressed: () =>
-                              setState(() => _imageBytes = null),
+                  ),
+                  child: _imageBytes != null
+                      ? ClipRRect(
+                    borderRadius: BorderRadius.circular(14),
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        Image.memory(_imageBytes!, fit: BoxFit.cover),
+                        Positioned(
+                          top: 8,
+                          right: 8,
+                          child: CircleAvatar(
+                            backgroundColor: Colors.black54,
+                            child: IconButton(
+                              tooltip: 'Retake photo',
+                              icon: const Icon(Icons.refresh,
+                                  color: Colors.white, size: 20),
+                              // Retake opens the camera straight away.
+                              onPressed: _isSubmitting ? null : _takePhoto,
+                            ),
+                          ),
                         ),
-                      ),
-                    ),
-                    Positioned(
-                      bottom: 8,
-                      left: 8,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 10, vertical: 4),
-                        decoration: BoxDecoration(
-                            color: Colors.green,
-                            borderRadius: BorderRadius.circular(12)),
-                        child: const Row(
-                          children: [
-                            Icon(Icons.check,
-                                color: Colors.white, size: 14),
-                            SizedBox(width: 4),
-                            Text('Photo Attached',
-                                style: TextStyle(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.bold,
-                                    fontSize: 11)),
-                          ],
+                        Positioned(
+                          bottom: 8,
+                          left: 8,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 10, vertical: 4),
+                            decoration: BoxDecoration(
+                                color: Colors.green,
+                                borderRadius: BorderRadius.circular(12)),
+                            child: const Row(
+                              children: [
+                                Icon(Icons.check,
+                                    color: Colors.white, size: 14),
+                                SizedBox(width: 4),
+                                Text('Photo Attached',
+                                    style: TextStyle(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 11)),
+                              ],
+                            ),
+                          ),
                         ),
-                      ),
+                      ],
                     ),
-                  ],
-                ),
-              )
-                  : Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(Icons.add_a_photo_outlined,
-                      size: 48, color: Colors.grey[400]),
-                  const SizedBox(height: 12),
-                  const Text('Capture photo of delivered bouquet',
-                      style: TextStyle(color: Colors.grey, fontSize: 12)),
-                  const SizedBox(height: 16),
-                  Row(
+                  )
+                      : Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
+                      Icon(Icons.add_a_photo_outlined,
+                          size: 44, color: _amber.withOpacity(0.8)),
+                      const SizedBox(height: 10),
+                      Text('Take a photo of the delivered bouquet',
+                          style: TextStyle(color: mutedColor, fontSize: 12)),
+                      const SizedBox(height: 14),
+                      // The ONLY way to add a photo.
                       ElevatedButton.icon(
-                        onPressed: () => _pickImage(ImageSource.camera),
-                        icon: const Icon(Icons.camera_alt, size: 16),
-                        label: const Text('CAMERA'),
+                        onPressed: _takePhoto,
+                        icon: const Icon(Icons.camera_alt, size: 18),
+                        label: const Text('OPEN CAMERA'),
                         style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.amber,
-                            foregroundColor: Colors.black),
-                      ),
-                      const SizedBox(width: 12),
-                      OutlinedButton.icon(
-                        onPressed: () => _pickImage(ImageSource.gallery),
-                        icon: const Icon(Icons.photo_library, size: 16),
-                        label: const Text('GALLERY'),
+                          backgroundColor: _amber,
+                          foregroundColor: Colors.black,
+                          elevation: 0,
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 22, vertical: 12),
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(24)),
+                          textStyle: const TextStyle(
+                              fontWeight: FontWeight.w800,
+                              fontSize: 12,
+                              letterSpacing: 0.8),
+                        ),
                       ),
                     ],
                   ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 16),
-
-            // Recipient & Courier inputs
-            Text('2. Received By (Recipient Name)*',
-                style: GoogleFonts.inter(
-                    fontWeight: FontWeight.bold, fontSize: 13)),
-            const SizedBox(height: 6),
-            TextField(
-              controller: _recipientController,
-              decoration: InputDecoration(
-                hintText: 'e.g. Maria Santos',
-                border:
-                OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                contentPadding:
-                const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              ),
-            ),
-            const SizedBox(height: 12),
-
-            Text('3. Courier / Delivered By',
-                style: GoogleFonts.inter(
-                    fontWeight: FontWeight.bold, fontSize: 13)),
-            const SizedBox(height: 6),
-            TextField(
-              controller: _courierController,
-              decoration: InputDecoration(
-                hintText: 'e.g. Super Admin / Driver Name',
-                border:
-                OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                contentPadding:
-                const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              ),
-            ),
-            const SizedBox(height: 12),
-
-            // Driver Notes
-            Text('4. Delivery Notes / Remarks (Optional)',
-                style: GoogleFonts.inter(
-                    fontWeight: FontWeight.bold, fontSize: 13)),
-            const SizedBox(height: 6),
-            TextField(
-              controller: _notesController,
-              decoration: InputDecoration(
-                hintText: 'e.g. Handed directly to recipient at main entrance',
-                border:
-                OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                contentPadding: const EdgeInsets.all(12),
-              ),
-              maxLines: 2,
-            ),
-            const SizedBox(height: 20),
-
-            // Submit Button
-            SizedBox(
-              width: double.infinity,
-              height: 50,
-              child: ElevatedButton(
-                onPressed: _isSubmitting ? null : _submitDelivery,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.green,
-                  foregroundColor: Colors.white,
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(16)),
-                  textStyle: const TextStyle(
-                      fontWeight: FontWeight.bold, fontSize: 15),
                 ),
-                child: _isSubmitting
-                    ? const CircularProgressIndicator(color: Colors.white)
-                    : const Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(Icons.check_circle_outline),
-                    SizedBox(width: 8),
-                    Text('CONFIRM & COMPLETE DELIVERY'),
-                  ],
+                const SizedBox(height: 18),
+
+                // 2. RECIPIENT (locked)
+                _sectionLabel('2. RECEIVED BY (CUSTOMER)', mutedColor),
+                _lockedField(
+                  value: _recipientName,
+                  icon: Icons.person_outline,
+                  fill: fieldFill,
+                  border: borderCol,
+                  textColor: textColor,
                 ),
-              ),
+                const SizedBox(height: 14),
+
+                // 3. RIDER (locked)
+                _sectionLabel('3. DELIVERED BY (RIDER)', mutedColor),
+                _lockedField(
+                  value: _courierName,
+                  icon: Icons.local_shipping_outlined,
+                  fill: fieldFill,
+                  border: borderCol,
+                  textColor: textColor,
+                ),
+                const SizedBox(height: 14),
+
+                // 4. NOTES (the only editable text)
+                _sectionLabel('4. DELIVERY NOTES (OPTIONAL)', mutedColor),
+                TextField(
+                  controller: _notesController,
+                  maxLines: 2,
+                  style: TextStyle(color: textColor, fontSize: 14),
+                  cursorColor: _amber,
+                  decoration: InputDecoration(
+                    hintText: 'e.g. Handed directly to recipient at main entrance',
+                    hintStyle: TextStyle(color: mutedColor, fontSize: 13),
+                    filled: true,
+                    fillColor: fieldFill,
+                    contentPadding: const EdgeInsets.all(14),
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide: BorderSide(color: borderCol),
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide: const BorderSide(color: _amber, width: 1.6),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 22),
+
+                // SUBMIT
+                SizedBox(
+                  width: double.infinity,
+                  height: 52,
+                  child: ElevatedButton(
+                    onPressed: _isSubmitting ? null : _submitDelivery,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: _amber,
+                      foregroundColor: Colors.black,
+                      disabledBackgroundColor: _amber.withOpacity(0.5),
+                      elevation: 0,
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16)),
+                    ),
+                    child: _isSubmitting
+                        ? const SizedBox(
+                        width: 22,
+                        height: 22,
+                        child: CircularProgressIndicator(
+                            strokeWidth: 2.5, color: Colors.black))
+                    // FittedBox shrinks the label instead of clipping it.
+                        : FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.check_circle_outline, size: 20),
+                          const SizedBox(width: 8),
+                          Text('CONFIRM & COMPLETE DELIVERY',
+                              style: GoogleFonts.inter(
+                                  fontWeight: FontWeight.w800,
+                                  fontSize: 14,
+                                  letterSpacing: 0.6)),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ],
             ),
-          ],
+          ),
         ),
       ),
     );

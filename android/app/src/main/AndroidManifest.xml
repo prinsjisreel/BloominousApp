@@ -10,8 +10,8 @@
         android:label="Bloominous"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
-                android:usesCleartextTraffic="true">
-        
+        android:usesCleartextTraffic="true">
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -20,12 +20,12 @@
             android:configChanges="orientation|keyboardHidden|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:hardwareAccelerated="true"
             android:windowSoftInputMode="adjustResize">
-            
+
             <meta-data
-              android:name="io.flutter.embedding.android.NormalTheme"
-              android:resource="@style/NormalTheme"
-              />
-              
+                android:name="io.flutter.embedding.android.NormalTheme"
+                android:resource="@style/NormalTheme"
+                />
+
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
@@ -37,21 +37,33 @@
                 <!-- Ito ang magsasabi na bloomapp:// ang gagamitin -->
                 <data android:scheme="flowerar" />
             </intent-filter>
-                    </activity>
+        </activity>
 
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
     </application>
 
+    <!-- Android 11+ hides other apps from yours unless you declare them here.
+         Without the https/http/tel entries, url_launcher's canLaunchUrl()
+         returns false, so GCash/Maya pages, Google Maps links and phone
+         calls "cannot be opened" even though they are perfectly valid. -->
     <queries>
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
         </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="http" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="tel" />
+        </intent>
     </queries>
 </manifest>
-        
-    
-
-        

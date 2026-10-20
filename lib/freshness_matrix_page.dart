@@ -14,6 +14,16 @@ class FreshnessMatrixPage extends StatefulWidget {
 }
 
 class _FreshnessMatrixPageState extends State<FreshnessMatrixPage> {
+  // Created ONCE (not inside build) so a rebuild never restarts the stream
+  // and flashes the loading spinner.
+  late final Stream<List<Map<String, dynamic>>> _freshnessStream;
+
+  @override
+  void initState() {
+    super.initState();
+    _freshnessStream = InventoryData.freshnessStream();
+  }
+
   Color _scoreColor(int score) {
     if (score > 70) return Colors.green;
     if (score > 40) return Colors.orange;
@@ -58,9 +68,10 @@ class _FreshnessMatrixPageState extends State<FreshnessMatrixPage> {
                     ),
                   Expanded(
                     child: StreamBuilder<List<Map<String, dynamic>>>(
-                      stream: InventoryData.freshnessStream(),
+                      stream: _freshnessStream,
                       builder: (context, snapshot) {
-                        if (snapshot.connectionState == ConnectionState.waiting) {
+                        if (snapshot.connectionState == ConnectionState.waiting &&
+                            !snapshot.hasData) {
                           return const Center(child: CircularProgressIndicator(color: Color(0xFFF59E0B)));
                         }
                         if (snapshot.hasError) {
@@ -76,7 +87,7 @@ class _FreshnessMatrixPageState extends State<FreshnessMatrixPage> {
                         int total = 0, healthy = 0, discount = 0, critical = 0;
                         for (final s in displayScans) {
                           total++;
-                          final score = (s['freshnessScore'] ?? 0) as int;
+                          final score = ((s['freshnessScore'] ?? 0) as num).toInt();
                           final status = (s['status'] ?? '').toString();
                           if (status == 'Healthy') healthy++;
                           if (score >= 30 && score <= 60) discount++;
@@ -146,42 +157,49 @@ class _FreshnessMatrixPageState extends State<FreshnessMatrixPage> {
     );
   }
 
-  // FIXED: minHeight guarantees the box never gets squeezed shorter than
-  // both children genuinely need; FittedBox on the value number means IT
-  // shrinks under pressure instead of silently starving the label of
-  // space; label now wraps to 2 lines instead of forcing 1 line — this
-  // is exactly what was making "Peak Freshness" and "Discount Threshold"
-  // (both accent-bordered, both longer labels) render blank on narrow
-  // 2-column layouts.
+  // ROOT CAUSE OF THE BLANK BOXES: the old version drew the coloured top line
+  // with a Border whose top side was a different colour/width than the other
+  // sides, AND gave the same box a borderRadius. Flutter does not allow
+  // rounded corners on a non-uniform border, so every box WITH an accent
+  // (Peak Freshness, Discount Threshold, Critical Decay) failed to paint,
+  // while "Processed" (uniform border) was fine.
+  //
+  // Now the box has one uniform rounded border, and the accent is a thin
+  // coloured strip drawn INSIDE it (clipped to the rounded corners).
   Widget _statBox(String label, String value, Color textColor, Color subTextColor, Color cardColor, Color borderColor, Color? accent) {
     return Container(
-      padding: const EdgeInsets.all(14),
       constraints: const BoxConstraints(minHeight: 72),
+      clipBehavior: Clip.antiAlias,
       decoration: BoxDecoration(
         color: cardColor,
         borderRadius: BorderRadius.circular(16),
-        border: Border(
-          top: BorderSide(color: accent ?? borderColor, width: accent != null ? 3 : 1),
-          left: BorderSide(color: borderColor),
-          right: BorderSide(color: borderColor),
-          bottom: BorderSide(color: borderColor),
-        ),
+        border: Border.all(color: borderColor),
       ),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Text(
-            label,
-            style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: subTextColor, letterSpacing: 0.5),
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-          ),
-          const SizedBox(height: 6),
-          FittedBox(
-            fit: BoxFit.scaleDown,
-            alignment: Alignment.centerLeft,
-            child: Text(value, style: GoogleFonts.plusJakartaSans(fontSize: 24, fontWeight: FontWeight.bold, color: textColor)),
+          if (accent != null) Container(height: 3, color: accent),
+          Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  label,
+                  style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: subTextColor, letterSpacing: 0.5),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 6),
+                FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child: Text(value, style: GoogleFonts.plusJakartaSans(fontSize: 24, fontWeight: FontWeight.bold, color: textColor)),
+                ),
+              ],
+            ),
           ),
         ],
       ),
@@ -189,7 +207,7 @@ class _FreshnessMatrixPageState extends State<FreshnessMatrixPage> {
   }
 
   Widget _buildScanCard(Map<String, dynamic> scan, bool isDark, Color cardColor, Color borderColor, Color textColor, Color subTextColor) {
-    final int score = scan['freshnessScore'] ?? 0;
+    final int score = ((scan['freshnessScore'] ?? 0) as num).toInt();
     final String status = scan['status'] ?? 'Unknown';
     final bool isRecycled = scan['is_recycled'] == true;
     final color = _scoreColor(score);

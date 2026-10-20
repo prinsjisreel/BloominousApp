@@ -24,6 +24,8 @@ import 'auth_page.dart';
 // ← UPDATED: import YOUR existing Cloudinary service.
 // Adjust the path below if your file is NOT at lib/services/cloudinary_service.dart.
 import 'cloudinary_service.dart';
+// Provider fallback chain (Gemini -> Stability AI -> Pixazo GPT Image 2.5 Flare)
+import 'stylist_image_service.dart';
 
 class AIAssistantPage extends StatefulWidget {
   const AIAssistantPage({super.key});
@@ -48,6 +50,12 @@ class _AIAssistantPageState extends State<AIAssistantPage>
   TextEditingController();
 
   bool _aiImageGenerationSucceeded = false;
+
+  // Which provider produced the final edited photo ('Gemini',
+  // 'Stability AI', or 'Pixazo'), and the live status line shown while
+  // the fallback chain is working.
+  String _aiImageProvider = '';
+  String _aiStatusText = '';
 
   final TextEditingController _firstNameController = TextEditingController();
   final TextEditingController _middleNameController = TextEditingController();
@@ -159,10 +167,80 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     }
   }
 
-  Future<void> _generateAiPhotoSynthesis({String? customPrompt}) async {
+  /// Updates the live status line, but only while this screen is still open.
+  void _setAiStatus(String status) {
+    if (mounted) setState(() => _aiStatusText = status);
+  }
+
+  /// Squashes extra spaces/new lines and cuts long text, so every prompt
+  /// stays a predictable length (Pixazo's cheapest prompt tier is 1,200 chars).
+  String _cleanPromptText(String text, int maxChars) {
+    final oneLine = text.replaceAll(RegExp(r'\s+'), ' ').trim();
+    return oneLine.length > maxChars ? oneLine.substring(0, maxChars) : oneLine;
+  }
+
+  /// The SHORT customer brief shared by every provider:
+  /// "styled for <occasion>, <theme> style, colors: <a, b, c>".
+  /// Gemini and Stability AI wrap this in their own prompt styles.
+  String _buildStylistBrief(String eventNote) {
+    final occasion = _cleanPromptText(eventNote, 200);
+    final theme =
+    _cleanPromptText((_visualResult?['detectedTheme'] ?? '').toString(), 80);
+
+    // Gemini's palette looks like "#E11D48 (Crimson Red)". Image models
+    // can't read hex codes (and sometimes paint them as text), so keep
+    // only the color names.
+    final palette = ((_visualResult?['colorPalette'] as List?) ?? [])
+        .map((color) => _cleanPromptText(
+        color
+            .toString()
+            .replaceAll(RegExp(r'#[0-9A-Fa-f]{3,8}'), '')
+            .replaceAll(RegExp(r'[()]'), ''),
+        30))
+        .where((color) => color.isNotEmpty)
+        .take(3)
+        .join(', ');
+
+    final parts = <String>[];
+    if (occasion.isNotEmpty) parts.add('styled for $occasion');
+    if (theme.isNotEmpty) parts.add('$theme style');
+    if (palette.isNotEmpty) parts.add('colors: $palette');
+    return parts.join(', ');
+  }
+
+  /// The FULL instruction prompt, for providers without their own
+  /// wrapper (Pixazo, and Imagen in text-only mode). Scale-aware, matching
+  /// Gemini's own rule: one arrangement for a small room, more decor for
+  /// a hall or event venue.
+  String _buildStylistPrompt({
+    required String flowerName,
+    required String potName,
+    required String brief,
+    required bool hasRoomPhoto,
+  }) {
+    if (hasRoomPhoto) {
+      final parts = <String>[
+        'Edit this photo by adding fresh floral decor. Suggested flowers: $flowerName in a $potName.',
+        if (brief.isNotEmpty) 'Customer brief: $brief.',
+        'Scale the decor to the space: one well-placed arrangement on a table for a home or small room; several arrangements or stage, entrance, or aisle decor for a hall or event venue.',
+        'Keep everything else exactly the same: walls, furniture, layout, lighting, and camera angle - only add the flowers.',
+        "Match the photo's existing light direction with soft natural contact shadows.",
+        'Photorealistic. No text, no people, no watermark.',
+      ];
+      return parts.join(' ');
+    }
+
+    return 'A photorealistic photo of a fresh floral arrangement: $flowerName in a $potName on a table in a softly lit, tidy room'
+        '${brief.isNotEmpty ? ', $brief' : ''}'
+        '. Natural daylight. No text, no people, no watermark.';
+  }
+
+  Future<void> _generateAiPhotoSynthesis({String? eventNote}) async {
     setState(() {
       _isSynthesizingAiImage = true;
       _aiImageGenerationSucceeded = false;
+      _aiImageProvider = '';
+      _aiStatusText = '';
     });
 
     final flowerName = _selectedFlowerType == 'sunflower'
@@ -183,91 +261,155 @@ class _AIAssistantPageState extends State<AIAssistantPage>
         ? 'luxurious golden metallic vase'
         : 'clear crystal glass vase';
 
-    final userTyped = _customApiPromptController.text.trim();
-    final promptText = (customPrompt != null && customPrompt.isNotEmpty)
-        ? customPrompt
-        : userTyped.isNotEmpty
-        ? "Edit the uploaded photo: $userTyped, featuring $flowerName placed inside a $potName on a table, ultra realistic 8k florist interior photography."
-        : "Edit the uploaded photo: place an elegant floral arrangement of $flowerName gracefully inside a $potName sitting on the table in the room photo, ultra realistic 8k daylight interior photo.";
+    final Uint8List? roomBytes =
+    (_imageBytes != null && _imageBytes!.isNotEmpty) ? _imageBytes : null;
 
+    // The event note is CONTEXT inside the prompts, never the whole prompt.
+    final occasionNote = (eventNote != null && eventNote.trim().isNotEmpty)
+        ? eventNote
+        : _customApiPromptController.text;
+
+    // Short brief -> Gemini & Stability (they add their own wrappers).
+    final brief = _buildStylistBrief(occasionNote);
+    // Full instructions -> Pixazo & Imagen (no wrappers of their own).
+    final fullPrompt = _buildStylistPrompt(
+      flowerName: flowerName,
+      potName: potName,
+      brief: brief,
+      hasRoomPhoto: roomBytes != null,
+    );
+    debugPrint('Visual Stylist brief: $brief');
+    debugPrint('Visual Stylist full prompt (${fullPrompt.length} chars): $fullPrompt');
+
+    // ── Step 1: instant local preview (no API cost) ──
+    // Shown right away so the customer sees something while the real AI
+    // edit runs. If it fails, we log it and carry on to the real edit.
     Uint8List? instantEdited;
-    String providerUsed = 'Gemini';
-    try {
-      Uint8List? bytes;
-      if (_imageBytes != null && _imageBytes!.isNotEmpty) {
+    if (roomBytes != null) {
+      try {
         instantEdited = await GeminiService.compositeEditedRoomPhoto(
-          userRoomBytes: _imageBytes!,
+          userRoomBytes: roomBytes,
           flowerType: flowerName,
           potType: potName,
         );
-        if (mounted) {
+        if (mounted && instantEdited != null) {
           setState(() {
             _aiSynthesizedImageBytes = instantEdited;
           });
         }
-
-        try {
-          bytes = await GeminiService.editUserPhotoWithGemini(
-            userRoomBytes: _imageBytes!,
-            userInstruction: promptText,
-            flowerType: flowerName,
-            potType: potName,
-          );
-        } on GeminiImageException catch (geminiError) {
-          print(
-              "Gemini failed, trying Stability AI fallback: ${geminiError.message}");
-          bytes = await GeminiService.editUserPhotoWithStabilityAI(
-            userRoomBytes: _imageBytes!,
-            userInstruction: promptText,
-            flowerType: flowerName,
-            potType: potName,
-          );
-          providerUsed = 'Stability AI';
-        }
-      } else {
-        bytes = await GeminiService.generateImagen3Image(prompt: promptText);
+      } catch (previewError) {
+        debugPrint('Instant composite preview failed (continuing): $previewError');
       }
+    }
 
-      if (mounted) {
-        setState(() {
-          if (bytes != null && bytes.isNotEmpty) {
-            _aiSynthesizedImageBytes = bytes;
-            _aiImageGenerationSucceeded = true;
-          }
-          _isSynthesizingAiImage = false;
-        });
-        if (bytes != null) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(
-                  '✨ $providerUsed analyzed your photo and generated your edited room design!'),
-              backgroundColor: const Color(0xFF10B981),
+    // ── Step 2: real AI edit, one provider at a time ──
+    // Order: Gemini -> Stability AI -> Pixazo (GPT Image 2.5 Flare, 1536x1024).
+    // Each step decides which text it sends: Gemini/Stability ignore the
+    // shared prompt (_) and use the short brief; Pixazo/Imagen use the
+    // full instruction prompt. To change the order, reorder the list.
+    final List<StylistImageStep> steps;
+    if (roomBytes != null) {
+      final Uint8List room = roomBytes;
+      steps = [
+        StylistImageStep(
+          'Gemini',
+              (_) async => StylistImageResult(
+            provider: 'Gemini',
+            imageBytes: await GeminiService.editUserPhotoWithGemini(
+              userRoomBytes: room,
+              userInstruction: brief,
+              flowerType: flowerName,
+              potType: potName,
             ),
-          );
-        }
-      }
-    } on GeminiImageException catch (e) {
-      print("Gemini image generation failed: ${e.message}");
-      if (mounted) {
-        setState(() {
-          _isSynthesizingAiImage = false;
-          if (instantEdited != null) {
-            _aiSynthesizedImageBytes = instantEdited;
-          }
-        });
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('AI image generation failed: ${e.message}'),
-            backgroundColor: const Color(0xFFDC3545),
-            duration: const Duration(seconds: 6),
           ),
-        );
+        ),
+        StylistImageStep(
+          'Stability AI',
+              (_) async => StylistImageResult(
+            provider: 'Stability AI',
+            imageBytes: await GeminiService.editUserPhotoWithStabilityAI(
+              userRoomBytes: room,
+              userInstruction: brief,
+              flowerType: flowerName,
+              potType: potName,
+            ),
+          ),
+        ),
+        StylistImageStep(
+          'Pixazo',
+              (prompt) => StylistImageService.editWithPixazo(
+            roomBytes: room,
+            prompt: prompt,
+            onStatus: _setAiStatus,
+          ),
+        ),
+      ];
+    } else {
+      steps = [
+        StylistImageStep(
+          'Gemini',
+              (prompt) async => StylistImageResult(
+            provider: 'Gemini',
+            imageBytes: await GeminiService.generateImagen3Image(prompt: prompt),
+          ),
+        ),
+        StylistImageStep(
+          'Pixazo',
+              (prompt) => StylistImageService.generateWithPixazo(
+            prompt,
+            onStatus: _setAiStatus,
+          ),
+        ),
+      ];
+    }
+
+    try {
+      final result = await StylistImageService.generateWithFallbacks(
+        prompt: fullPrompt,
+        steps: steps,
+        onStatus: _setAiStatus,
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _aiSynthesizedImageBytes = result.imageBytes ?? _aiSynthesizedImageBytes;
+        _aiImageGenerationSucceeded = true;
+        _aiImageProvider = result.provider;
+        _isSynthesizingAiImage = false;
+        _aiStatusText = '';
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+              '✨ ${result.provider} analyzed your photo and generated your edited room design!'),
+          backgroundColor: const Color(0xFF10B981),
+        ),
+      );
+    } on StylistImageException catch (e) {
+      for (final note in e.details) {
+        debugPrint('Visual Stylist provider failure: $note');
       }
+      if (!mounted) return;
+      setState(() {
+        _isSynthesizingAiImage = false;
+        _aiStatusText = '';
+        if (instantEdited != null) {
+          _aiSynthesizedImageBytes = instantEdited;
+        }
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('AI image generation failed: ${e.message}'),
+          backgroundColor: const Color(0xFFDC3545),
+          duration: const Duration(seconds: 6),
+        ),
+      );
     } catch (e) {
       print("Unexpected error in _generateAiPhotoSynthesis: $e");
       if (mounted) {
         setState(() {
           _isSynthesizingAiImage = false;
+          _aiStatusText = '';
         });
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -455,6 +597,8 @@ class _AIAssistantPageState extends State<AIAssistantPage>
           _visualResult = null;
           _aiSynthesizedImageBytes = null;
           _aiImageGenerationSucceeded = false;
+          _aiImageProvider = '';
+          _aiStatusText = '';
           _flowerReferencePhotos = [];
           _reservationSubmitted = false;
         });
@@ -557,7 +701,7 @@ class _AIAssistantPageState extends State<AIAssistantPage>
     final userNote = _visualNoteController.text.trim();
     if (_imageBytes != null) {
       _generateAiPhotoSynthesis(
-          customPrompt: userNote.isNotEmpty ? userNote : null);
+          eventNote: userNote.isNotEmpty ? userNote : null);
     }
 
     final recommendedList = (result['recommendedFlowers'] as List?) ?? [];
@@ -1095,11 +1239,12 @@ class _AIAssistantPageState extends State<AIAssistantPage>
 
           TextField(
             controller: _visualNoteController,
+            maxLength: 200,
             decoration: InputDecoration(
-              labelText: 'Optional Event / Style Note',
-              hintText:
-              'e.g., Rustic garden wedding in Tagaytay with warm lighting',
-              prefixIcon: const Icon(Icons.edit_note, color: Color(0xFFF59E0B)),
+              labelText: 'Event or Occasion (optional)',
+              hintText: 'e.g., 25th wedding anniversary dinner at home',
+              helperText: 'Just tell us the occasion - we\'ll style the flowers for you.',
+              prefixIcon: const Icon(Icons.celebration_outlined, color: Color(0xFFF59E0B)),
               filled: true,
               fillColor: isDark ? const Color(0xFF262626) : Colors.white,
               border:
@@ -1332,7 +1477,9 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                                 const SizedBox(width: 12),
                                 Expanded(
                                   child: Text(
-                                    'Analyzing theme and curating your custom styled room photo...',
+                                    _aiStatusText.isNotEmpty
+                                        ? _aiStatusText
+                                        : 'Analyzing theme and curating your custom styled room photo...',
                                     style: TextStyle(
                                         fontSize: 12.5,
                                         height: 1.4,
@@ -2258,7 +2405,9 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                             const SizedBox(width: 8),
                             Expanded(
                               child: Text(
-                                '✨ Gemini AI is refining your room photo edit...',
+                                _aiStatusText.isNotEmpty
+                                    ? '✨ $_aiStatusText'
+                                    : '✨ AI is refining your room photo edit...',
                                 style: GoogleFonts.plusJakartaSans(
                                   color: Colors.white,
                                   fontSize: 11,
@@ -2290,8 +2439,11 @@ class _AIAssistantPageState extends State<AIAssistantPage>
                               color: Color(0xFFF59E0B), size: 14),
                           const SizedBox(width: 6),
                           Text(
-                            _aiSynthesizedImageBytes != null
-                                ? '✨ Gemini API Edited Picture'
+                            _aiImageGenerationSucceeded &&
+                                _aiImageProvider.isNotEmpty
+                                ? '✨ $_aiImageProvider Edited Picture'
+                                : _aiSynthesizedImageBytes != null
+                                ? '🪄 Quick Preview'
                                 : '📸 Photorealistic HD Florist Design',
                             style: const TextStyle(
                                 color: Colors.white,

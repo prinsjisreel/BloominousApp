@@ -10,6 +10,7 @@ import 'app_sidebar.dart';
 import 'invoice_portal_page.dart';
 import 'override_code_service.dart';
 import 'admin_audit_service.dart';
+import 'proof_of_order_viewer.dart';
 
 class OrdersPage extends StatefulWidget {
   final String role;
@@ -83,11 +84,44 @@ class _OrdersPageState extends State<OrdersPage> {
     return type != 'POS';
   }
 
-  Future<void> _updateOrderStatus(String orderId, String newStatus) async {
+  // Statuses that mean "this order is finished". The web writes 'confirmed',
+  // the app writes 'COMPLETED' — both must count as final on both sides.
+  static const List<String> _finalStatuses = ['COMPLETED', 'CONFIRMED', 'DELIVERED', 'CANCELLED'];
+
+  /// Reads the order fresh from Firestore (not the list on screen, which may
+  /// be a second behind) and says whether somebody already finalised it —
+  /// for example another employee, or the web page, a moment ago.
+  Future<bool> _isAlreadyFinal(String orderId) async {
+    try {
+      final snap = await FirebaseFirestore.instance.collection('orders').doc(orderId).get();
+      final data = snap.data();
+      if (data == null) return false;
+      final status = (data['status'] ?? '').toString().toUpperCase();
+      return data['locked'] == true || _finalStatuses.contains(status);
+    } catch (_) {
+      // Can't check (offline?) — let the real write decide.
+      return false;
+    }
+  }
+
+  void _showAlreadyFinalMessage() {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('This order is already final and can no longer be changed.'),
+        backgroundColor: Colors.orange,
+      ),
+    );
+  }
+
+  Future<void> _updateOrderStatus(String orderId, String newStatus, {bool lock = false}) async {
     try {
       await FirebaseFirestore.instance.collection('orders').doc(orderId).set({
         'status': newStatus,
         'updatedAt': FieldValue.serverTimestamp(),
+        // lock = true freezes the order ("touch move"). The web page and the
+        // Firestore rules both look at this flag.
+        if (lock) 'locked': true,
       }, SetOptions(merge: true));
 
       // General accountability logging — separate from
@@ -119,6 +153,23 @@ class _OrdersPageState extends State<OrdersPage> {
         );
       }
     }
+  }
+
+  /// Walk-in CONFIRM button. Asks once ("this is final"), re-checks that
+  /// nobody else finalised the order meanwhile, then saves + locks it.
+  Future<void> _handleConfirmWalkIn(String orderId) async {
+    if (await _isAlreadyFinal(orderId)) {
+      _showAlreadyFinalMessage();
+      return;
+    }
+    final confirmed = await _showSimpleConfirm(
+      title: 'Confirm this order?',
+      message: 'Once confirmed, this order is final and cannot be changed again.',
+      keepLabel: 'NOT YET',
+      okLabel: 'CONFIRM ORDER',
+      okColor: Colors.green,
+    );
+    if (confirmed) await _updateOrderStatus(orderId, 'COMPLETED', lock: true);
   }
 
   /// Counts today's WALK-IN cancellations for a specific branch, computed
@@ -161,10 +212,27 @@ class _OrdersPageState extends State<OrdersPage> {
       ) async {
     final branchId = (order['branchId'] ?? _selectedBranchId ?? '').toString();
 
-    if (todaysCancelCount < _dailyCancelLimit) {
+    // Check FIRST, so a wasted override code is never burned on an order
+    // that somebody else already finalised.
+    if (await _isAlreadyFinal(orderId)) {
+      _showAlreadyFinalMessage();
+      return;
+    }
+
+    // The daily limit is for employees. Admins / super-admins are the ones
+    // who create the override codes, so they just get the normal confirm.
+    final bool isAdminRole = widget.role == 'admin' || widget.role == 'super-admin';
+
+    if (isAdminRole || todaysCancelCount < _dailyCancelLimit) {
       final confirmed = await _showSimpleConfirm(
         title: 'Cancel this order?',
-        message: 'This action cannot be undone.',
+        message: isAdminRole
+            ? 'Once cancelled, this order is final. This cannot be undone.'
+            : 'Once cancelled, this order is final. This cannot be undone.\n\n'
+            'Cancellations used today at this branch: $todaysCancelCount of $_dailyCancelLimit.',
+        keepLabel: 'KEEP ORDER',
+        okLabel: 'CANCEL ORDER',
+        okColor: Colors.red,
       );
       if (confirmed) await _finalizeCancellation(orderId);
       return;
@@ -230,6 +298,11 @@ class _OrdersPageState extends State<OrdersPage> {
         // future edit would overwrite) is what the daily-limit count
         // above filters on.
         'cancelledAt': FieldValue.serverTimestamp(),
+        // Same fields the web page writes, so both sides agree the order is
+        // finished and nobody can reopen it.
+        'locked': true,
+        'paymentStatus': 'Voided',
+        'cancelledBy': FirebaseAuth.instance.currentUser?.email ?? 'Staff',
       }, SetOptions(merge: true));
 
       // Matches _updateOrderStatus's own logging — cancellations that
@@ -252,18 +325,24 @@ class _OrdersPageState extends State<OrdersPage> {
     }
   }
 
-  Future<bool> _showSimpleConfirm({required String title, required String message}) async {
+  Future<bool> _showSimpleConfirm({
+    required String title,
+    required String message,
+    String keepLabel = 'KEEP ORDER',
+    String okLabel = 'CANCEL ORDER',
+    Color okColor = Colors.red,
+  }) async {
     final result = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: Text(title),
         content: Text(message),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('KEEP ORDER')),
+          TextButton(onPressed: () => Navigator.pop(context, false), child: Text(keepLabel)),
           ElevatedButton(
             onPressed: () => Navigator.pop(context, true),
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.red, foregroundColor: Colors.white),
-            child: const Text('CANCEL ORDER'),
+            style: ElevatedButton.styleFrom(backgroundColor: okColor, foregroundColor: Colors.white),
+            child: Text(okLabel),
           ),
         ],
       ),
@@ -832,6 +911,16 @@ class _OrdersPageState extends State<OrdersPage> {
                                                     final timelineStr = DateFormat('M/d/yyyy').format(date);
 
                                                     final currentStatus = (order['status'] ?? 'PENDING').toString().toUpperCase();
+                                                    // "Touch move": once confirmed / cancelled / locked, no buttons.
+                                                    // 'CONFIRMED' is what the web page writes, 'COMPLETED' what the app writes.
+                                                    final bool isCancelled = currentStatus == 'CANCELLED';
+                                                    final bool isConfirmed = currentStatus == 'COMPLETED' ||
+                                                        currentStatus == 'CONFIRMED' ||
+                                                        currentStatus == 'DELIVERED';
+                                                    final bool isLockedOther = order['locked'] == true && !isCancelled && !isConfirmed;
+
+                                                    // POS proof-of-order photo (null when the order has none).
+                                                    final proofUrl = proofOfOrderUrl(order);
 
                                                     return Padding(
                                                       padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
@@ -865,6 +954,18 @@ class _OrdersPageState extends State<OrdersPage> {
                                                                     overflow: TextOverflow.ellipsis,
                                                                   ),
                                                                 ),
+                                                                if (proofUrl != null)
+                                                                  IconButton(
+                                                                    tooltip: 'View proof of order',
+                                                                    visualDensity: VisualDensity.compact,
+                                                                    icon: const Icon(Icons.photo_camera_outlined,
+                                                                        size: 18, color: Color(0xFFF59E0B)),
+                                                                    onPressed: () => showProofOfOrderViewer(
+                                                                      context,
+                                                                      url: proofUrl,
+                                                                      caption: 'Proof of order • ${customerName}',
+                                                                    ),
+                                                                  ),
                                                               ],
                                                             ),
                                                           ),
@@ -933,7 +1034,11 @@ class _OrdersPageState extends State<OrdersPage> {
                                                                     DropdownMenuItem(value: 'PROCESSING', child: Text('PROCESSING')),
                                                                     DropdownMenuItem(value: 'IN TRANSIT', child: Text('IN TRANSIT')),
                                                                   ],
-                                                                  onChanged: (val) {
+                                                                  // Employees may only update WALK-IN orders (the
+                                                                  // Firestore rules enforce it). null = greyed out.
+                                                                  onChanged: !isAdmin
+                                                                      ? null
+                                                                      : (val) {
                                                                     if (val != null) _updateOrderStatus(orderId, val);
                                                                   },
                                                                 ),
@@ -941,7 +1046,7 @@ class _OrdersPageState extends State<OrdersPage> {
                                                             )
                                                                 : Row(
                                                               children: [
-                                                                if (currentStatus == 'CANCELLED')
+                                                                if (isCancelled)
                                                                   Container(
                                                                     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                                                                     decoration: BoxDecoration(
@@ -957,25 +1062,32 @@ class _OrdersPageState extends State<OrdersPage> {
                                                                       ),
                                                                     ),
                                                                   )
-                                                                else if (currentStatus == 'COMPLETED')
+                                                                else if (isConfirmed || isLockedOther)
                                                                   Container(
                                                                     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                                                                     decoration: BoxDecoration(
                                                                       color: Colors.green.withValues(alpha: 0.1),
                                                                       borderRadius: BorderRadius.circular(6),
                                                                     ),
-                                                                    child: const Text(
-                                                                      'COMPLETED',
-                                                                      style: TextStyle(
-                                                                        fontSize: 10,
-                                                                        fontWeight: FontWeight.bold,
-                                                                        color: Colors.green,
-                                                                      ),
+                                                                    child: Row(
+                                                                      mainAxisSize: MainAxisSize.min,
+                                                                      children: [
+                                                                        const Icon(Icons.lock, size: 11, color: Colors.green),
+                                                                        const SizedBox(width: 4),
+                                                                        Text(
+                                                                          isConfirmed ? 'CONFIRMED' : 'LOCKED',
+                                                                          style: const TextStyle(
+                                                                            fontSize: 10,
+                                                                            fontWeight: FontWeight.bold,
+                                                                            color: Colors.green,
+                                                                          ),
+                                                                        ),
+                                                                      ],
                                                                     ),
                                                                   )
                                                                 else ...[
                                                                     ElevatedButton(
-                                                                      onPressed: () => _updateOrderStatus(orderId, 'COMPLETED'),
+                                                                      onPressed: () => _handleConfirmWalkIn(orderId),
                                                                       style: ElevatedButton.styleFrom(
                                                                         backgroundColor: Colors.green[600],
                                                                         foregroundColor: Colors.white,

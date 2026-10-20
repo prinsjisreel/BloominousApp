@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'device_security_service.dart';
 
 /// Thrown when an order can't be placed. `code` mirrors the server's
@@ -35,6 +36,11 @@ class OrderSubmissionResult {
 class OrderSubmissionService {
   static const String _endpoint =
       'https://honeydew-duck-132160.hostingersite.com/submit_order.php';
+
+  // The server runs rate limits, pricing, IP/phone lookups, fraud checks,
+  // the invoice counter and notifications before it answers, so a slow
+  // host can need well over 15 seconds. 45s is generous but still finite.
+  static const Duration _requestTimeout = Duration(seconds: 45);
 
   // Must match submit_order.php exactly: preg_match('/^[a-f0-9]{64}$/').
   // A hash in any other shape is silently ignored by the server, which
@@ -69,6 +75,48 @@ class OrderSubmissionService {
     }
   }
 
+  /// After a timeout, asks Firestore: "did the server create my order
+  /// anyway?" Looks at THIS customer's orders only (the same read the
+  /// order-tracking screen already does) and accepts one that was created
+  /// since this request started AND matches the payment method and
+  /// subtotal we sent. Checks a few times, because the server may still be
+  /// finishing when the app gives up. Returns null if nothing is found.
+  Future<OrderSubmissionResult?> _findOrderCreatedSince({
+    required String uid,
+    required DateTime since,
+    required String paymentMethod,
+    required double subtotal,
+  }) async {
+    for (int attempt = 0; attempt < 4; attempt++) {
+      if (attempt > 0) await Future.delayed(const Duration(seconds: 4));
+      try {
+        final snap = await FirebaseFirestore.instance
+            .collection('orders')
+            .where('user_id', isEqualTo: uid)
+            .get();
+
+        for (final doc in snap.docs) {
+          final data = doc.data();
+          final created = data['createdAt'];
+          final invoiceId = data['invoiceId'];
+          final savedSubtotal = data['subtotal'];
+
+          final isRecent = created is Timestamp && !created.toDate().isBefore(since);
+          final sameMethod = data['payment_method'] == paymentMethod;
+          final sameAmount =
+              savedSubtotal is num && (savedSubtotal - subtotal).abs() < 1.0;
+
+          if (isRecent && sameMethod && sameAmount && invoiceId is String) {
+            return OrderSubmissionResult(orderId: doc.id, invoiceId: invoiceId);
+          }
+        }
+      } catch (e) {
+        debugPrint('OrderSubmissionService: recovery lookup failed: $e');
+      }
+    }
+    return null;
+  }
+
   Future<OrderSubmissionResult> submitOrder({
     required String name,
     required String phone,
@@ -94,8 +142,13 @@ class OrderSubmissionService {
     final deviceHash = await _readDeviceHash();
     final trimmedNotes = notes?.trim() ?? '';
 
+    // Remember when we started, minus a minute for clock differences
+    // between this phone and the server. Used only by the recovery check.
+    final requestStartedAt = DateTime.now().subtract(const Duration(minutes: 1));
+
     // --- Send the order ---
-    http.Response response;
+    http.Response? response;
+    bool timedOut = false;
     try {
       response = await http
           .post(
@@ -123,15 +176,9 @@ class OrderSubmissionService {
           if (deviceHash != null) 'deviceHash': deviceHash,
         }),
       )
-          .timeout(const Duration(seconds: 15));
+          .timeout(_requestTimeout);
     } on TimeoutException {
-      // The request may have REACHED the server and created the order;
-      // only the reply was too slow. Warn the customer before they tap
-      // Place Order again and create a duplicate.
-      throw OrderSubmissionException(
-        'The server is taking too long to respond. Your order may still have gone through — please check your orders before trying again.',
-        code: 'TIMEOUT',
-      );
+      timedOut = true;
     } catch (e) {
       debugPrint('OrderSubmissionService: request failed: $e');
       throw OrderSubmissionException(
@@ -140,10 +187,28 @@ class OrderSubmissionService {
       );
     }
 
+    // --- Timed out: the order may still have been created ---
+    if (timedOut) {
+      final recovered = await _findOrderCreatedSince(
+        uid: user.uid,
+        since: requestStartedAt,
+        paymentMethod: paymentMethod,
+        subtotal: subtotal,
+      );
+      if (recovered != null) {
+        debugPrint('OrderSubmissionService: recovered order ${recovered.invoiceId} after timeout.');
+        return recovered;
+      }
+      throw OrderSubmissionException(
+        'The server is taking too long to respond. Your order may still have gone through — please check your orders before trying again.',
+        code: 'TIMEOUT',
+      );
+    }
+
     // --- Read the reply ---
     Map<String, dynamic> data;
     try {
-      data = jsonDecode(response.body) as Map<String, dynamic>;
+      data = jsonDecode(response!.body) as Map<String, dynamic>;
     } catch (_) {
       throw OrderSubmissionException(
         'The server returned an unexpected response. Please try again.',

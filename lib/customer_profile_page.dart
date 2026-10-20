@@ -1,10 +1,54 @@
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'inventory_data.dart';
-import 'my_orders_page.dart';
 import 'order_tracking_page.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+
+/// One redeemable reward, built from a document in the `promos` collection.
+/// Note: it deliberately has NO promo_code field, so the code cannot be
+/// shown to customers by accident.
+class _CatalogReward {
+  final String id; // the promo document id
+  final String name;
+  final String desc;
+  final int cost;
+  final int discount;
+
+  const _CatalogReward({
+    required this.id,
+    required this.name,
+    required this.desc,
+    required this.cost,
+    required this.discount,
+  });
+}
+
+/// "20% Off Voucher": the one place this title is built, so the catalog
+/// card and the saved redemption always use identical wording.
+String _rewardTitle(int discount) => '$discount% Off Voucher';
+
+/// True when a promo's expiry_date ("yyyy-MM-dd" from the web form) is in the
+/// past. The promo stays valid through the END of its expiry day.
+/// A missing or unreadable date is treated as "not expired".
+bool _isPromoExpired(dynamic rawExpiry) {
+  if (rawExpiry is! String) return false;
+  final parsed = DateTime.tryParse(rawExpiry);
+  if (parsed == null) return false;
+  final endOfDay = DateTime(parsed.year, parsed.month, parsed.day, 23, 59, 59);
+  return DateTime.now().isAfter(endOfDay);
+}
+
+/// Random coupon code like BLOOM-K7QM-X2PD. Skips look-alike characters
+/// (0/O, 1/I) so staff can read it aloud without mistakes.
+String _generateRedemptionCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  final random = Random.secure();
+  final part =
+  List.generate(8, (_) => chars[random.nextInt(chars.length)]).join();
+  return 'BLOOM-${part.substring(0, 4)}-${part.substring(4)}';
+}
 
 class CustomerProfilePage extends StatefulWidget {
   final String email;
@@ -153,7 +197,8 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
           final name = (firstName.isNotEmpty || lastName.isNotEmpty)
               ? "$firstName $middleName $lastName".trim()
               : (data?['name'] ?? 'Floral Enthusiast');
-          final points = data?['points'] ?? 0;
+          // Always a whole number, even if Firestore stored 100.0
+          final int points = (data?['points'] as num? ?? 0).toInt();
           final phone = data?['phone'] ?? 'Update phone number';
           final membership = _getMembershipTier(points);
 
@@ -377,19 +422,9 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
                         onTap: () => _showUpdatePhoneDialog(context, phone),
                       ),
                       const SizedBox(height: 16),
-                      _buildOptionTile(context,
-                          icon: Icons.shopping_bag_outlined,
-                          label: 'Order History',
-                          value: 'View your previous bouquets', onTap: () {
-                            Navigator.push(
-                              context,
-                              MaterialPageRoute(
-                                builder: (context) => MyOrdersPage(
-                                    userId: widget.customerId, email: widget.email),
-                              ),
-                            );
-                          }),
-                      const SizedBox(height: 16),
+                      // "Order History" tile removed: the MY ORDERS card above
+                      // (To Pay / To Ship / To Deliver / To Rate) already
+                      // covers it.
                       _buildOptionTile(
                         context,
                         icon: Icons.card_giftcard_rounded,
@@ -446,16 +481,11 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
         if (snapshot.hasData) {
           for (final doc in snapshot.data!.docs) {
             final data = doc.data() as Map<String, dynamic>;
-            final status = (data['status'] ?? '').toString().toLowerCase();
-            final paymentStatus =
-            (data['paymentStatus'] ?? '').toString().toLowerCase();
-            final paymentMethod = (data['payment_method'] ??
-                data['paymentMethod'] ??
-                '')
-                .toString()
-                .toLowerCase();
 
-            if (status == 'cancelled') continue;
+            // Same decision the tracking tabs use (orderBucketFor lives in
+            // order_tracking_page.dart), so a badge always matches its tab.
+            final bucket = orderBucketFor(data);
+            if (bucket == null) continue; // cancelled orders are not counted
 
             final items = (data['items'] as List?) ?? [];
             final itemCount = items.fold<int>(0, (sum, item) {
@@ -465,20 +495,19 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
               return sum + parsedQty;
             });
 
-            if (status == 'delivered' || status == 'completed') {
-              toRate += itemCount;
-            } else if (status == 'shipped' || status == 'out_for_delivery') {
-              toDeliver += itemCount;
-            } else {
-              final isOnlinePayment =
-              ['gcash', 'maya', 'paymaya', 'paymongo'].contains(paymentMethod);
-              final paymentUnresolved = paymentStatus.contains('pending') ||
-                  paymentStatus.contains('awaiting');
-              if (isOnlinePayment && paymentUnresolved) {
+            switch (bucket) {
+              case OrderBucket.toPay:
                 toPay += itemCount;
-              } else {
+                break;
+              case OrderBucket.toShip:
                 toShip += itemCount;
-              }
+                break;
+              case OrderBucket.toDeliver:
+                toDeliver += itemCount;
+                break;
+              case OrderBucket.toRate:
+                toRate += itemCount;
+                break;
             }
           }
         }
@@ -530,6 +559,8 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
               const SizedBox(height: 12),
               Row(
                 children: [
+                  // To Pay first, then To Ship. The last number is the tab
+                  // OrderTrackingPage opens on (0 = To Pay, 1 = To Ship).
                   Expanded(
                       child: _trackingIcon(context, customerId,
                           Icons.payments_outlined, 'To Pay', toPay, 0)),
@@ -803,50 +834,174 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
     );
   }
 
-  void _showRewardsCatalog(BuildContext context, int currentPoints) {
-    final rewards = [
-      {
-        'name': '₱100 Store Discount Voucher',
-        'points': 100,
-        'desc': 'Get ₱100 off any florist bouquet purchase',
-        'icon': Icons.confirmation_number_outlined
-      },
-      {
-        'name': '₱250 Mega Discount Voucher',
-        'points': 220,
-        'desc': 'Get ₱250 off any florist bouquet purchase',
-        'icon': Icons.local_activity_outlined
-      },
-      {
-        'name': 'Premium Custom Wrapper Upgrade',
-        'points': 150,
-        'desc': 'Free premium Korean styled flower wrapping',
-        'icon': Icons.layers_outlined
-      },
-      {
-        'name': 'Free Red Rose Stem Add-on',
-        'points': 200,
-        'desc': 'Add one extra fresh red rose stem to your next bouquet',
-        'icon': Icons.local_florist_outlined
-      },
-      {
-        'name': 'Free Fluffy Teddy Bear Plushie',
-        'points': 300,
-        'desc': 'An adorable 6-inch plushie companion for your arrangement',
-        'icon': Icons.toys_outlined
-      },
-    ];
+  /// Turns the live `promos` documents into catalog rewards.
+  /// Keeps only promos that have a points cost and have not expired,
+  /// cheapest first. promo_code is never copied into the result.
+  List<_CatalogReward> _rewardsFromDocs(List<QueryDocumentSnapshot> docs) {
+    final rewards = <_CatalogReward>[];
+
+    for (final doc in docs) {
+      final data = doc.data() as Map<String, dynamic>;
+      final cost = (data['points_cost'] as num? ?? 0).toInt();
+      final discount = (data['discount_percentage'] as num? ?? 0).toInt();
+
+      if (cost <= 0 || discount <= 0) continue; // not meant for the catalog
+      if (_isPromoExpired(data['expiry_date'])) continue; // already expired
+
+      final expiry = data['expiry_date'];
+      rewards.add(_CatalogReward(
+        id: doc.id,
+        name: _rewardTitle(discount),
+        desc: expiry is String && expiry.isNotEmpty
+            ? 'Get $discount% off your next bouquet purchase. Valid until $expiry.'
+            : 'Get $discount% off your next bouquet purchase.',
+        cost: cost,
+        discount: discount,
+      ));
+    }
+
+    rewards.sort((a, b) => a.cost.compareTo(b.cost));
+    return rewards;
+  }
+
+  /// Spends points and creates the coupon in ONE all-or-nothing transaction.
+  /// Returns the coupon code on success. Throws an Exception with a
+  /// customer-friendly message on failure.
+  Future<String> _redeemPromo(String promoId) async {
+    final db = FirebaseFirestore.instance;
+    final customerRef = db.collection('customers').doc(widget.customerId);
+    final promoRef = db.collection('promos').doc(promoId);
+
+    // The coupon code doubles as the redemption document id (see rules #32).
+    final code = _generateRedemptionCode();
+    final redemptionRef = db.collection('redemptions').doc(code);
+
+    await db.runTransaction((tx) async {
+      // 1. Read the current truth INSIDE the transaction.
+      final customerSnap = await tx.get(customerRef);
+      final promoSnap = await tx.get(promoRef);
+
+      if (!customerSnap.exists) {
+        throw Exception('Your account could not be found. Please try again.');
+      }
+      if (!promoSnap.exists) {
+        throw Exception('This reward is no longer available.');
+      }
+
+      final promo = promoSnap.data() as Map<String, dynamic>;
+      final cost = (promo['points_cost'] as num? ?? 0).toInt();
+      final discount = (promo['discount_percentage'] as num? ?? 0).toInt();
+
+      if (cost <= 0 || discount <= 0) {
+        throw Exception('This reward is no longer available.');
+      }
+      if (_isPromoExpired(promo['expiry_date'])) {
+        throw Exception('This reward has expired.');
+      }
+
+      final points = ((customerSnap.data() as Map<String, dynamic>)['points']
+      as num? ??
+          0)
+          .toInt();
+      if (points < cost) {
+        throw Exception(
+            'Not enough points. You need $cost but have $points.');
+      }
+
+      // 2. Take the points...
+      tx.update(customerRef, {'points': points - cost});
+
+      // 3. ...and save the coupon. Both writes succeed together or not at all.
+      tx.set(redemptionRef, {
+        'customerId': widget.customerId,
+        'promoId': promoId,
+        'rewardName': _rewardTitle(discount),
+        'costPoints': cost,
+        'discountPercentage': discount,
+        'code': code,
+        'status': 'active',
+        'redeemedAt': FieldValue.serverTimestamp(),
+        if (promo['expiry_date'] is String)
+          'validUntil': promo['expiry_date'],
+      });
+    });
+
+    return code;
+  }
+
+  void _showRewardsCatalog(BuildContext pageContext, int currentPoints) {
+    // Which reward is being redeemed right now (null = nothing in progress).
+    // Lives outside the builder so it survives rebuilds of the sheet.
+    String? redeemingId;
+    // Last redeem error, shown inside the sheet (a SnackBar would hide behind it).
+    String? errorMessage;
 
     showModalBottomSheet(
-      context: context,
+      context: pageContext,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      builder: (context) {
+      builder: (sheetContext) {
         return StatefulBuilder(
-          builder: (context, setModalState) {
-            final isDark = Theme.of(context).brightness == Brightness.dark;
+          builder: (sheetContext, setModalState) {
+            final isDark = Theme.of(sheetContext).brightness == Brightness.dark;
+
+            // Runs when the customer taps REDEEM on a card.
+            Future<void> onRedeem(_CatalogReward reward) async {
+              // Spending points can't be undone, so confirm first.
+              final confirmed = await showDialog<bool>(
+                context: sheetContext,
+                builder: (dialogContext) => AlertDialog(
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(20)),
+                  title: const Text('Confirm Redemption'),
+                  content: Text(
+                      'Spend ${reward.cost} points on "${reward.name}"?'),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(dialogContext, false),
+                      child: const Text('CANCEL'),
+                    ),
+                    ElevatedButton(
+                      onPressed: () => Navigator.pop(dialogContext, true),
+                      style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFFF59E0B)),
+                      child: const Text('REDEEM',
+                          style: TextStyle(color: Colors.white)),
+                    ),
+                  ],
+                ),
+              );
+              if (confirmed != true) return;
+              if (!sheetContext.mounted) return;
+
+              setModalState(() {
+                redeemingId = reward.id;
+                errorMessage = null;
+              });
+
+              try {
+                final code = await _redeemPromo(reward.id);
+
+                // Success: close the sheet, then show the coupon from the
+                // PAGE's context (the sheet's context is gone after the pop).
+                if (sheetContext.mounted) Navigator.pop(sheetContext);
+                if (mounted) {
+                  _showRedemptionSuccessDialog(pageContext, reward.name, code);
+                }
+              } catch (e) {
+                debugPrint('Redeem failed: $e');
+                if (sheetContext.mounted) {
+                  setModalState(() {
+                    redeemingId = null;
+                    errorMessage =
+                        e.toString().replaceFirst('Exception: ', '');
+                  });
+                }
+              }
+            }
+
             return Container(
-              height: MediaQuery.of(context).size.height * 0.75,
+              height: MediaQuery.of(sheetContext).size.height * 0.75,
               decoration: BoxDecoration(
                 color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
                 borderRadius:
@@ -899,149 +1054,193 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
                   ),
                   const SizedBox(height: 8),
                   const Text(
-                    'Redeem your accumulated Bloom Points for premium vouchers and flower bouquet add-ons.',
+                    'Redeem your accumulated Bloom Points for discount vouchers on your next bouquet.',
                     style: TextStyle(color: Colors.grey, fontSize: 13),
                   ),
                   const SizedBox(height: 16),
+
+                  // Red message box when a redemption fails
+                  if (errorMessage != null)
+                    Container(
+                      width: double.infinity,
+                      margin: const EdgeInsets.only(bottom: 12),
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.redAccent.withOpacity(0.1),
+                        borderRadius: BorderRadius.circular(12),
+                        border:
+                        Border.all(color: Colors.redAccent.withOpacity(0.3)),
+                      ),
+                      child: Text(
+                        errorMessage!,
+                        style: const TextStyle(
+                            color: Colors.redAccent,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600),
+                      ),
+                    ),
+
                   Expanded(
-                    child: ListView.builder(
-                      itemCount: rewards.length,
-                      itemBuilder: (context, index) {
-                        final reward = rewards[index];
-                        final cost = reward['points'] as int;
-                        final name = reward['name'] as String;
-                        final desc = reward['desc'] as String;
-                        final icon = reward['icon'] as IconData;
-                        final canRedeem = currentPoints >= cost;
+                    // Live list: when staff add, edit, or delete a promo on
+                    // the web, this list updates by itself.
+                    child: StreamBuilder<QuerySnapshot>(
+                      stream: FirebaseFirestore.instance
+                          .collection('promos')
+                          .where('points_cost', isGreaterThan: 0)
+                          .snapshots(),
+                      builder: (context, snapshot) {
+                        if (snapshot.connectionState ==
+                            ConnectionState.waiting &&
+                            !snapshot.hasData) {
+                          return const Center(
+                              child: CircularProgressIndicator(
+                                  color: Color(0xFFF59E0B)));
+                        }
+                        if (snapshot.hasError) {
+                          return Center(
+                            child: Text(
+                              'Could not load rewards.\n${snapshot.error}',
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(
+                                  color: Colors.grey, fontSize: 12),
+                            ),
+                          );
+                        }
 
-                        return Card(
-                          margin: const EdgeInsets.only(bottom: 12),
-                          elevation: 0,
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(16),
-                            side: BorderSide(
+                        final rewards =
+                        _rewardsFromDocs(snapshot.data?.docs ?? []);
+
+                        if (rewards.isEmpty) {
+                          return const Center(
+                            child: Text(
+                              'No rewards available right now.\nCheck back soon!',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(color: Colors.grey),
+                            ),
+                          );
+                        }
+
+                        return ListView.builder(
+                          itemCount: rewards.length,
+                          itemBuilder: (context, index) {
+                            final reward = rewards[index];
+                            final canRedeem = currentPoints >= reward.cost;
+                            final isBusy = redeemingId == reward.id;
+
+                            return Card(
+                              margin: const EdgeInsets.only(bottom: 12),
+                              elevation: 0,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(16),
+                                side: BorderSide(
+                                  color: isDark
+                                      ? Colors.grey[800]!
+                                      : Colors.grey[200]!,
+                                  width: 1,
+                                ),
+                              ),
                               color: isDark
-                                  ? Colors.grey[800]!
-                                  : Colors.grey[200]!,
-                              width: 1,
-                            ),
-                          ),
-                          color: isDark
-                              ? const Color(0xFF2A2A2A)
-                              : Colors.grey[50]!,
-                          child: Padding(
-                            padding: const EdgeInsets.all(16.0),
-                            child: Row(
-                              children: [
-                                Container(
-                                  padding: const EdgeInsets.all(12),
-                                  decoration: BoxDecoration(
-                                    color: canRedeem
-                                        ? const Color(0xFFF59E0B)
-                                        .withOpacity(0.1)
-                                        : Colors.grey.withOpacity(0.1),
-                                    shape: BoxShape.circle,
-                                  ),
-                                  child: Icon(icon,
-                                      color: canRedeem
-                                          ? const Color(0xFFF59E0B)
-                                          : Colors.grey,
-                                      size: 24),
-                                ),
-                                const SizedBox(width: 16),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                    CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        name,
-                                        style: TextStyle(
-                                          fontWeight: FontWeight.bold,
-                                          fontSize: 14,
-                                          color: isDark
-                                              ? Colors.white
-                                              : Colors.black87,
-                                        ),
+                                  ? const Color(0xFF2A2A2A)
+                                  : Colors.grey[50]!,
+                              child: Padding(
+                                padding: const EdgeInsets.all(16.0),
+                                child: Row(
+                                  children: [
+                                    Container(
+                                      padding: const EdgeInsets.all(12),
+                                      decoration: BoxDecoration(
+                                        color: canRedeem
+                                            ? const Color(0xFFF59E0B)
+                                            .withOpacity(0.1)
+                                            : Colors.grey.withOpacity(0.1),
+                                        shape: BoxShape.circle,
                                       ),
-                                      const SizedBox(height: 4),
-                                      Text(
-                                        desc,
-                                        style: TextStyle(
-                                            fontSize: 11,
-                                            color: Colors.grey[600]),
-                                      ),
-                                      const SizedBox(height: 8),
-                                      Text(
-                                        '$cost Points Required',
-                                        style: TextStyle(
-                                          fontSize: 12,
+                                      child: Icon(Icons.local_activity_outlined,
                                           color: canRedeem
-                                              ? const Color(0xFF7B79F2)
+                                              ? const Color(0xFFF59E0B)
                                               : Colors.grey,
-                                          fontWeight: FontWeight.w700,
+                                          size: 24),
+                                    ),
+                                    const SizedBox(width: 16),
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            reward.name,
+                                            style: TextStyle(
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 14,
+                                              color: isDark
+                                                  ? Colors.white
+                                                  : Colors.black87,
+                                            ),
+                                          ),
+                                          const SizedBox(height: 4),
+                                          Text(
+                                            reward.desc,
+                                            style: TextStyle(
+                                                fontSize: 11,
+                                                color: Colors.grey[600]),
+                                          ),
+                                          const SizedBox(height: 8),
+                                          Text(
+                                            '${reward.cost} Points Required',
+                                            style: TextStyle(
+                                              fontSize: 12,
+                                              color: canRedeem
+                                                  ? const Color(0xFF7B79F2)
+                                                  : Colors.grey,
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                    const SizedBox(width: 12),
+                                    ElevatedButton(
+                                      // Disabled when too expensive OR while
+                                      // any redemption is already running.
+                                      onPressed:
+                                      (!canRedeem || redeemingId != null)
+                                          ? null
+                                          : () => onRedeem(reward),
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor:
+                                        const Color(0xFFF59E0B),
+                                        disabledBackgroundColor:
+                                        Colors.grey[300],
+                                        padding: const EdgeInsets.symmetric(
+                                            horizontal: 16, vertical: 8),
+                                        shape: RoundedRectangleBorder(
+                                            borderRadius:
+                                            BorderRadius.circular(12)),
+                                        elevation: 0,
+                                      ),
+                                      child: isBusy
+                                          ? const SizedBox(
+                                          width: 14,
+                                          height: 14,
+                                          child: CircularProgressIndicator(
+                                              strokeWidth: 2,
+                                              color: Colors.white))
+                                          : Text(
+                                        'REDEEM',
+                                        style: TextStyle(
+                                          color: canRedeem
+                                              ? Colors.white
+                                              : Colors.grey[600],
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.bold,
                                         ),
                                       ),
-                                    ],
-                                  ),
-                                ),
-                                const SizedBox(width: 12),
-                                ElevatedButton(
-                                  onPressed: !canRedeem
-                                      ? null
-                                      : () async {
-                                    await FirebaseFirestore.instance
-                                        .collection('customers')
-                                        .doc(widget.customerId)
-                                        .update({
-                                      'points':
-                                      FieldValue.increment(-cost)
-                                    });
-
-                                    final code =
-                                        'BLOOM-${name.split(" ").last.toUpperCase()}-${DateTime.now().millisecondsSinceEpoch.toString().substring(8)}';
-                                    await FirebaseFirestore.instance
-                                        .collection('redemptions')
-                                        .add({
-                                      'customerId': widget.customerId,
-                                      'rewardName': name,
-                                      'costPoints': cost,
-                                      'redeemedAt':
-                                      FieldValue.serverTimestamp(),
-                                      'code': code,
-                                      'status': 'active',
-                                    });
-
-                                    if (context.mounted) {
-                                      Navigator.pop(context);
-                                      _showRedemptionSuccessDialog(
-                                          context, name, code);
-                                    }
-                                  },
-                                  style: ElevatedButton.styleFrom(
-                                    backgroundColor: const Color(0xFFF59E0B),
-                                    disabledBackgroundColor: Colors.grey[300],
-                                    padding: const EdgeInsets.symmetric(
-                                        horizontal: 16, vertical: 8),
-                                    shape: RoundedRectangleBorder(
-                                        borderRadius:
-                                        BorderRadius.circular(12)),
-                                    elevation: 0,
-                                  ),
-                                  child: Text(
-                                    'REDEEM',
-                                    style: TextStyle(
-                                      color: canRedeem
-                                          ? Colors.white
-                                          : Colors.grey[600],
-                                      fontSize: 11,
-                                      fontWeight: FontWeight.bold,
                                     ),
-                                  ),
+                                  ],
                                 ),
-                              ],
-                            ),
-                          ),
+                              ),
+                            );
+                          },
                         );
                       },
                     ),
@@ -1116,7 +1315,7 @@ class _CustomerProfilePageState extends State<CustomerProfilePage> {
               ),
               const SizedBox(height: 16),
               const Text(
-                'Present this code at the florist counter to claim your reward.',
+                'Screenshot or copy this code, then present it at the florist counter to claim your reward.',
                 style: TextStyle(color: Colors.grey, fontSize: 11),
                 textAlign: TextAlign.center,
               ),

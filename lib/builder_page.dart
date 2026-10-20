@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart'; // reads every branch's inventory
 import 'package:url_launcher/url_launcher.dart';
 import 'package:model_viewer_plus/model_viewer_plus.dart';
 import 'package:camera/camera.dart';
@@ -11,6 +12,18 @@ import 'payment_service.dart';
 import 'delivery_details_page.dart';
 import 'auth_page.dart';
 
+// ---------------------------------------------------------------------------
+// BLOOMINOUS AR PALETTE
+// One place for every colour on this screen. The rose tones are taken from the
+// wrapper paper itself, so the panels and the bouquet look like one family.
+// ---------------------------------------------------------------------------
+const Color _kAmber = Color(0xFFF59E0B); // brand amber (buttons, accents)
+const Color _kAmberDeep = Color(0xFFD97706); // prices, selected text
+const Color _kRose = Color(0xFF9E5460); // same family as the wrapper paper
+const Color _kRoseDeep = Color(0xFF5A2A32); // dark text on light backgrounds
+const Color _kBlush = Color(0xFFFFF1F3); // soft petal pink
+const Color _kCharcoal = Color(0xFF4A5C66); // left sidebar
+
 class BuilderPage extends StatefulWidget {
   const BuilderPage({super.key});
 
@@ -20,19 +33,47 @@ class BuilderPage extends StatefulWidget {
 
 class _BuilderPageState extends State<BuilderPage> {
   final List<Map<String, dynamic>> _selectedItems = [];
-  final TextEditingController _aiController = TextEditingController();
+
+  // The search box above the flower list (was the unused "AI generator" box).
+  final TextEditingController _searchController = TextEditingController();
+  String _searchQuery = '';
+
   CameraController? _cameraController;
   List<CameraDescription>? _cameras;
   bool _isCameraInitialized = false;
   String _paymentMethod = 'paymongo';
   bool _isMenuOpen = true;
   bool _showPanel = true;
-  bool _isAISectionMinimized = false;
+  bool _isSearchMinimized = false;
   bool _isFlowersMinimized = false;
   bool _isSummaryMinimized = true;
   bool _isArEnabled = true; // Added AR Toggle state
   bool _showWrapper = true; // Added showWrapper state variable
   String? _manualModelSelection;
+
+  // The flower list. Built once in initState (and rebuilt by the Retry button),
+  // so the StreamBuilder does not open a brand-new Firestore listener on every redraw.
+  late Stream<List<Map<String, dynamic>>> _inventoryStream;
+
+  // -------------------------------------------------------------------------
+  // OPTIONAL 3D WRAPPER
+  // Today the wrapper is drawn by Flutter code (the two painter classes at the
+  // bottom of this file). If you ever get real .glb wrapper models, put the
+  // asset paths here and the painters are replaced automatically:
+  //   _wrapperBackModel  = the paper BEHIND the flowers
+  //   _wrapperFrontModel = the collar, skirt and ribbon IN FRONT of the flowers
+  // Leave both null to keep the drawn wrapper.
+  // -------------------------------------------------------------------------
+  final String? _wrapperBackModel = null; // e.g. 'assets/models/wrapper_back.glb'
+  final String? _wrapperFrontModel = null; // e.g. 'assets/models/wrapper_front.glb'
+
+  // -------------------------------------------------------------------------
+  // FLOWER LAYOUT TUNING (all numbers are in the 320 x 440 bouquet space)
+  // -------------------------------------------------------------------------
+  static const double _flowerBoxW = 350.0; // a flower's viewer box at scale 1.0
+  static const double _flowerBoxH = 311.6; // (380 * 0.82, same crop as before)
+  static const double _stemBaseX = 160.0; // middle of the bouquet
+  static const double _headFromTop = 0.25; // flower head sits 25% below the box top
 
   final Map<String, String> _modelMapping = {
     'Red Rose': 'assets/models/Rose.glb',
@@ -161,7 +202,94 @@ class _BuilderPageState extends State<BuilderPage> {
   void initState() {
     super.initState();
     InventoryData.seedInventoryIfEmpty();
+    _inventoryStream = _buildInventoryStream();
     _initializeCamera();
+  }
+
+  // "Red Rose", " red  rose " and "RED ROSE" all count as the same product.
+  String _normalizeName(String name) =>
+      name.trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
+
+  bool _isHttpUrl(dynamic value) =>
+      value is String &&
+          (value.trim().startsWith('http://') || value.trim().startsWith('https://'));
+
+  // The flower list for the builder.
+  //   1. It listens to the inventory of EVERY branch (branches/*/inventory).
+  //   2. Same product name = ONE row. The row from the branch the customer is
+  //      browsing wins; a product that only another branch has still appears.
+  //   3. If the winning row has no 3D model but another branch's copy does,
+  //      the model link is borrowed, so the AR preview can show it.
+  // Errors are NOT swallowed here: the StreamBuilder shows them on screen.
+  Stream<List<Map<String, dynamic>>> _buildInventoryStream() {
+    final String selected = InventoryData.selectedBranchId ?? 'main_branch';
+    final String currentBranch = selected == 'all' ? 'main_branch' : selected;
+
+    return FirebaseFirestore.instance
+        .collectionGroup('inventory')
+        .snapshots()
+        .map((snapshot) {
+      final Map<String, Map<String, dynamic>> rowByName = {};
+      final Map<String, String> modelByName = {};
+
+      for (final doc in snapshot.docs) {
+        final Map<String, dynamic> data = doc.data();
+        if (data['isDeleted'] == true || data['status'] == 'archived') continue;
+
+        final String name = (data['name'] ?? '').toString().trim();
+        if (name.isEmpty) continue;
+
+        // Only real branch products: branches/{branchId}/inventory/{docId}
+        final List<String> parts = doc.reference.path.split('/');
+        if (parts.length != 4 || parts[0] != 'branches') continue;
+        final String branchId = parts[1];
+        final bool isCurrentBranch = branchId == currentBranch;
+
+        final String key = _normalizeName(name);
+        final Map<String, dynamic> row = <String, dynamic>{
+          ...data,
+          'id': doc.id,
+          'branchId': branchId,
+        };
+
+        final Map<String, dynamic>? existing = rowByName[key];
+        if (existing == null ||
+            (isCurrentBranch && existing['branchId'] != currentBranch)) {
+          rowByName[key] = row;
+        }
+
+        if (_isHttpUrl(data['model'])) {
+          if (!modelByName.containsKey(key) || isCurrentBranch) {
+            modelByName[key] = (data['model'] as String).trim();
+          }
+        }
+      }
+
+      final List<Map<String, dynamic>> rows = rowByName.entries.map((entry) {
+        final Map<String, dynamic> row = entry.value;
+        if (!_isHttpUrl(row['model']) && modelByName[entry.key] != null) {
+          row['model'] = modelByName[entry.key];
+        }
+        return row;
+      }).toList();
+
+      rows.sort((a, b) => (a['name'] ?? '')
+          .toString()
+          .toLowerCase()
+          .compareTo((b['name'] ?? '').toString().toLowerCase()));
+      return rows;
+    });
+  }
+
+  // "Retry" button: open a fresh listener.
+  void _retryInventory() {
+    setState(() => _inventoryStream = _buildInventoryStream());
+  }
+
+  // Empties the search box and shows the full flower list again.
+  void _clearSearch() {
+    _searchController.clear();
+    setState(() => _searchQuery = '');
   }
 
   Future<void> _initializeCamera() async {
@@ -188,249 +316,246 @@ class _BuilderPageState extends State<BuilderPage> {
   @override
   void dispose() {
     _cameraController?.dispose();
-    _aiController.dispose();
+    _searchController.dispose();
     super.dispose();
+  }
+
+  // One wrapper layer (back or front): a 3D model if a path was given,
+  // otherwise the Flutter-drawn painter.
+  Widget _buildWrapperLayer({
+    required String? modelPath,
+    required CustomPainter painter,
+  }) {
+    if (modelPath == null) {
+      return IgnorePointer(
+        child: CustomPaint(size: const Size(320, 440), painter: painter),
+      );
+    }
+    return IgnorePointer(
+      child: SizedBox(
+        width: 320,
+        height: 440,
+        child: ModelViewer(
+          key: ValueKey('wrapper_$modelPath'),
+          src: modelPath,
+          ar: false,
+          autoRotate: false,
+          cameraControls: false,
+          disableZoom: true,
+          backgroundColor: Colors.transparent,
+          cameraOrbit: '0deg 80deg auto',
+        ),
+      ),
+    );
   }
 
   Widget _buildModelLayer() {
     if (_selectedItems.isEmpty) {
-      return Container(
-        color: _isArEnabled ? Colors.transparent : Colors.white,
-        child: Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(Icons.filter_vintage_outlined,
-                  size: 80, color: Colors.pink.withOpacity(0.2)),
-              const SizedBox(height: 16),
-              Text(
-                'YOUR BOUQUET IS EMPTY',
-                style: GoogleFonts.inter(
-                  fontSize: 14,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.pink.withOpacity(0.3),
-                  letterSpacing: 2,
-                ),
+      // Sits in the open space above the wrapper, so the wrapper stays visible.
+      return Align(
+        alignment: const Alignment(0, -0.62),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.local_florist_outlined,
+                size: 52,
+                color: _isArEnabled
+                    ? Colors.white.withOpacity(0.55)
+                    : _kRose.withOpacity(0.55)),
+            const SizedBox(height: 10),
+            Text(
+              'YOUR BOUQUET IS EMPTY',
+              style: GoogleFonts.inter(
+                fontSize: 12,
+                fontWeight: FontWeight.bold,
+                color: _isArEnabled
+                    ? Colors.white.withOpacity(0.85)
+                    : _kRose.withOpacity(0.8),
+                letterSpacing: 2,
               ),
-            ],
-          ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'Pick a flower from the list',
+              style: GoogleFonts.inter(
+                fontSize: 11,
+                color: _isArEnabled
+                    ? Colors.white.withOpacity(0.6)
+                    : _kRose.withOpacity(0.6),
+              ),
+            ),
+          ],
         ),
       );
     }
 
-    // Group items to limit visual clutter but represent quantity
-    Map<String, Map<String, dynamic>> itemPrototypes = {};
-    Map<String, int> itemGroups = {};
-    for (var item in _selectedItems) {
+    // ---- 1. Group the picked items: one prototype per flower name ----
+    final Map<String, Map<String, dynamic>> itemPrototypes = {};
+    final Map<String, int> itemGroups = {};
+    for (final item in _selectedItems) {
       final name = item['name'] as String;
       itemGroups[name] = (itemGroups[name] ?? 0) + 1;
-      if (!itemPrototypes.containsKey(name)) {
-        itemPrototypes[name] = item;
-      }
+      itemPrototypes.putIfAbsent(name, () => item);
     }
 
-    // Flatten to a list of specific visual items to arrange
+    // ---- 2. Flatten to one entry per visible flower ----
     List<Map<String, dynamic>> visualItems = [];
     itemGroups.forEach((name, count) {
       final proto = itemPrototypes[name]!;
-      String src =
-      (proto['model'] != null && proto['model'].toString().isNotEmpty)
-          ? proto['model']
+      final String src =
+      (proto['model'] != null && proto['model'].toString().trim().isNotEmpty)
+          ? proto['model'].toString().trim()
           : (_modelMapping[name] ?? _modelMapping['Red Rose']!);
 
       // Limit to 6 visible of each flower type to avoid heavy resources but show fullness
-      int limit = count > 6 ? 6 : count;
+      final int limit = count > 6 ? 6 : count;
       for (int i = 0; i < limit; i++) {
-        visualItems.add({
-          'name': name,
-          'src': src,
-          'index': i,
-        });
+        visualItems.add({'name': name, 'src': src, 'index': i});
       }
     });
 
-    // Sort or cap visualItems if too many (max 18 flowers across all varieties)
+    // Every flower is a WebView, so cap the total (max 18 across all varieties)
     if (visualItems.length > 18) {
       visualItems = visualItems.sublist(0, 18);
     }
 
-    int totalM = visualItems.length;
-    List<Widget> layers = [];
+    // ---- 3. Decide HOW MANY ROWS and HOW BIG each flower is ----
+    // Few flowers = one row of big heads. Many flowers = 2-3 rows of smaller
+    // heads, so the wrapper opening never turns into a pile of overlapping blobs.
+    final int total = visualItems.length;
+    final int rows = total <= 5 ? 1 : (total <= 11 ? 2 : 3);
+    final double baseScale = total <= 1
+        ? 0.80
+        : total <= 3
+        ? 0.72
+        : total <= 5
+        ? 0.64
+        : total <= 11
+        ? 0.56
+        : 0.48;
 
-    // Base convergence point for stalks/stems in local 320x440 coordinates
-    const double xBase = 160.0;
-    const double yBase = 315.0;
-
-    for (int i = 0; i < totalM; i++) {
+    // ---- 4. Work out where each flower HEAD goes ----
+    final List<Map<String, dynamic>> placed = [];
+    for (int i = 0; i < total; i++) {
       final item = visualItems[i];
-      final name = item['name'] as String;
-      final src = item['src'] as String;
-      final itemIndex = item['index'] as int;
 
-      double r = 140.0;
-      double theta = 0.0;
+      // Deal flowers out like cards: row 0, row 1, row 2, row 0, row 1 ...
+      final int row = i % rows;
+      final int indexInRow = i ~/ rows;
+      final int rowCount = (total - row + rows - 1) ~/ rows;
 
-      if (totalM == 1) {
-        theta = 0.0;
-        r = 120.0;
-      } else if (totalM <= 5) {
-        // Single row, compact fan arrangement
-        double maxTheta = 0.18; // Tightly grouped to stay snugly inside wrapper
-        theta = -maxTheta + i * ((maxTheta * 2) / (totalM - 1));
-        // Parabolic arc lowering outer flowers on left and right sides
-        double normalized = (i / (totalM - 1)) * 2 - 1; // -1.0 to 1.0
-        r = 145.0 - 32.0 * (normalized * normalized);
+      // norm: -1 = far left of its row, 0 = middle, +1 = far right
+      final double norm =
+      rowCount == 1 ? 0.0 : (indexInRow / (rowCount - 1)) * 2 - 1;
+
+      double spreadX; // how far left/right this row's heads reach
+      double headY; // how high this row's heads sit (smaller = higher)
+      double rowSize; // back row is taller, front row is shorter
+      if (rows == 1) {
+        spreadX = math.min(84.0, 26.0 * (total - 1));
+        headY = 122.0;
+        rowSize = 1.0;
+      } else if (row == 0) {
+        spreadX = 88.0; // back row
+        headY = 104.0;
+        rowSize = 1.08;
+      } else if (row == 1) {
+        spreadX = 60.0; // middle row
+        headY = 124.0;
+        rowSize = 1.0;
       } else {
-        // Multi-tier layered arrangement: categorizing into Back, Middle, and Front rows
-        int numBack = (totalM * 0.35).ceil();
-        int numMiddle = (totalM * 0.35).ceil();
-        int numFront = totalM - numBack - numMiddle;
-
-        if (numFront <= 0) numFront = 1;
-
-        int row;
-        int indexInRow;
-        int rowCount;
-
-        if (i < numBack) {
-          row = 0; // Back row
-          indexInRow = i;
-          rowCount = numBack;
-        } else if (i < numBack + numMiddle) {
-          row = 1; // Middle row
-          indexInRow = i - numBack;
-          rowCount = numMiddle;
-        } else {
-          row = 2; // Front row
-          indexInRow = i - numBack - numMiddle;
-          rowCount = numFront;
-        }
-
-        // Configuration per row to create depths with compact spacing
-        double spreadFactor;
-        double baseR;
-
-        if (row == 0) {
-          // Back row: Tallest flowers, gentle fanning
-          spreadFactor = 0.22;
-          baseR = 158.0;
-        } else if (row == 1) {
-          // Middle row: Medium depth, compact fanning
-          spreadFactor = 0.14;
-          baseR = 132.0;
-        } else {
-          // Front row: Lowest depth, snug fanning inside tissue collar
-          spreadFactor = 0.07;
-          baseR = 105.0;
-        }
-
-        // Calculate angle of placement within the row
-        if (rowCount == 1) {
-          theta = 0.0;
-        } else {
-          theta = -spreadFactor +
-              indexInRow * ((spreadFactor * 2) / (rowCount - 1));
-        }
-
-        // Parabolic contour for each tier lowering outer side flowers
-        double normInRow = rowCount == 1
-            ? 0.0
-            : (indexInRow / (rowCount - 1)) * 2 - 1; // -1.0 to 1.0
-        r = baseR - 25.0 * (normInRow * normInRow);
+        spreadX = 32.0; // front row
+        headY = 144.0;
+        rowSize = 0.9;
       }
 
-      // Compute precise local center positions (X, Y)
-      double x = xBase + r * math.sin(theta);
-      double y = yBase - r * math.cos(theta);
+      placed.add({
+        'name': item['name'],
+        'src': item['src'],
+        'index': item['index'],
+        'row': row,
+        'norm': norm,
+        'scale': baseScale * rowSize * (1 - 0.08 * norm * norm),
+        'hx': _stemBaseX + norm * spreadX,
+        // outer flowers sit a little lower, like a natural dome
+        'hy': headY + 16.0 * norm * norm,
+        // outer flowers lean outward; their stems tilt toward the middle
+        'theta': norm * 0.30,
+      });
+    }
 
-      // Model-specific sizing, offsets, and camera orbit/target configurations
-      // to ensure all flower heads look consistently large, proportional, and have their stems completely hidden inside the wrappers!
-      double modelWidth = 350.0;
-      double modelHeight = 380.0;
-      double heightFactor =
-      0.78; // generous default crop factor to show top portions cleanly without cutting heads
+    // Paint order: back row first, and inside a row the outer flowers first,
+    // so the middle flower of the front row ends up on top.
+    placed.sort((a, b) {
+      final int byRow = (a['row'] as int).compareTo(b['row'] as int);
+      if (byRow != 0) return byRow;
+      return (b['norm'] as double).abs().compareTo((a['norm'] as double).abs());
+    });
+
+    // ---- 5. Turn every placement into a positioned 3D viewer ----
+    final List<Widget> layers = [];
+    for (int k = 0; k < placed.length; k++) {
+      final p = placed[k];
+      final String name = p['name'] as String;
+      final String src = p['src'] as String;
+      final int itemIndex = p['index'] as int;
+      final double scale = p['scale'] as double;
+      final double hx = p['hx'] as double;
+      final double hy = p['hy'] as double;
+      final double theta = p['theta'] as double;
+
+      final double w = _flowerBoxW * scale;
+      final double h = _flowerBoxH * scale;
+
+      // Camera framing per flower type (unchanged from before)
       String cameraTarget = "0m 0.08m 0m";
       String cameraOrbit = "0deg 75deg 90%";
-      double verticalOffset = 0.0;
-
       final String nameLower = name.toLowerCase();
-      final bool isRose = src.contains('Rose') || nameLower.contains('rose');
-      final bool isSunflower =
-          src.contains('Sunflower') || nameLower.contains('sunflower');
-      final bool isLily = src.contains('lily') || nameLower.contains('lily');
-      final bool isTulip = src.contains('tulip') || nameLower.contains('tulip');
-
-      if (isRose) {
-        modelWidth = 350.0;
-        modelHeight = 380.0;
-        heightFactor = 0.82;
-        cameraTarget =
-        "0m 0.09m 0m"; // Center focus on flower head & upper stem
-        cameraOrbit =
-        "0deg 75deg 88%"; // Balanced fit so bloom is fully visible at top
-        verticalOffset =
-        18.0; // Lower flower down so head is fully shown & roots buried in wrapper
-      } else if (isSunflower) {
-        modelWidth = 350.0;
-        modelHeight = 380.0;
-        heightFactor = 0.82;
+      if (src.contains('Rose') || nameLower.contains('rose')) {
         cameraTarget = "0m 0.09m 0m";
         cameraOrbit = "0deg 75deg 88%";
-        verticalOffset = 15.0; // Tucked gracefully inside the wrapper
-      } else if (isLily) {
-        modelWidth = 350.0;
-        modelHeight = 380.0;
-        heightFactor = 0.82;
+      } else if (src.contains('Sunflower') || nameLower.contains('sunflower')) {
+        cameraTarget = "0m 0.09m 0m";
+        cameraOrbit = "0deg 75deg 88%";
+      } else if (src.contains('lily') || nameLower.contains('lily')) {
         cameraTarget = "0m 0.10m 0m";
         cameraOrbit = "0deg 75deg 90%";
-        verticalOffset = 18.0;
-      } else if (isTulip) {
-        modelWidth = 350.0;
-        modelHeight = 380.0;
-        heightFactor = 0.82;
+      } else if (src.contains('tulip') || nameLower.contains('tulip')) {
         cameraTarget = "0m 0.09m 0m";
         cameraOrbit = "0deg 75deg 88%";
-        verticalOffset = 18.0;
-      } else {
-        // flowerBear items (e.g. teddy bear, heart, chivas, etc.)
-        modelWidth = 350.0;
-        modelHeight = 380.0;
-        heightFactor = 0.82;
-        cameraTarget = "0m 0.08m 0m";
-        cameraOrbit = "0deg 75deg 90%";
-        verticalOffset = 15.0;
       }
 
-      double cropHeight = modelHeight * heightFactor;
-      double left = x - (modelWidth / 2);
-      double top = y - (cropHeight / 2) + verticalOffset;
+      // The LAST layer is painted on top, so it is the one the finger can touch.
+      final bool isLead = k == placed.length - 1;
 
       layers.add(
         Positioned(
-          width: modelWidth,
-          height: cropHeight,
-          left: left,
-          top: top,
+          left: hx - w / 2,
+          top: hy - h * _headFromTop,
+          width: w,
+          height: h,
           child: Transform.rotate(
-            angle:
-            theta, // tilt the model matching its exact direction from stem base
-            child: SizedBox(
-              width: modelWidth,
-              height: cropHeight,
-              child: ModelViewer(
-                key:
-                ValueKey('model_${name}_${itemIndex}_${i}_${_isArEnabled}'),
-                src: src,
-                ar: i == 0 && _isArEnabled,
-                autoRotate: i == 0,
-                cameraControls: i == 0,
-                backgroundColor: Colors.transparent,
-                arModes: const ['scene-viewer', 'webxr', 'quick-look'],
-                cameraOrbit: cameraOrbit,
-                cameraTarget: cameraTarget,
-                fieldOfView: "auto",
-                loading: Loading.eager,
-              ),
+            angle: theta,
+            // Tilt around the flower HEAD, so the head stays where we put it
+            alignment: Alignment(0, _headFromTop * 2 - 1),
+            child: ModelViewer(
+              key: ValueKey('model_${name}_${itemIndex}_${k}_${_isArEnabled}_$src'),
+              src: src,
+              ar: isLead && _isArEnabled,
+              autoRotate: isLead,
+              cameraControls: isLead,
+              // Spin-only: no pinch zoom, no panning, no tilting up/down.
+              disableZoom: true,
+              disablePan: true,
+              disableTap: true,
+              minCameraOrbit: 'auto 75deg auto',
+              maxCameraOrbit: 'auto 75deg auto',
+              backgroundColor: Colors.transparent,
+              arModes: const ['scene-viewer', 'webxr', 'quick-look'],
+              cameraOrbit: cameraOrbit,
+              cameraTarget: cameraTarget,
+              fieldOfView: "auto",
+              loading: Loading.eager,
             ),
           ),
         ),
@@ -445,21 +570,23 @@ class _BuilderPageState extends State<BuilderPage> {
 
   // Aesthetic Glassmorphism Base for all floating panels
   Widget _buildAestheticPanel({required Widget child}) {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
+    // Always a LIGHT glass panel, even when the phone is in dark mode,
+    // so the dark-rose text on top of it is always readable.
     return ClipRRect(
       borderRadius: BorderRadius.circular(24),
       child: BackdropFilter(
         filter: ImageFilter.blur(sigmaX: 15, sigmaY: 15),
         child: Container(
-          padding: const EdgeInsets.all(16),
+          padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(
-            color: isDark ? Colors.black.withOpacity(0.4) : Colors.white.withOpacity(0.65),
+            color: Colors.white.withOpacity(0.82),
             borderRadius: BorderRadius.circular(24),
-            border: Border.all(
-                color: isDark ? Colors.white.withOpacity(0.1) : Colors.white.withOpacity(0.5),
-                width: 1.5),
+            border: Border.all(color: _kRose.withOpacity(0.18), width: 1.2),
             boxShadow: [
-              BoxShadow(color: Colors.black.withOpacity(0.1), blurRadius: 15)
+              BoxShadow(
+                  color: _kRoseDeep.withOpacity(0.12),
+                  blurRadius: 18,
+                  offset: const Offset(0, 6))
             ],
           ),
           child: child,
@@ -468,102 +595,149 @@ class _BuilderPageState extends State<BuilderPage> {
     );
   }
 
+  // The screen behind the bouquet: the camera when it works, otherwise a soft
+  // studio gradient (never a flat black or white screen).
+  Widget _buildBackdrop() {
+    if (_isArEnabled && _isCameraInitialized && _cameraController != null) {
+      return Positioned.fill(
+        child: FittedBox(
+          fit: BoxFit.cover,
+          child: SizedBox(
+            width: MediaQuery.of(context).size.width,
+            height: MediaQuery.of(context).size.width /
+                _cameraController!.value.aspectRatio,
+            child: CameraPreview(_cameraController!),
+          ),
+        ),
+      );
+    }
+
+    return Positioned.fill(
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: _isArEnabled
+                ? const [Color(0xFF2B1A20), Color(0xFF4A2A33), Color(0xFF1E1216)]
+                : const [Color(0xFFFFF7F2), Color(0xFFFFE4E8), _kBlush],
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final bool narrow = MediaQuery.of(context).size.width < 600;
+    final Color topBarText = _isArEnabled ? Colors.white70 : _kRoseDeep;
+
     return Scaffold(
+      // The keyboard slides OVER the screen instead of squashing the panels.
+      resizeToAvoidBottomInset: false,
       body: Stack(
         children: [
-          // 0. CAMERA BACKGROUND
-          if (_isArEnabled && _isCameraInitialized && _cameraController != null)
-            Positioned.fill(
+          // 0. BACKDROP (camera, or a soft gradient when there is no camera)
+          _buildBackdrop(),
+
+          // 1. BOUQUET SYSTEM: wrapper + flowers. The wrapper is ALWAYS drawn
+          // (even with an empty bouquet) so it never "disappears".
+          Positioned(
+            top: 100, // Pushed down to clear the top logo bar
+            bottom: 100, // Pushed up to clear AR toggles
+            left: 16,
+            // Dynamically adjust right padding based on device width and panel state to prevent squishing
+            right: _isMenuOpen && _showPanel ? (narrow ? 300 : 370) : 16,
+            child: Center(
+              // The FittedBox ensures the 320x440 wrapper AND the 3D models
+              // scale up or down proportionally on ANY screen size
               child: FittedBox(
-                fit: BoxFit.cover,
+                fit: BoxFit.contain,
                 child: SizedBox(
-                  width: MediaQuery.of(context).size.width,
-                  height: MediaQuery.of(context).size.width /
-                      _cameraController!.value.aspectRatio,
-                  child: CameraPreview(_cameraController!),
-                ),
-              ),
-            ),
-
-          // 1. AR VIEW BACKGROUND (Empty state) or BOUQUET SYSTEM (Aligned models + wrapper overlay)
-          if (_selectedItems.isEmpty)
-            _buildModelLayer()
-          else
-            Positioned(
-              top: 100, // Pushed down to clear the top logo bar
-              bottom: 100, // Pushed up to clear AR toggles
-              left: 16,
-              // Dynamically adjust right padding based on device width and panel state to prevent squishing
-              right: _isMenuOpen && _showPanel
-                  ? (MediaQuery.of(context).size.width < 600 ? 300 : 370)
-                  : 16,
-              child: Center(
-                // The FittedBox ensures the 320x440 wrapper AND the 3D models
-                // scale up or down proportionally on ANY screen size
-                child: FittedBox(
-                  fit: BoxFit.contain,
-                  child: SizedBox(
-                    width: 320,
-                    height: 440,
-                    child: Stack(
-                      clipBehavior: Clip.none,
-                      children: [
-                        // Layer 1: Back Wrapper (Outer fanning sheets)
-                        if (_showWrapper)
-                          IgnorePointer(
-                            child: CustomPaint(
-                              size: const Size(320, 440),
-                              painter: BouquetBackWrapperPainter(),
+                  width: 320,
+                  height: 440,
+                  child: Stack(
+                    clipBehavior: Clip.none,
+                    children: [
+                      // Soft ground shadow so the bouquet looks like it stands
+                      Positioned(
+                        left: 70,
+                        right: 70,
+                        top: 396,
+                        height: 14,
+                        child: IgnorePointer(
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                              color: Colors.black.withOpacity(0.10),
+                              borderRadius: const BorderRadius.all(
+                                  Radius.elliptical(90, 12)),
+                              boxShadow: [
+                                BoxShadow(
+                                    color: Colors.black.withOpacity(0.28),
+                                    blurRadius: 18,
+                                    spreadRadius: 2),
+                              ],
                             ),
                           ),
+                        ),
+                      ),
 
-                        // Layer 2: Harmonized flowers (nested inside)
-                        _buildModelLayer(),
+                      // Layer 1: Back Wrapper (Outer fanning sheets)
+                      if (_showWrapper)
+                        _buildWrapperLayer(
+                          modelPath: _wrapperBackModel,
+                          painter: BouquetBackWrapperPainter(),
+                        ),
 
-                        // Layer 3: Front Wrapper (White collar tissue, handle, crimson bow)
-                        if (_showWrapper)
-                          IgnorePointer(
-                            child: CustomPaint(
-                              size: const Size(320, 440),
-                              painter: BouquetFrontWrapperPainter(),
-                            ),
-                          ),
-                      ],
-                    ),
+                      // Layer 2: Harmonized flowers (or the "empty" hint)
+                      _buildModelLayer(),
+
+                      // Layer 3: Front Wrapper (White collar tissue, handle, crimson bow)
+                      if (_showWrapper)
+                        _buildWrapperLayer(
+                          modelPath: _wrapperFrontModel,
+                          painter: BouquetFrontWrapperPainter(),
+                        ),
+                    ],
                   ),
                 ),
               ),
             ),
+          ),
 
           // 2. LOGO TOP BAR
           Positioned(
             top: 30,
-            left: MediaQuery.of(context).size.width < 600 ? 70 : 100,
+            left: narrow ? 70 : 100,
             right: 0,
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 10),
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Text(
-                    'bloomypro',
-                    style: GoogleFonts.cormorantGaramond(
-                      fontSize: 24,
-                      fontWeight: FontWeight.bold,
-                      color: const Color(0xFFF59E0B),
-                    ),
+                  Row(
+                    children: [
+                      const Icon(Icons.local_florist, color: _kAmber, size: 22),
+                      const SizedBox(width: 6),
+                      Text(
+                        'bloomypro',
+                        style: GoogleFonts.cormorantGaramond(
+                          fontSize: 26,
+                          fontWeight: FontWeight.bold,
+                          color: _kAmber,
+                        ),
+                      ),
+                    ],
                   ),
-                  if (MediaQuery.of(context).size.width > 600)
+                  if (!narrow)
                     Row(
                       children: [
-                        const Icon(Icons.chat_bubble_outline,
-                            color: Colors.white70, size: 16),
+                        Icon(Icons.chat_bubble_outline,
+                            color: topBarText, size: 16),
                         const SizedBox(width: 8),
                         Text('Support',
                             style: GoogleFonts.inter(
-                                color: Colors.white70, fontSize: 11)),
+                                color: topBarText, fontSize: 11)),
                       ],
                     ),
                 ],
@@ -576,12 +750,12 @@ class _BuilderPageState extends State<BuilderPage> {
             left: 0,
             top: 0,
             bottom: 0,
-            width: MediaQuery.of(context).size.width < 600 ? 50 : 70,
+            width: narrow ? 50 : 70,
             child: ClipRRect(
               child: BackdropFilter(
                 filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
                 child: Container(
-                  color: const Color(0xFF4A5C66).withOpacity(0.6), // Glassmorphism sidebar
+                  color: _kCharcoal.withOpacity(0.6), // Glassmorphism sidebar
                   child: Column(
                     children: [
                       const SizedBox(height: 30),
@@ -604,13 +778,13 @@ class _BuilderPageState extends State<BuilderPage> {
           // 4. FLOATING PANELS (Right Side - More compact on mobile)
           if (_isMenuOpen && _showPanel)
             Positioned(
-              right: MediaQuery.of(context).size.width < 600 ? 10 : 20,
+              right: narrow ? 10 : 20,
               top: 80,
               bottom: 20,
-              width: MediaQuery.of(context).size.width < 600 ? 280 : 350,
+              width: narrow ? 280 : 350,
               child: Column(
                 children: [
-                  _buildAISection(),
+                  _buildSearchSection(),
                   const SizedBox(height: 12),
                   Expanded(child: _buildFlowerSelection()),
                   const SizedBox(height: 12),
@@ -622,7 +796,7 @@ class _BuilderPageState extends State<BuilderPage> {
           // 5. AR TRACKING INDICATOR & TOGGLE
           Positioned(
             bottom: 120,
-            left: MediaQuery.of(context).size.width < 600 ? 60 : 90,
+            left: narrow ? 60 : 90,
             child: GestureDetector(
               onTap: () => setState(() => _isArEnabled = !_isArEnabled),
               child: ClipRRect(
@@ -634,12 +808,12 @@ class _BuilderPageState extends State<BuilderPage> {
                     decoration: BoxDecoration(
                       color: _isArEnabled
                           ? Colors.black.withOpacity(0.4)
-                          : Colors.white.withOpacity(0.4),
+                          : Colors.white.withOpacity(0.7),
                       borderRadius: BorderRadius.circular(25),
                       border: Border.all(
                           color: _isArEnabled
                               ? Colors.greenAccent
-                              : Colors.white.withOpacity(0.5),
+                              : _kRose.withOpacity(0.4),
                           width: 1.5),
                     ),
                     child: Row(
@@ -650,7 +824,7 @@ class _BuilderPageState extends State<BuilderPage> {
                           decoration: BoxDecoration(
                             color: _isArEnabled
                                 ? const Color(0xFF4CAF50)
-                                : Colors.grey[800],
+                                : Colors.grey[600],
                             shape: BoxShape.circle,
                             boxShadow: [
                               if (_isArEnabled)
@@ -665,7 +839,7 @@ class _BuilderPageState extends State<BuilderPage> {
                         Text(
                           _isArEnabled ? 'AR IS ON' : 'AR IS OFF',
                           style: TextStyle(
-                              color: _isArEnabled ? Colors.white : Colors.black87,
+                              color: _isArEnabled ? Colors.white : _kRoseDeep,
                               fontSize: 12,
                               fontWeight: FontWeight.bold,
                               letterSpacing: 0.5),
@@ -681,29 +855,29 @@ class _BuilderPageState extends State<BuilderPage> {
           // 6. TOGGLE INTERFACE BUTTON
           Positioned(
             bottom: 180,
-            right: _isMenuOpen && _showPanel ? (MediaQuery.of(context).size.width < 600 ? 300 : 380) : 20,
+            right: _isMenuOpen && _showPanel ? (narrow ? 300 : 380) : 20,
             child: FloatingActionButton.small(
               heroTag: 'toggle_ui',
               backgroundColor: Colors.white.withOpacity(0.95),
+              tooltip: 'Show / hide the panels',
               onPressed: () => setState(() => _showPanel = !_showPanel),
               child: Icon(_showPanel ? Icons.visibility_off : Icons.visibility,
-                  color: const Color(0xFFF59E0B)),
+                  color: _kAmber),
             ),
           ),
 
           // 7. TOGGLE WRAPPER COVER BUTTON
           Positioned(
             bottom: 240,
-            right: _isMenuOpen && _showPanel ? (MediaQuery.of(context).size.width < 600 ? 300 : 380) : 20,
+            right: _isMenuOpen && _showPanel ? (narrow ? 300 : 380) : 20,
             child: FloatingActionButton.small(
               heroTag: 'toggle_wrapper',
-              backgroundColor: _showWrapper
-                  ? const Color(0xFFF59E0B)
-                  : Colors.white.withOpacity(0.95),
+              backgroundColor:
+              _showWrapper ? _kAmber : Colors.white.withOpacity(0.95),
               onPressed: () => setState(() => _showWrapper = !_showWrapper),
               tooltip: 'Toggle Wrapper Cover',
               child: Icon(Icons.layers_clear_outlined,
-                  color: _showWrapper ? Colors.white : const Color(0xFFF59E0B)),
+                  color: _showWrapper ? Colors.white : _kAmber),
             ),
           ),
         ],
@@ -722,14 +896,14 @@ class _BuilderPageState extends State<BuilderPage> {
         constraints: const BoxConstraints(),
         style: isAction
             ? IconButton.styleFrom(
-            padding: const EdgeInsets.all(8),
-            backgroundColor: const Color(0xFFF59E0B))
+            padding: const EdgeInsets.all(8), backgroundColor: _kAmber)
             : null,
       ),
     );
   }
 
-  Widget _buildAISection() {
+  // The search box. Typing here filters the flower list below it live.
+  Widget _buildSearchSection() {
     return _buildAestheticPanel(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -737,35 +911,63 @@ class _BuilderPageState extends State<BuilderPage> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(
-                'AI GENERATOR',
-                style: GoogleFonts.inter(
-                    fontSize: 10,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.purple[700],
-                    letterSpacing: 1.5),
+              Row(
+                children: [
+                  const Icon(Icons.search, size: 14, color: _kAmberDeep),
+                  const SizedBox(width: 6),
+                  Text(
+                    'FIND A FLOWER',
+                    style: GoogleFonts.inter(
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
+                        color: _kRoseDeep,
+                        letterSpacing: 1.5),
+                  ),
+                ],
               ),
               IconButton(
-                icon: Icon(_isAISectionMinimized ? Icons.add : Icons.remove, size: 14),
+                icon: Icon(_isSearchMinimized ? Icons.add : Icons.remove,
+                    size: 14, color: _kRoseDeep),
                 padding: EdgeInsets.zero,
                 constraints: const BoxConstraints(),
-                onPressed: () => setState(() => _isAISectionMinimized = !_isAISectionMinimized),
+                onPressed: () =>
+                    setState(() => _isSearchMinimized = !_isSearchMinimized),
               ),
             ],
           ),
-          if (!_isAISectionMinimized) ...[
-            const SizedBox(height: 8),
+          if (!_isSearchMinimized) ...[
+            const SizedBox(height: 10),
             TextField(
-              controller: _aiController,
-              style: const TextStyle(fontSize: 13),
+              controller: _searchController,
+              textInputAction: TextInputAction.search,
+              style: GoogleFonts.inter(fontSize: 13, color: _kRoseDeep),
+              cursorColor: _kAmberDeep,
+              onChanged: (value) => setState(() => _searchQuery = value),
               decoration: InputDecoration(
-                hintText: 'e.g., Neon Rose',
-                hintStyle: const TextStyle(color: Colors.grey, fontSize: 13),
+                isDense: true,
+                hintText: 'Search roses, tulips, bears...',
+                hintStyle: GoogleFonts.inter(
+                    color: _kRose.withOpacity(0.55), fontSize: 13),
+                prefixIcon:
+                const Icon(Icons.search, size: 18, color: _kAmberDeep),
+                suffixIcon: _searchQuery.isEmpty
+                    ? null
+                    : IconButton(
+                  icon: const Icon(Icons.close, size: 16, color: _kRose),
+                  onPressed: _clearSearch,
+                ),
                 filled: true,
-                fillColor: Colors.white.withOpacity(0.5),
-                contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+                fillColor: Colors.white.withOpacity(0.75),
+                contentPadding:
+                const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(14),
+                  borderSide: BorderSide(color: _kRose.withOpacity(0.25)),
+                ),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(14),
+                  borderSide: const BorderSide(color: _kAmber, width: 1.5),
+                ),
               ),
             ),
           ],
@@ -782,111 +984,97 @@ class _BuilderPageState extends State<BuilderPage> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(
-                'FLOWERS',
-                style: GoogleFonts.inter(
-                    fontSize: 10,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.black87,
-                    letterSpacing: 1.2),
+              Row(
+                children: [
+                  const Icon(Icons.local_florist, size: 14, color: _kAmberDeep),
+                  const SizedBox(width: 6),
+                  Text(
+                    'FLOWERS',
+                    style: GoogleFonts.inter(
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
+                        color: _kRoseDeep,
+                        letterSpacing: 1.5),
+                  ),
+                ],
               ),
               IconButton(
-                icon: Icon(_isFlowersMinimized ? Icons.add : Icons.remove, size: 14),
+                icon: Icon(_isFlowersMinimized ? Icons.add : Icons.remove,
+                    size: 14, color: _kRoseDeep),
                 padding: EdgeInsets.zero,
                 constraints: const BoxConstraints(),
-                onPressed: () => setState(() => _isFlowersMinimized = !_isFlowersMinimized),
+                onPressed: () =>
+                    setState(() => _isFlowersMinimized = !_isFlowersMinimized),
               ),
             ],
           ),
           if (!_isFlowersMinimized) ...[
-            const SizedBox(height: 12),
+            const SizedBox(height: 10),
             Expanded(
               child: StreamBuilder<List<Map<String, dynamic>>>(
-                stream: InventoryData.inventoryStream(),
+                stream: _inventoryStream,
                 builder: (context, snapshot) {
-                  if (snapshot.connectionState == ConnectionState.waiting) {
-                    return const Center(child: CircularProgressIndicator(strokeWidth: 2));
+                  // A real problem (no permission, no network...) is shown, not hidden.
+                  if (snapshot.hasError) {
+                    return _buildListMessage(
+                      icon: Icons.error_outline,
+                      iconColor: Colors.redAccent,
+                      title: 'Could not load flowers',
+                      detail: '${snapshot.error}',
+                      buttonLabel: 'Retry',
+                      onPressed: _retryInventory,
+                    );
                   }
 
-                  final flowers = snapshot.data ?? [];
+                  if (!snapshot.hasData) {
+                    return const Center(
+                        child: CircularProgressIndicator(
+                            strokeWidth: 2, color: _kAmber));
+                  }
+
+                  final List<Map<String, dynamic>> allFlowers =
+                      snapshot.data ?? [];
+
+                  if (allFlowers.isEmpty) {
+                    return _buildListMessage(
+                      icon: Icons.inventory_2_outlined,
+                      iconColor: Colors.grey,
+                      title: 'No flowers found',
+                      detail:
+                      'Checked every branch (browsing: ${InventoryData.selectedBranchId ?? 'main_branch'})',
+                      buttonLabel: 'Retry',
+                      onPressed: _retryInventory,
+                    );
+                  }
+
+                  // ---- SEARCH FILTER: keep flowers whose name or category matches ----
+                  final String query = _searchQuery.trim().toLowerCase();
+                  final List<Map<String, dynamic>> flowers = query.isEmpty
+                      ? allFlowers
+                      : allFlowers.where((f) {
+                    final String name =
+                    (f['name'] ?? '').toString().toLowerCase();
+                    final String category =
+                    (f['category'] ?? '').toString().toLowerCase();
+                    return name.contains(query) || category.contains(query);
+                  }).toList();
 
                   if (flowers.isEmpty) {
-                    return Center(
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          const Icon(Icons.inventory_2_outlined, color: Colors.grey, size: 24),
-                          const SizedBox(height: 8),
-                          Text('No flowers found',
-                              style: GoogleFonts.inter(fontSize: 12, color: Colors.grey)),
-                        ],
-                      ),
+                    return _buildListMessage(
+                      icon: Icons.search_off,
+                      iconColor: _kRose,
+                      title: 'No match for "${_searchQuery.trim()}"',
+                      detail: 'Try another name, or clear the search.',
+                      buttonLabel: 'Clear search',
+                      onPressed: _clearSearch,
                     );
                   }
 
                   return ListView.builder(
                     itemCount: flowers.length,
                     padding: EdgeInsets.zero,
-                    itemBuilder: (context, index) {
-                      final f = flowers[index];
-                      final count = _getItemCount(f['id']);
-                      return Padding(
-                        padding: const EdgeInsets.only(bottom: 12),
-                        child: Row(
-                          children: [
-                            Container(
-                              width: 40,
-                              height: 40,
-                              decoration: BoxDecoration(
-                                color: Colors.white.withOpacity(0.5),
-                                borderRadius: BorderRadius.circular(8),
-                                image: DecorationImage(
-                                    image: NetworkImage(f['image'] ?? ''), fit: BoxFit.cover),
-                              ),
-                            ),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              child: GestureDetector(
-                                onTap: () => setState(() => _manualModelSelection = f['name']),
-                                child: Container(
-                                  color: Colors.transparent,
-                                  child: Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    children: [
-                                      Text(f['name'],
-                                          style: GoogleFonts.inter(
-                                              fontWeight: FontWeight.bold,
-                                              fontSize: 12,
-                                              color: _manualModelSelection == f['name']
-                                                  ? const Color(0xFFD97706)
-                                                  : Colors.black87),
-                                          maxLines: 1),
-                                      Text('₱${f['price']}',
-                                          style: GoogleFonts.cormorantGaramond(
-                                              color: const Color(0xFFD97706),
-                                              fontWeight: FontWeight.bold,
-                                              fontSize: 13)),
-                                    ],
-                                  ),
-                                ),
-                              ),
-                            ),
-                            Row(
-                              children: [
-                                _buildCounterBtn(Icons.remove, () => _removeItem(f['id'])),
-                                Padding(
-                                  padding: const EdgeInsets.symmetric(horizontal: 8),
-                                  child: Text('$count',
-                                      style: const TextStyle(
-                                          fontWeight: FontWeight.bold, fontSize: 12)),
-                                ),
-                                _buildCounterBtn(Icons.add, () => _addItem(f)),
-                              ],
-                            ),
-                          ],
-                        ),
-                      );
-                    },
+                    itemBuilder: (context, index) =>
+                        _buildFlowerRow(flowers[index]),
                   );
                 },
               ),
@@ -897,39 +1085,216 @@ class _BuilderPageState extends State<BuilderPage> {
     );
   }
 
+  // One small centered message (error / empty / no match) with a button.
+  Widget _buildListMessage({
+    required IconData icon,
+    required Color iconColor,
+    required String title,
+    required String detail,
+    required String buttonLabel,
+    required VoidCallback onPressed,
+  }) {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(icon, color: iconColor, size: 26),
+          const SizedBox(height: 8),
+          Text(title,
+              textAlign: TextAlign.center,
+              style: GoogleFonts.inter(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: _kRoseDeep)),
+          const SizedBox(height: 4),
+          Text(detail,
+              textAlign: TextAlign.center,
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
+              style: GoogleFonts.inter(fontSize: 10, color: Colors.grey[600])),
+          TextButton(
+            onPressed: onPressed,
+            child: Text(buttonLabel,
+                style: const TextStyle(fontSize: 12, color: _kAmberDeep)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // One flower card in the list: photo, name, price, and the - / + counter.
+  Widget _buildFlowerRow(Map<String, dynamic> f) {
+    final int count = _getItemCount(f['id']);
+    final bool selected = count > 0;
+    final bool hasModel = _isHttpUrl(f['model']);
+    // A missing/blank photo must not crash the row.
+    final String imageUrl =
+    _isHttpUrl(f['image']) ? (f['image'] as String).trim() : '';
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        // Solid light colours: text stays readable in light AND dark mode.
+        color: selected ? const Color(0xFFFFF4D6) : Colors.white.withOpacity(0.92),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+            color: selected ? _kAmber : _kRose.withOpacity(0.15),
+            width: selected ? 1.6 : 1),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 44,
+            height: 44,
+            decoration: BoxDecoration(
+              color: _kBlush,
+              borderRadius: BorderRadius.circular(12),
+              image: imageUrl.isEmpty
+                  ? null
+                  : DecorationImage(
+                  image: NetworkImage(imageUrl), fit: BoxFit.cover),
+            ),
+            child: imageUrl.isEmpty
+                ? const Icon(Icons.local_florist, color: _kRose, size: 20)
+                : null,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: GestureDetector(
+              onTap: () => setState(() => _manualModelSelection = f['name']),
+              child: Container(
+                color: Colors.transparent,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Flexible(
+                          child: Text(
+                            '${f['name']}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: GoogleFonts.inter(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 12,
+                                color: _manualModelSelection == f['name']
+                                    ? _kAmberDeep
+                                    : _kRoseDeep),
+                          ),
+                        ),
+                        // Small cube icon = this product has its own 3D model
+                        if (hasModel) ...[
+                          const SizedBox(width: 4),
+                          const Icon(Icons.view_in_ar,
+                              size: 12, color: _kAmberDeep),
+                        ],
+                      ],
+                    ),
+                    Text('₱${f['price']}',
+                        style: GoogleFonts.cormorantGaramond(
+                            color: _kAmberDeep,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 15)),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          Row(
+            children: [
+              _buildCounterBtn(Icons.remove, () => _removeItem(f['id'])),
+              // Quantity badge: turns solid amber with a white number once picked
+              Container(
+                constraints: const BoxConstraints(minWidth: 26),
+                margin: const EdgeInsets.symmetric(horizontal: 6),
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                decoration: BoxDecoration(
+                  color: selected ? _kAmberDeep : Colors.white,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: _kAmber.withOpacity(0.5)),
+                ),
+                child: Text('$count',
+                    textAlign: TextAlign.center,
+                    style: GoogleFonts.inter(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 12,
+                        color: selected ? Colors.white : _kRoseDeep)),
+              ),
+              _buildCounterBtn(Icons.add, () => _addItem(f), filled: true),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildSummaryPanel() {
+    final int stems = _selectedItems.length;
     return _buildAestheticPanel(
       child: Column(
         children: [
           Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              const Text('Total', style: TextStyle(color: Colors.black87, fontSize: 14)),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('TOTAL',
+                        style: GoogleFonts.inter(
+                            fontSize: 10,
+                            fontWeight: FontWeight.bold,
+                            color: _kRoseDeep,
+                            letterSpacing: 1.5)),
+                    Text(
+                        stems == 0
+                            ? 'Your bouquet is empty'
+                            : '$stems ${stems == 1 ? 'stem' : 'stems'} + wrapping',
+                        style: GoogleFonts.inter(
+                            fontSize: 10, color: Colors.grey[600])),
+                  ],
+                ),
+              ),
               Text('₱${_total.toStringAsFixed(2)}',
-                  style: GoogleFonts.inter(fontWeight: FontWeight.bold, fontSize: 15)),
+                  style: GoogleFonts.cormorantGaramond(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 22,
+                      color: _kAmberDeep)),
               IconButton(
-                icon: Icon(_isSummaryMinimized ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
-                    size: 18),
-                padding: EdgeInsets.zero,
+                icon: Icon(
+                    _isSummaryMinimized
+                        ? Icons.keyboard_arrow_up
+                        : Icons.keyboard_arrow_down,
+                    size: 18,
+                    color: _kRoseDeep),
+                padding: const EdgeInsets.only(left: 6),
                 constraints: const BoxConstraints(),
-                onPressed: () => setState(() => _isSummaryMinimized = !_isSummaryMinimized),
+                onPressed: () =>
+                    setState(() => _isSummaryMinimized = !_isSummaryMinimized),
               ),
             ],
           ),
           if (!_isSummaryMinimized) ...[
-            const SizedBox(height: 12),
+            const SizedBox(height: 10),
+            _buildSummaryLine('Flowers', _subtotal),
+            _buildSummaryLine('Wrapping', _customizationCost),
+            const SizedBox(height: 10),
             SizedBox(
               width: double.infinity,
-              child: ElevatedButton(
+              child: ElevatedButton.icon(
                 onPressed: _initiateCheckout,
+                icon: const Icon(Icons.shopping_bag_outlined, size: 18),
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFFF59E0B),
+                  backgroundColor: _kAmber,
                   foregroundColor: Colors.white,
+                  elevation: 0,
                   padding: const EdgeInsets.symmetric(vertical: 12),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14)),
                 ),
-                child: const Text('CHECKOUT',
-                    style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.1)),
+                label: const Text('CHECKOUT',
+                    style: TextStyle(
+                        fontWeight: FontWeight.bold, letterSpacing: 1.1)),
               ),
             ),
           ],
@@ -938,16 +1303,38 @@ class _BuilderPageState extends State<BuilderPage> {
     );
   }
 
-  Widget _buildCounterBtn(IconData icon, VoidCallback onTap) {
+  // "Flowers ........ ₱500.00" style line inside the summary.
+  Widget _buildSummaryLine(String label, double amount) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label,
+              style: GoogleFonts.inter(fontSize: 11, color: Colors.grey[700])),
+          Text('₱${amount.toStringAsFixed(2)}',
+              style: GoogleFonts.inter(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: _kRoseDeep)),
+        ],
+      ),
+    );
+  }
+
+  // Round-cornered +/- button. filled = the amber "add" button.
+  Widget _buildCounterBtn(IconData icon, VoidCallback onTap,
+      {bool filled = false}) {
     return GestureDetector(
       onTap: onTap,
       child: Container(
-        padding: const EdgeInsets.all(4),
+        padding: const EdgeInsets.all(5),
         decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.8),
-          borderRadius: BorderRadius.circular(8),
+          color: filled ? _kAmber : Colors.white.withOpacity(0.85),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: _kAmber.withOpacity(0.5)),
         ),
-        child: Icon(icon, size: 16, color: const Color(0xFFF59E0B)),
+        child: Icon(icon, size: 16, color: filled ? Colors.white : _kAmber),
       ),
     );
   }

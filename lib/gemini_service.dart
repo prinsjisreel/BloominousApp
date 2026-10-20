@@ -2,9 +2,11 @@ import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:google_generative_ai/google_generative_ai.dart';
+import 'package:image/image.dart' as img;
 import 'api_keys.dart';
 
 class GeminiImageException implements Exception {
@@ -12,6 +14,57 @@ class GeminiImageException implements Exception {
   GeminiImageException(this.message);
   @override
   String toString() => message;
+}
+
+// ---------------------------------------------------------------------
+// Stability AI inpainting helpers
+// ---------------------------------------------------------------------
+
+/// The area (as fractions of the photo's width/height) where Stability is
+/// ALLOWED to paint the arrangement: centre, lower half - where a vase on
+/// a table usually sits. Everything outside this box is kept exactly as
+/// the customer photographed it. Roughly matches where the instant
+/// composite preview draws its vase, so preview and AI result line up.
+const double _inpaintBoxLeft = 0.30;
+const double _inpaintBoxRight = 0.70;
+const double _inpaintBoxTop = 0.28;
+const double _inpaintBoxBottom = 0.85;
+
+/// Prepares the two files Stability's inpaint endpoint needs:
+///   'image' - the room photo, upright and shrunk to a 1536px long edge
+///             (keeps uploads small and inside Stability's size limits)
+///   'mask'  - same size, black everywhere (keep) except one white box
+///             (paint here)
+/// Runs in a background isolate via compute(), so it MUST be top-level.
+Map<String, Uint8List> _prepareStabilityInpaintFiles(Uint8List raw) {
+  final decoded = img.decodeImage(raw);
+  if (decoded == null) {
+    throw const FormatException('Unreadable room photo');
+  }
+  var photo = img.bakeOrientation(decoded);
+
+  const longEdge = 1536;
+  if (math.max(photo.width, photo.height) > longEdge) {
+    photo = photo.width >= photo.height
+        ? img.copyResize(photo, width: longEdge)
+        : img.copyResize(photo, height: longEdge);
+  }
+
+  // A brand-new image starts fully black = "keep everything".
+  final mask = img.Image(width: photo.width, height: photo.height);
+  img.fillRect(
+    mask,
+    x1: (photo.width * _inpaintBoxLeft).round(),
+    y1: (photo.height * _inpaintBoxTop).round(),
+    x2: (photo.width * _inpaintBoxRight).round(),
+    y2: (photo.height * _inpaintBoxBottom).round(),
+    color: img.ColorRgb8(255, 255, 255), // white = "paint flowers here"
+  );
+
+  return {
+    'image': Uint8List.fromList(img.encodeJpg(photo, quality: 90)),
+    'mask': Uint8List.fromList(img.encodePng(mask)),
+  };
 }
 
 class GeminiService {
@@ -448,6 +501,9 @@ class GeminiService {
     canvas.drawCircle(center, radius * 0.12, stamenPaint);
   }
 
+  /// Gemini image editing. `userInstruction` is the SHORT customer brief
+  /// (occasion, style, colors) - this method wraps it in its own expert
+  /// florist instructions, so callers must NOT pass a full prompt here.
   static Future<Uint8List> editUserPhotoWithGemini({
     required Uint8List userRoomBytes,
     required String userInstruction,
@@ -531,56 +587,77 @@ class GeminiService {
         'Response had no image part (model may have replied text-only): ${response.body}');
   }
 
+  /// Stability AI fallback - INPAINTING, not image-to-image.
+  ///
+  /// The old version used generate/sd3 in image-to-image mode at
+  /// strength 0.85, which repaints ~85% of the WHOLE photo - that is why
+  /// rooms came back unrecognizable. Inpainting only repaints the white
+  /// area of a mask; every other pixel of the customer's room is kept.
+  ///
+  /// `userInstruction` is the SHORT customer brief (occasion, style,
+  /// colors). Stable Diffusion reads prompts as a DESCRIPTION of the
+  /// finished picture, not as instructions, so the brief is turned into
+  /// a short description here, and exclusions go into negative_prompt.
   static Future<Uint8List> editUserPhotoWithStabilityAI({
     required Uint8List userRoomBytes,
     required String userInstruction,
     required String flowerType,
     required String potType,
   }) async {
-    // FIXED: this used to also compare against a specific hardcoded key
-    // string -- meant as a guard against an old leaked key ever being
-    // reused, but it meant ANY key that happened to match that exact
-    // string (including a legitimately rotated new key, if it happened
-    // to be the same value) would get blocked. The check now relies
-    // purely on ApiKeys.stabilityApiKey being non-empty -- no key text of
-    // any kind lives in this file; it's sourced from api_keys.dart alone,
-    // the same pattern payment_service.dart already uses for its secret.
     if (_stabilityApiKey.isEmpty) {
       throw GeminiImageException(
           'Stability AI key not set -- add ApiKeys.stabilityApiKey in api_keys.dart.');
     }
 
+    // 1) Upright + shrunk photo, and the matching mask (background isolate).
+    Map<String, Uint8List> files;
+    try {
+      files = await compute(_prepareStabilityInpaintFiles, userRoomBytes);
+    } catch (e) {
+      throw GeminiImageException('Could not prepare the photo for Stability AI: $e');
+    }
+
+    // 2) Descriptive prompt (what the painted box should SHOW).
+    final brief = userInstruction.replaceAll(RegExp(r'\s+'), ' ').trim();
+    final description = [
+      'a fresh floral arrangement of $flowerType in a $potType standing on a table',
+      if (brief.isNotEmpty) brief,
+      'photorealistic, natural soft lighting, realistic contact shadow, detailed petals, sharp focus',
+    ].join(', ');
+
+    const negativePrompt =
+        'people, person, hands, text, letters, watermark, logo, blurry, distorted, deformed, '
+        'cartoon, illustration, painting, extra furniture, duplicate vase, floating objects';
+
+    // 3) Inpaint request.
     final uri =
-    Uri.parse('https://api.stability.ai/v2beta/stable-image/generate/sd3');
+    Uri.parse('https://api.stability.ai/v2beta/stable-image/edit/inpaint');
 
     final request = http.MultipartRequest('POST', uri);
     request.headers['Authorization'] = 'Bearer $_stabilityApiKey';
     request.headers['Accept'] = 'image/*';
 
-    request.fields['mode'] = 'image-to-image';
-    request.fields['strength'] = '0.85';
-    request.fields['model'] = 'sd3.5-large';
+    request.fields['prompt'] = description;
+    request.fields['negative_prompt'] = negativePrompt;
+    request.fields['grow_mask'] = '15'; // softens the box edge so it blends in
     request.fields['output_format'] = 'png';
-    request.fields['prompt'] =
-    "PRIMARY BRIEF from the customer -- this determines WHAT decor to add and HOW MUCH: '$userInstruction'. "
-        "Treat $flowerType in a $potType as a fallback style/palette suggestion only, used if the brief above doesn't already specify the flowers, colors, or containers -- the brief always takes priority. "
-        "Scale the amount and placement of floral decor to genuinely suit the space and occasion shown in the photo. A single small accent arrangement is NOT enough for a large hall, stage, or aisle meant for a wedding or full event -- add multiple arrangements, an entrance/stage backdrop, or aisle decor so the space reads as actually styled for the occasion. For a small tabletop or intimate setting, one well-placed arrangement is enough. "
-        "Infer the most natural surfaces from what's visible in the photo -- do not assume only one item is needed. Keep the existing room or venue, furniture, lighting, and camera angle unchanged -- only add the floral decor, blended in with realistic scale and shadows.";
 
     request.files.add(
-      http.MultipartFile.fromBytes('image', userRoomBytes,
-          filename: 'room.jpg'),
+      http.MultipartFile.fromBytes('image', files['image']!, filename: 'room.jpg'),
+    );
+    request.files.add(
+      http.MultipartFile.fromBytes('mask', files['mask']!, filename: 'mask.png'),
     );
 
     http.StreamedResponse streamed;
     try {
-      streamed = await request.send();
+      streamed = await request.send().timeout(const Duration(seconds: 90));
     } catch (e) {
       throw GeminiImageException('Stability AI network request failed: $e');
     }
 
     final response = await http.Response.fromStream(streamed);
-    print("Stability AI HTTP ${response.statusCode}");
+    print("Stability AI inpaint HTTP ${response.statusCode}");
 
     if (response.statusCode != 200) {
       throw GeminiImageException(

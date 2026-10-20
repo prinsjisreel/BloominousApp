@@ -74,17 +74,9 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
     }
   }
 
-  // RESTORED + FIXED: reads/writes 'employees/{uid}' now, not the old
-  // 'users/{uid}' -- deviceHashes and branchId both moved to the
-  // 'employees' collection when that split happened, so pointing this
-  // at 'users' meant it was always reading/writing a field that
-  // wasn't there anymore. Also switched .update() to
-  // .set(..., merge: true): .update() THROWS if the document doesn't
-  // exist at all, which is exactly what was silently killing this for
-  // the super-admin account (no 'employees' doc existed for it until
-  // the fix in InventoryData.getUserData() below). .set() with merge
-  // creates the doc if missing and merges into it if present -- safe
-  // either way, for every role.
+  // Reads/writes 'employees/{uid}' (deviceHashes and branchId live there).
+  // .set(..., merge: true) creates the doc if missing and merges if present,
+  // so it never throws the way .update() does on a missing document.
   Future<void> _checkAndTrackDevice(String uid, String displayEmail) async {
     try {
       final deviceHash = await _securityService.getDeviceHash();
@@ -166,8 +158,6 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
 
         await _securityService.resetAttempts();
 
-        // RESTORED: device-tracking call site, now targeting the
-        // fixed function above.
         await _checkAndTrackDevice(
             credential.user!.uid, emailController.text.trim());
 
@@ -190,15 +180,16 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
         }
       }
     } on FirebaseAuthException catch (e) {
-      setState(() => isLoading = false);
       await _securityService.recordFailedAttempt();
       await _isRateLimited();
 
       String message = 'Login failed';
       if (e.code == 'user-not-found') {
         message = 'No user found for that email.';
-      } else if (e.code == 'wrong-password') {
-        message = 'Wrong password provided.';
+      } else if (e.code == 'wrong-password' || e.code == 'invalid-credential') {
+        // Newer Firebase versions report a bad email/password combo as
+        // 'invalid-credential' instead of 'wrong-password'.
+        message = 'Incorrect email or password.';
       } else if (e.code == 'invalid-email') {
         message = 'The email address is badly formatted.';
       } else if (e.code == 'user-disabled') {
@@ -223,13 +214,14 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
         );
       }
     } catch (e) {
-      setState(() => isLoading = false);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('An unexpected error occurred: $e')),
         );
       }
     } finally {
+      // Runs after success, failure, or the early return above, so the
+      // spinner can never get stuck.
       if (mounted) setState(() => isLoading = false);
     }
   }
@@ -269,6 +261,17 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
 
   @override
   Widget build(BuildContext context) {
+    // --- Responsive sizing ---------------------------------------------
+    // Read the screen once, then scale spacing and sizes from it so small
+    // phones (and phones with the keyboard open) never run out of room.
+    final size = MediaQuery.of(context).size;
+    final bool narrow = size.width < 360;
+    final bool short = size.height < 640;
+    final double sidePadding = narrow ? 16.0 : 24.0;
+    final double cardPadding = narrow ? 18.0 : 24.0;
+    final double logoSize = (narrow || short) ? 76.0 : 100.0;
+    final double gapAfterTitle = short ? 24.0 : 40.0;
+
     return Scaffold(
       backgroundColor: const Color(0xFFFFFDF7), // Lighter Cream
       body: Container(
@@ -288,232 +291,260 @@ class _EmployeeLoginPageState extends State<EmployeeLoginPage> {
         child: SafeArea(
           child: Center(
             child: SingleChildScrollView(
-              padding: const EdgeInsets.symmetric(horizontal: 32.0),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Container(
-                    width: 100,
-                    height: 100,
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      shape: BoxShape.circle,
-                      boxShadow: [
-                        BoxShadow(
-                          color: const Color(0xFFF4B400).withOpacity(0.4),
-                          blurRadius: 30,
-                          spreadRadius: 2,
-                        )
-                      ],
-                    ),
-                    child: Padding(
-                      padding: const EdgeInsets.all(15.0),
-                      child: Image.asset(
-                        'assets/images/logo.jpg',
-                        fit: BoxFit.contain,
-                        errorBuilder: (context, error, stackTrace) =>
-                        const Icon(Icons.business_center,
-                            size: 40, color: Color(0xFFF4B400)),
+              // Dragging the page closes the keyboard instead of fighting it.
+              keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+              padding:
+              EdgeInsets.symmetric(horizontal: sidePadding, vertical: 16),
+              // On tablets/landscape, keep the form a sensible width.
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 440),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: logoSize,
+                      height: logoSize,
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        shape: BoxShape.circle,
+                        boxShadow: [
+                          BoxShadow(
+                            color: const Color(0xFFF4B400).withOpacity(0.4),
+                            blurRadius: 30,
+                            spreadRadius: 2,
+                          )
+                        ],
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.all(15.0),
+                        child: Image.asset(
+                          'assets/images/logo.jpg',
+                          fit: BoxFit.contain,
+                          errorBuilder: (context, error, stackTrace) =>
+                          const Icon(Icons.business_center,
+                              size: 40, color: Color(0xFFF4B400)),
+                        ),
                       ),
                     ),
-                  ),
-                  const SizedBox(height: 24),
-                  const Text(
-                    'ADMIN PORTAL',
-                    style: TextStyle(
-                      fontSize: 28,
-                      fontWeight: FontWeight.w900,
-                      color: Colors.white,
-                      letterSpacing: 2.0,
+                    SizedBox(height: short ? 16 : 24),
+                    // FittedBox shrinks the title only if it would not fit.
+                    FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: Text(
+                        'ADMIN PORTAL',
+                        style: TextStyle(
+                          fontSize: narrow ? 24 : 28,
+                          fontWeight: FontWeight.w900,
+                          color: Colors.white,
+                          letterSpacing: 2.0,
+                        ),
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 40),
+                    SizedBox(height: gapAfterTitle),
 
-                  Container(
-                    padding: const EdgeInsets.all(24),
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: BorderRadius.circular(24),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withOpacity(0.05),
-                          blurRadius: 20,
-                          offset: const Offset(0, 10),
-                        )
-                      ],
-                    ),
-                    child: Form(
-                      key: _formKey,
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Text(
-                            'Welcome Back',
-                            style: TextStyle(
-                              fontSize: 20,
-                              fontWeight: FontWeight.bold,
-                              color: Color(0xFF121212),
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                          Text(
-                            'Please sign in to continue to your dashboard',
-                            style: TextStyle(
-                              fontSize: 13,
-                              color: Colors.grey[600],
-                            ),
-                          ),
-                          const SizedBox(height: 32),
-                          _buildTextField(
-                            controller: emailController,
-                            label: 'Email Address',
-                            icon: Icons.alternate_email_rounded,
-                            keyboardType: TextInputType.emailAddress,
-                            validator: (value) {
-                              if (value == null || value.isEmpty)
-                                return 'Email is required';
-                              if (!RegExp(r'^[\w-\.]+@([\w-]+\.)+[\w-]{2,4}$')
-                                  .hasMatch(value)) {
-                                return 'Enter a valid email address';
-                              }
-                              return null;
-                            },
-                          ),
-                          const SizedBox(height: 20),
-                          _buildTextField(
-                            controller: passwordController,
-                            label: 'Password',
-                            icon: Icons.lock_outline_rounded,
-                            obscureText: _obscurePassword,
-                            suffixIcon: IconButton(
-                              icon: Icon(
-                                _obscurePassword
-                                    ? Icons.visibility_off_outlined
-                                    : Icons.visibility_outlined,
-                                color: Colors.grey,
-                                size: 20,
+                    Container(
+                      width: double.infinity,
+                      padding: EdgeInsets.all(cardPadding),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(24),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withOpacity(0.05),
+                            blurRadius: 20,
+                            offset: const Offset(0, 10),
+                          )
+                        ],
+                      ),
+                      child: Form(
+                        key: _formKey,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'Welcome Back',
+                              style: TextStyle(
+                                fontSize: 20,
+                                fontWeight: FontWeight.bold,
+                                color: Color(0xFF121212),
                               ),
-                              onPressed: () => setState(
-                                      () => _obscurePassword = !_obscurePassword),
                             ),
-                            validator: (value) {
-                              if (value == null || value.isEmpty)
-                                return 'Password is required';
-                              if (value.length < 6)
-                                return 'Password must be at least 6 characters';
-                              return null;
-                            },
-                          ),
+                            const SizedBox(height: 8),
+                            Text(
+                              'Please sign in to continue to your dashboard',
+                              style: TextStyle(
+                                fontSize: 13,
+                                color: Colors.grey[600],
+                              ),
+                            ),
+                            SizedBox(height: short ? 20 : 32),
+                            _buildTextField(
+                              controller: emailController,
+                              label: 'Email Address',
+                              icon: Icons.alternate_email_rounded,
+                              keyboardType: TextInputType.emailAddress,
+                              validator: (value) {
+                                if (value == null || value.isEmpty) {
+                                  return 'Email is required';
+                                }
+                                if (!RegExp(r'^[\w-\.]+@([\w-]+\.)+[\w-]{2,4}$')
+                                    .hasMatch(value)) {
+                                  return 'Enter a valid email address';
+                                }
+                                return null;
+                              },
+                            ),
+                            const SizedBox(height: 20),
+                            _buildTextField(
+                              controller: passwordController,
+                              label: 'Password',
+                              icon: Icons.lock_outline_rounded,
+                              obscureText: _obscurePassword,
+                              suffixIcon: IconButton(
+                                icon: Icon(
+                                  _obscurePassword
+                                      ? Icons.visibility_off_outlined
+                                      : Icons.visibility_outlined,
+                                  color: Colors.grey,
+                                  size: 20,
+                                ),
+                                onPressed: () => setState(
+                                        () => _obscurePassword = !_obscurePassword),
+                              ),
+                              validator: (value) {
+                                if (value == null || value.isEmpty) {
+                                  return 'Password is required';
+                                }
+                                if (value.length < 6) {
+                                  return 'Password must be at least 6 characters';
+                                }
+                                return null;
+                              },
+                            ),
 
-                          if (_superAdminLocked || _remainingLockoutSeconds > 0)
-                            Container(
+                            if (_superAdminLocked || _remainingLockoutSeconds > 0)
+                              Container(
+                                width: double.infinity,
+                                margin: const EdgeInsets.only(top: 16),
+                                padding: const EdgeInsets.all(12),
+                                decoration: BoxDecoration(
+                                  color: Colors.red.withOpacity(0.1),
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(
+                                      color: Colors.red.withOpacity(0.3)),
+                                ),
+                                child: Row(
+                                  children: [
+                                    const Icon(Icons.lock_clock,
+                                        color: Colors.redAccent),
+                                    const SizedBox(width: 12),
+                                    Expanded(
+                                      child: Text(
+                                        _superAdminLocked
+                                            ? 'Account locked. Please coordinate with a Super Admin to reset access.'
+                                            : 'Too many attempts. Please wait $_remainingLockoutSeconds seconds.',
+                                        style: const TextStyle(
+                                          color: Colors.redAccent,
+                                          fontWeight: FontWeight.bold,
+                                          fontSize: 13,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+
+                            const SizedBox(height: 12),
+
+                            // WAS a Row: on narrow phones its two halves were
+                            // wider than the card and overflowed (the
+                            // yellow/black warning stripe). A Wrap puts the
+                            // second item on its own line when there is no
+                            // room, instead of overflowing.
+                            SizedBox(
                               width: double.infinity,
-                              margin: const EdgeInsets.only(top: 16),
-                              padding: const EdgeInsets.all(12),
-                              decoration: BoxDecoration(
-                                color: Colors.red.withOpacity(0.1),
-                                borderRadius: BorderRadius.circular(12),
-                                border: Border.all(
-                                    color: Colors.red.withOpacity(0.3)),
-                              ),
-                              child: Row(
+                              child: Wrap(
+                                alignment: WrapAlignment.spaceBetween,
+                                crossAxisAlignment: WrapCrossAlignment.center,
+                                runSpacing: 4,
                                 children: [
-                                  const Icon(Icons.lock_clock,
-                                      color: Colors.redAccent),
-                                  const SizedBox(width: 12),
-                                  Expanded(
-                                    child: Text(
-                                      _superAdminLocked
-                                          ? 'Account locked. Please coordinate with a Super Admin to reset access.'
-                                          : 'Too many attempts. Please wait $_remainingLockoutSeconds seconds.',
-                                      style: const TextStyle(
-                                        color: Colors.redAccent,
+                                  Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      SizedBox(
+                                        height: 24,
+                                        width: 24,
+                                        child: Checkbox(
+                                          value: _rememberMe,
+                                          onChanged: (val) => setState(
+                                                  () => _rememberMe = val ?? false),
+                                          activeColor: const Color(0xFFF4B400),
+                                          shape: RoundedRectangleBorder(
+                                              borderRadius:
+                                              BorderRadius.circular(4)),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      const Text('Remember me',
+                                          style: TextStyle(
+                                              fontSize: 12,
+                                              color: Color(0xFF333333))),
+                                    ],
+                                  ),
+                                  TextButton(
+                                    onPressed: _forgotPassword,
+                                    child: const Text(
+                                      'Forgot Password?',
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        color: Color(0xFFF4B400),
                                         fontWeight: FontWeight.bold,
-                                        fontSize: 13,
                                       ),
                                     ),
                                   ),
                                 ],
                               ),
                             ),
-
-                          const SizedBox(height: 12),
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              Row(
-                                children: [
-                                  SizedBox(
-                                    height: 24,
-                                    width: 24,
-                                    child: Checkbox(
-                                      value: _rememberMe,
-                                      onChanged: (val) => setState(
-                                              () => _rememberMe = val ?? false),
-                                      activeColor: const Color(0xFFF4B400),
-                                      shape: RoundedRectangleBorder(
-                                          borderRadius:
-                                          BorderRadius.circular(4)),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  const Text('Remember me',
-                                      style: TextStyle(
-                                          fontSize: 12,
-                                          color: Color(0xFF333333))),
-                                ],
-                              ),
-                              TextButton(
-                                onPressed: _forgotPassword,
+                            SizedBox(height: short ? 20 : 32),
+                            if (isLoading)
+                              const Center(
+                                  child: CircularProgressIndicator(
+                                      color: Color(0xFFF4B400)))
+                            else
+                              ElevatedButton(
+                                onPressed: (_superAdminLocked ||
+                                    _remainingLockoutSeconds > 0)
+                                    ? null
+                                    : _login,
+                                style: ElevatedButton.styleFrom(
+                                  minimumSize: const Size(double.infinity, 56),
+                                  backgroundColor: const Color(0xFF121212),
+                                  foregroundColor: const Color(0xFFF4B400),
+                                  elevation: 0,
+                                  shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(16)),
+                                ),
                                 child: const Text(
-                                  'Forgot Password?',
+                                  'SIGN IN',
                                   style: TextStyle(
-                                    fontSize: 12,
-                                    color: Color(0xFFF4B400),
-                                    fontWeight: FontWeight.bold,
-                                  ),
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.w800,
+                                      letterSpacing: 1.2),
                                 ),
                               ),
-                            ],
-                          ),
-                          const SizedBox(height: 32),
-                          if (isLoading)
-                            const Center(
-                                child: CircularProgressIndicator(
-                                    color: Color(0xFFF4B400)))
-                          else
-                            ElevatedButton(
-                              onPressed: (_superAdminLocked ||
-                                  _remainingLockoutSeconds > 0)
-                                  ? null
-                                  : _login,
-                              style: ElevatedButton.styleFrom(
-                                minimumSize: const Size(double.infinity, 56),
-                                backgroundColor: const Color(0xFF121212),
-                                foregroundColor: const Color(0xFFF4B400),
-                                elevation: 0,
-                                shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(16)),
-                              ),
-                              child: const Text(
-                                'SIGN IN',
-                                style: TextStyle(
-                                    fontSize: 15,
-                                    fontWeight: FontWeight.w800,
-                                    letterSpacing: 1.2),
-                              ),
-                            ),
-                        ],
+                          ],
+                        ),
                       ),
                     ),
-                  ),
 
-                  const SizedBox(height: 40),
-                  Text(
-                    '© 2026 BloomyPro Inventory System',
-                    style: TextStyle(color: Colors.grey[400], fontSize: 10),
-                  ),
-                ],
+                    SizedBox(height: short ? 24 : 40),
+                    Text(
+                      '© 2026 BloomyPro Inventory System',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: Colors.grey[400], fontSize: 10),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),

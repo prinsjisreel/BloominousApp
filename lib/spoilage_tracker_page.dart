@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'inventory_data.dart';
@@ -22,15 +23,40 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
   double _lossAmount = 0.0;
   bool _isSaving = false;
 
+  // FIX: these used to be created INSIDE build(). Every rebuild (and tapping
+  // the Qty box rebuilds the page, because the keyboard changes the screen
+  // size) made a brand-new Firestore stream. A brand-new stream starts in the
+  // "waiting" state, so the page swapped to a loading spinner, destroyed the
+  // form, and the Qty box lost focus. Now each one is created ONCE here.
+  late final Stream<List<Map<String, dynamic>>> _spoilageStream;
+  late final Future<Map<String, dynamic>?> _branchFuture;
+  StreamSubscription<List<Map<String, dynamic>>>? _inventorySub;
+  List<Map<String, dynamic>> _products = [];
+
   @override
   void initState() {
     super.initState();
     _selectedProductId = widget.initialProductId;
-    if (_selectedProductId != null) {
-      InventoryData.inventoryStream().first.then((products) {
-        if (mounted) _calculateLoss(products);
-      });
-    }
+    _spoilageStream = InventoryData.spoilageStream();
+    _branchFuture = InventoryData.getBranchDetails(
+        InventoryData.selectedBranchId ?? 'main_branch');
+
+    // One long-lived listener keeps the latest product list in memory. The
+    // dropdown, the loss calculation and the save button all read _products
+    // instead of opening a new stream every time.
+    _inventorySub = InventoryData.inventoryStream().listen((products) {
+      if (!mounted) return;
+      setState(() => _products = products);
+      _calculateLoss();
+    });
+  }
+
+  @override
+  void dispose() {
+    _inventorySub?.cancel();
+    _quantityController.dispose();
+    _reasonController.dispose();
+    super.dispose();
   }
 
   final List<String> _reasons = [
@@ -59,8 +85,7 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
                     fontSize: 16,
                     letterSpacing: 1.2)),
             FutureBuilder<Map<String, dynamic>?>(
-                future: InventoryData.getBranchDetails(
-                    InventoryData.selectedBranchId ?? 'main_branch'),
+                future: _branchFuture,
                 builder: (context, snapshot) {
                   final name = snapshot.data?['name'] ??
                       (InventoryData.selectedBranchId == null
@@ -85,9 +110,11 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
           if (isDesktop) AppSidebar(role: widget.role, currentPage: 'spoilage'),
           Expanded(
             child: StreamBuilder<List<Map<String, dynamic>>>(
-              stream: InventoryData.spoilageStream(),
+              stream: _spoilageStream,
               builder: (context, snapshot) {
-                if (snapshot.connectionState == ConnectionState.waiting) {
+                // Spinner only on the very first load, never once data exists.
+                if (snapshot.connectionState == ConnectionState.waiting &&
+                    !snapshot.hasData) {
                   return const Center(
                       child: CircularProgressIndicator(color: Color(0xFFF4B400)));
                 }
@@ -242,31 +269,27 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
             const Text('REPORT WILTED/DAMAGED',
                 style: TextStyle(fontWeight: FontWeight.w900, fontSize: 14)),
             const SizedBox(height: 20),
-            StreamBuilder<List<Map<String, dynamic>>>(
-              stream: InventoryData.inventoryStream(),
-              builder: (context, snapshot) {
-                final products = snapshot.data ?? [];
-                return DropdownButtonFormField<String>(
-                  value: _selectedProductId,
-                  isExpanded: true,
-                  decoration: _inputDecoration(
-                      'Select Product', Icons.local_florist_rounded),
-                  items: products.map<DropdownMenuItem<String>>((p) {
-                    return DropdownMenuItem<String>(
-                      value: p['id'] as String,
-                      child: Text('${p['name']} (Stock: ${p['stock']})',
-                          overflow: TextOverflow.ellipsis),
-                    );
-                  }).toList(),
-                  onChanged: (val) {
-                    setState(() {
-                      _selectedProductId = val;
-                      _calculateLoss(products);
-                    });
-                  },
-                  validator: (val) => val == null ? 'Required' : null,
+            DropdownButtonFormField<String>(
+              // A DropdownButton crashes if its value isn't in its items, so
+              // only pass the selection when that product is in the list.
+              value: _products.any((p) => p['id'] == _selectedProductId)
+                  ? _selectedProductId
+                  : null,
+              isExpanded: true,
+              decoration:
+              _inputDecoration('Select Product', Icons.local_florist_rounded),
+              items: _products.map<DropdownMenuItem<String>>((p) {
+                return DropdownMenuItem<String>(
+                  value: p['id'] as String,
+                  child: Text('${p['name']} (Stock: ${p['stock']})',
+                      overflow: TextOverflow.ellipsis),
                 );
+              }).toList(),
+              onChanged: (val) {
+                setState(() => _selectedProductId = val);
+                _calculateLoss();
               },
+              validator: (val) => val == null ? 'Required' : null,
             ),
             const SizedBox(height: 15),
             Row(
@@ -277,11 +300,7 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
                     controller: _quantityController,
                     keyboardType: TextInputType.number,
                     decoration: _inputDecoration('Qty', Icons.numbers_rounded),
-                    onChanged: (val) {
-                      InventoryData.inventoryStream().first.then((products) {
-                        _calculateLoss(products);
-                      });
-                    },
+                    onChanged: (val) => _calculateLoss(),
                     validator: (val) =>
                     (val == null || val.isEmpty) ? 'Required' : null,
                   ),
@@ -336,12 +355,8 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
                   .map((r) => DropdownMenuItem(value: r, child: Text(r, overflow: TextOverflow.ellipsis)))
                   .toList(),
               onChanged: (val) {
-                setState(() {
-                  _reasonController.text = val ?? '';
-                  InventoryData.inventoryStream().first.then((products) {
-                    _calculateLoss(products);
-                  });
-                });
+                setState(() => _reasonController.text = val ?? '');
+                _calculateLoss();
               },
               validator: (val) =>
               (val == null || val.isEmpty) ? 'Required' : null,
@@ -392,26 +407,21 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
     );
   }
 
-  void _calculateLoss(List<Map<String, dynamic>> products) {
-    if (_selectedProductId == null || _quantityController.text.isEmpty) {
-      setState(() => _lossAmount = 0.0);
-      return;
-    }
-
-    try {
-      final product = products.firstWhere((p) => p['id'] == _selectedProductId);
-      final price = (product['price'] ?? 0.0).toDouble();
-      final qty = int.tryParse(_quantityController.text) ?? 0;
-      final reason = _reasonController.text;
-
-      if (reason == 'Salvaged / Reusable Scraps') {
-        setState(() => _lossAmount = 0.0);
-      } else {
-        setState(() => _lossAmount = price * qty);
+  // Reads the cached _products list (no new stream, no waiting).
+  void _calculateLoss() {
+    double loss = 0.0;
+    if (_selectedProductId != null && _quantityController.text.isNotEmpty) {
+      final matches = _products.where((p) => p['id'] == _selectedProductId);
+      if (matches.isNotEmpty) {
+        final price = ((matches.first['price'] ?? 0.0) as num).toDouble();
+        final qty = int.tryParse(_quantityController.text) ?? 0;
+        // Salvaged scraps go back on sale, so they are not a loss.
+        if (_reasonController.text != 'Salvaged / Reusable Scraps') {
+          loss = price * qty;
+        }
       }
-    } catch (e) {
-      setState(() => _lossAmount = 0.0);
     }
+    if (mounted) setState(() => _lossAmount = loss);
   }
 
   Future<void> _saveReport() async {
@@ -420,8 +430,7 @@ class _SpoilageTrackerPageState extends State<SpoilageTrackerPage> {
     setState(() => _isSaving = true);
 
     try {
-      final products = await InventoryData.inventoryStream().first;
-      final product = products.firstWhere((p) => p['id'] == _selectedProductId);
+      final product = _products.firstWhere((p) => p['id'] == _selectedProductId);
       final qty = int.parse(_quantityController.text);
 
       if (qty > (product['stock'] ?? 0)) {

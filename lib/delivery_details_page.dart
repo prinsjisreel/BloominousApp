@@ -280,7 +280,10 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
     }
   }
 
-  Future<void> _onCitySelected(PsgcItem city) async {
+  // recalcFee: true for a normal dropdown tap. The "Get Current Location"
+  // flow passes false because it recalculates the fee once, itself, after
+  // all four levels are filled.
+  Future<void> _onCitySelected(PsgcItem city, {bool recalcFee = true}) async {
     setState(() {
       selectedCityCode = city.code;
       selectedCityName = city.name;
@@ -296,7 +299,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
       _updateFullAddress();
     });
 
-    if (!sendAsGift) _calculateDeliveryFeeFromGps();
+    if (!sendAsGift && recalcFee) _calculateDeliveryFeeFromGps();
 
     try {
       final barangays = await PsgcService.getBarangays(city.code);
@@ -411,6 +414,12 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
       final address = await _reverseGeocode(position.latitude, position.longitude);
       if (address != null) {
         await _applyReverseGeocodedAddress(address);
+      } else if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+              content: Text(
+                  'We got your GPS position but could not look up the address. Please choose it manually.')),
+        );
       }
 
       await _calculateDeliveryFeeFromGps();
@@ -428,7 +437,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
   Future<Map<String, dynamic>?> _reverseGeocode(double lat, double lng) async {
     try {
       final uri = Uri.parse(
-          'https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=$lat&lon=$lng&addressdetails=1');
+          'https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=$lat&lon=$lng&addressdetails=1&zoom=18&accept-language=en');
       final res = await http
           .get(uri, headers: _nominatimHeaders)
           .timeout(const Duration(seconds: 8));
@@ -440,63 +449,249 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
     }
   }
 
+  // ---------------------------------------------------------------------
+  // GET CURRENT LOCATION -> fill Region, Province, City/Municipality, Barangay
+  // ---------------------------------------------------------------------
+  // Nominatim (OpenStreetMap) answers with PLAIN TEXT names ("Central Luzon",
+  // "Bulacan", "Meycauayan", "Banga"). The dropdowns, however, are filled from
+  // the PSGC government directory, whose names look different ("Region III
+  // (Central Luzon)", "City of Meycauayan"). So the job here is to TRANSLATE
+  // each text name into the matching PSGC item, one level at a time:
+  //   Region -> Province -> City/Municipality -> Barangay
+  // and to select each one exactly as if the customer had tapped it.
+
+  /// Makes two spellings comparable: lowercase, no accents/punctuation, and
+  /// without filler words like "City of", "Municipality of", "Barangay".
+  String _normPlace(String? raw) {
+    if (raw == null) return '';
+    var t = raw.toLowerCase().replaceAll('ñ', 'n');
+    t = t.replaceAll(RegExp(r'[^a-z0-9 ]'), ' ');
+    t = t.replaceAll(
+        RegExp(r'\b(city of|municipality of|province of|city|municipality|barangay|brgy|bgy)\b'),
+        ' ');
+    t = t.replaceAll(RegExp(r'\bsta\b'), 'santa').replaceAll(RegExp(r'\bsto\b'), 'santo');
+    return t.replaceAll(RegExp(r'\s+'), ' ').trim();
+  }
+
+  /// Finds the PSGC item that best matches any of the given text names.
+  /// Pass 1 = exact match (after cleaning). Pass 2 = one name contains the
+  /// other, and the closest in length wins (so "San Jose" beats
+  /// "San Jose del Monte" when both could fit).
+  PsgcItem? _matchItem(List<PsgcItem> items, Iterable<String?> candidates) {
+    final cands = candidates.map(_normPlace).where((c) => c.isNotEmpty).toList();
+    if (cands.isEmpty || items.isEmpty) return null;
+
+    for (final c in cands) {
+      for (final item in items) {
+        if (_normPlace(item.name) == c) return item;
+      }
+    }
+
+    PsgcItem? best;
+    int bestGap = 1 << 30;
+    for (final c in cands) {
+      if (c.length < 3) continue;
+      for (final item in items) {
+        final n = _normPlace(item.name);
+        if (n.length < 3) continue;
+        if (n.contains(c) || c.contains(n)) {
+          final gap = (n.length - c.length).abs();
+          if (gap < bestGap) {
+            bestGap = gap;
+            best = item;
+          }
+        }
+      }
+    }
+    return best;
+  }
+
+  /// Region match. "Metro Manila" is the one name PSGC spells differently
+  /// ("National Capital Region (NCR)"), so it is matched by its known code.
+  PsgcItem? _matchRegion(List<String?> texts) {
+    for (final t in texts) {
+      final n = _normPlace(t);
+      if (n.contains('metro manila') || n.contains('national capital') || n == 'ncr') {
+        for (final r in _regions) {
+          if (r.code == PsgcService.metroManilaRegionCode) return r;
+        }
+      }
+    }
+    return _matchItem(_regions, texts);
+  }
+
+  /// Backup plan when the text has no usable region name: ask PSGC for every
+  /// region's provinces (in parallel) and see which region owns this province.
+  Future<PsgcItem?> _findRegionByProvince(List<String?> provinceTexts) async {
+    if (provinceTexts.every((p) => _normPlace(p).isEmpty)) return null;
+
+    final candidates =
+    _regions.where((r) => r.code != PsgcService.metroManilaRegionCode).toList();
+    final lists = await Future.wait(candidates.map((r) async {
+      try {
+        final res = await PsgcService.getProvincesOrCities(r.code);
+        return res.items;
+      } catch (_) {
+        return <PsgcItem>[];
+      }
+    }));
+
+    for (int i = 0; i < candidates.length; i++) {
+      if (_matchItem(lists[i], provinceTexts) != null) return candidates[i];
+    }
+    return null;
+  }
+
+  /// Backup plan #2: maybe the person is in Metro Manila (which has no
+  /// province level, so there is no province text to match).
+  Future<PsgcItem?> _findNcrByCity(List<String?> cityTexts) async {
+    try {
+      final res = await PsgcService.getProvincesOrCities(PsgcService.metroManilaRegionCode);
+      if (_matchItem(res.items, cityTexts) == null) return null;
+      for (final r in _regions) {
+        if (r.code == PsgcService.metroManilaRegionCode) return r;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Backup plan for the province level: look inside each province of the
+  /// chosen region for the city name.
+  Future<PsgcItem?> _findProvinceByCity(List<String?> cityTexts) async {
+    if (cityTexts.every((c) => _normPlace(c).isEmpty)) return null;
+
+    final provinces = List<PsgcItem>.from(_provinces);
+    final lists = await Future.wait(provinces.map((p) async {
+      try {
+        return await PsgcService.getCities(p.code);
+      } catch (_) {
+        return <PsgcItem>[];
+      }
+    }));
+
+    for (int i = 0; i < provinces.length; i++) {
+      if (_matchItem(lists[i], cityTexts) != null) return provinces[i];
+    }
+    return null;
+  }
+
   Future<void> _applyReverseGeocodedAddress(Map<String, dynamic> geocoded) async {
-    final addr = geocoded['address'] as Map<String, dynamic>? ?? {};
+    final addr = (geocoded['address'] as Map?)?.cast<String, dynamic>() ?? <String, dynamic>{};
 
-    final road = addr['road'] as String?;
-    final houseNumber = addr['house_number'] as String?;
-    final postcode = addr['postcode'] as String?;
-    final cityGuess = (addr['city'] ?? addr['town'] ?? addr['municipality']) as String?;
-    final provinceGuess = addr['state'] as String?;
+    // Reads one field from Nominatim's answer; empty text counts as missing.
+    String? pick(String key) {
+      final v = addr[key];
+      return (v is String && v.trim().isNotEmpty) ? v.trim() : null;
+    }
 
-    setState(() {
-      if (road != null) {
-        streetController.text = houseNumber != null ? '$houseNumber $road' : road;
-      }
-      if (postcode != null && postcode.isNotEmpty) {
-        postalCodeController.text = postcode;
-      }
-    });
+    final road = pick('road');
+    final houseNumber = pick('house_number');
+    final postcode = pick('postcode');
 
-    if (provinceGuess == null && cityGuess == null) {
+    // OpenStreetMap is inconsistent about WHICH field holds which level in the
+    // Philippines, so each level gets a list of possible fields to try.
+    final regionTexts = [pick('region'), pick('state')];
+    final provinceTexts = [pick('province'), pick('county'), pick('state_district'), pick('state')];
+    final cityTexts = [pick('city'), pick('town'), pick('municipality')];
+    final barangayTexts = [
+      pick('suburb'),
+      pick('village'),
+      pick('neighbourhood'),
+      pick('quarter'),
+      pick('city_district'),
+      pick('hamlet'),
+    ];
+
+    // Street line
+    if (road != null) {
+      streetController.text = houseNumber != null ? '$houseNumber $road' : road;
+    }
+
+    // ---- 1. REGION ----
+    if (_regions.isEmpty) await _loadRegions();
+    if (!mounted) return;
+
+    PsgcItem? region = _matchRegion(regionTexts);
+    region ??= await _findRegionByProvince(provinceTexts);
+    region ??= await _findNcrByCity(cityTexts);
+    if (!mounted) return;
+
+    if (region == null) {
       _updateFullAddress();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text(
+                'Location found, but we could not match your region. Please choose Region, Province, City and Barangay manually.')),
+      );
       return;
     }
 
-    for (final region in _regions) {
-      final regionMatches = provinceGuess != null &&
-          region.name.toLowerCase().contains('metro manila') &&
-          (cityGuess?.toLowerCase().contains('manila') ?? false);
-      if (regionMatches ||
-          (provinceGuess != null &&
-              region.name.toLowerCase().contains(provinceGuess.toLowerCase()))) {
-        await _onRegionSelected(region);
-        break;
+    // Selecting the region also loads its provinces (or, for Metro Manila,
+    // its cities). `await` = wait until that list has arrived.
+    await _onRegionSelected(region);
+    if (!mounted) return;
+
+    // ---- 2. PROVINCE ----  (Metro Manila has no province level)
+    PsgcItem? province;
+    PsgcItem? city;
+
+    if (_isMetroManilaSelected) {
+      city = _matchItem(_cities, cityTexts);
+    } else {
+      province = _matchItem(_provinces, provinceTexts);
+      province ??= await _findProvinceByCity(cityTexts);
+      if (!mounted) return;
+
+      if (province != null) {
+        await _onProvinceSelected(province);
+        if (!mounted) return;
+        // ---- 3. CITY / MUNICIPALITY ----
+        city = _matchItem(_cities, cityTexts);
       }
     }
 
-    if (cityGuess != null && _cities.isNotEmpty) {
-      PsgcItem? matchedCity;
-      for (final city in _cities) {
-        final normalizedCityName = city.name.toLowerCase().replaceAll(' city', '');
-        if (normalizedCityName.contains(cityGuess.toLowerCase()) ||
-            cityGuess.toLowerCase().contains(normalizedCityName)) {
-          matchedCity = city;
-          break;
-        }
-      }
-      if (matchedCity != null) {
-        await _onCitySelected(matchedCity);
-      } else if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-              content: Text(
-                  'Detected your general area — please confirm City and Barangay manually.')),
-        );
-      }
+    // ---- 3. CITY / MUNICIPALITY + 4. BARANGAY ----
+    PsgcItem? barangay;
+    if (city != null) {
+      // recalcFee:false -> the caller (_handleGetCurrentLocation) already
+      // recalculates the fee once after this finishes. Avoids a duplicate
+      // Google Routes request.
+      await _onCitySelected(city, recalcFee: false);
+      if (!mounted) return;
+      barangay = _matchItem(_barangays, barangayTexts);
     }
 
-    _updateFullAddress();
+    setState(() {
+      if (barangay != null) selectedBarangayName = barangay.name;
+      // Set the postal code LAST: _onCitySelected clears it for cities that
+      // are not in our small postalCodes table, which would erase the one
+      // from the GPS result.
+      if (postcode != null) postalCodeController.text = postcode;
+      _updateFullAddress();
+    });
+
+    // ---- Tell the customer what happened ----
+    if (!mounted) return;
+    final missing = <String>[];
+    if (!_isMetroManilaSelected && province == null) missing.add('Province');
+    if (city == null) missing.add('City/Municipality');
+    if (barangay == null) missing.add('Barangay');
+
+    final found = <String>[
+      if (barangay != null) 'Brgy. ${barangay.name}',
+      if (city != null) city.name,
+      if (province != null) province.name,
+      region.name,
+    ].join(', ');
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        duration: const Duration(seconds: 5),
+        content: Text(missing.isEmpty
+            ? 'Location detected: $found'
+            : 'Detected: $found. Please choose ${missing.join(' and ')} manually.'),
+      ),
+    );
   }
 
   void _onStreetTextChanged() {
