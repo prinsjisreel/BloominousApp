@@ -123,6 +123,9 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
   double deliveryFee = 0.0;
   double distanceKm = 0.0;
   String nearestBranchName = "";
+  // True when NO branch's delivery radius covers the chosen address.
+  bool _outsideDeliveryArea = false;
+  String _outsideAreaMessage = '';
   bool isCalculatingFee = false;
   bool isUsingRealRoadDistance = false;
   bool isAutoFillingAddress = false;
@@ -813,16 +816,38 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
       final branchesList = await InventoryData.getBranchesStream().first;
       if (branchesList.isEmpty) throw 'No branches found to calculate delivery';
 
+      // Only branches whose delivery radius covers this address can take the
+      // order. `minDistance` is the nearest branch that CAN deliver here.
       double minDistance = double.infinity;
       String closestBranchId = "";
       String closestBranchName = "";
       double? branchLat;
       double? branchLng;
 
+      // The nearest branch overall (even if it can't deliver here). Only used
+      // to explain WHY the address is out of range.
+      double nearestAnyMeters = double.infinity;
+      String nearestAnyName = "";
+      double? nearestAnyRadiusKm;
+
       for (var branch in branchesList) {
         double bLat = branch['latitude']?.toDouble() ?? 14.7573;
         double bLng = branch['longitude']?.toDouble() ?? 120.9439;
         double distance = Geolocator.distanceBetween(bLat, bLng, destLat, destLng);
+
+        // No radius saved (an older branch) = no limit, as before.
+        final radiusKm = (branch['deliveryRadiusKm'] as num?)?.toDouble();
+        final hasLimit = radiusKm != null && radiusKm > 0;
+
+        if (distance < nearestAnyMeters) {
+          nearestAnyMeters = distance;
+          nearestAnyName = branch['name'] ?? "Main Branch";
+          nearestAnyRadiusKm = hasLimit ? radiusKm : null;
+        }
+
+        final canDeliverHere = radiusKm == null || radiusKm <= 0 || distance / 1000 <= radiusKm;
+        if (!canDeliverHere) continue;
+
         if (distance < minDistance) {
           minDistance = distance;
           closestBranchId = branch['id'] ?? "";
@@ -830,6 +855,37 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
           branchLat = bLat;
           branchLng = bLng;
         }
+      }
+
+      // No branch covers this address: stop here. No fee, no branch picked,
+      // and _processCheckout refuses to place the order.
+      if (closestBranchId.isEmpty) {
+        if (!mounted) return;
+        // Copied into `final` locals so Dart can safely null-check them
+        // inside the setState callback below.
+        final double? shownRadiusKm = nearestAnyRadiusKm;
+        final String shownBranchName = nearestAnyName;
+        final double shownMeters = nearestAnyMeters;
+        setState(() {
+          _outsideDeliveryArea = true;
+          _outsideAreaMessage = shownRadiusKm != null
+              ? '$shownBranchName delivers within ${shownRadiusKm.toStringAsFixed(shownRadiusKm % 1 == 0 ? 0 : 1)} km, '
+                  'and this address is about ${(shownMeters / 1000).toStringAsFixed(1)} km away.'
+              : 'We could not find a branch that delivers to this address.';
+          nearestBranchName = '';
+          distanceKm = 0;
+          deliveryFee = 0;
+          _branchLat = null;
+          _branchLng = null;
+          if (isSenderLocation) {
+            _customerLat = destLat;
+            _customerLng = destLng;
+          } else {
+            _recipientLat = destLat;
+            _recipientLng = destLng;
+          }
+        });
+        return;
       }
 
       double finalDistanceKm = 0.0;
@@ -858,6 +914,8 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
       }
 
       setState(() {
+        _outsideDeliveryArea = false;
+        _outsideAreaMessage = '';
         nearestBranchName = closestBranchName;
         distanceKm = finalDistanceKm;
         isUsingRealRoadDistance = usedRoutesApi;
@@ -1153,6 +1211,8 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
       distanceKm = 0;
       deliveryFee = 0;
       nearestBranchName = '';
+      _outsideDeliveryArea = false;
+      _outsideAreaMessage = '';
       _activeSavedAddressId = null;
       _editingAddressId = null;
       _saveAddressForLater = _savedAddresses.length < SavedAddressService.maxAddresses;
@@ -1675,6 +1735,17 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
       return;
     }
 
+    // The address is outside every branch's delivery radius.
+    if (_outsideDeliveryArea) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Sorry, we don\'t deliver to this address. $_outsideAreaMessage'),
+          backgroundColor: Colors.redAccent,
+        ),
+      );
+      return;
+    }
+
     if (method == 'cod' && sendAsGift) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
@@ -2004,6 +2075,8 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
                       distanceKm = 0;
                       deliveryFee = 0;
                       nearestBranchName = '';
+                      _outsideDeliveryArea = false;
+                      _outsideAreaMessage = '';
                       if (val && selectedPaymentMethod == 'cod') {
                         selectedPaymentMethod = 'gcash';
                       }
@@ -2226,7 +2299,41 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
             _buildLocationMap(context),
             const SizedBox(height: 12),
 
-            if (nearestBranchName.isNotEmpty)
+            if (_outsideDeliveryArea)
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.red.withOpacity(isDark ? 0.15 : 0.08),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.red.withOpacity(0.4)),
+                ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Icon(Icons.location_off, color: Colors.red, size: 20),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('Outside our delivery area',
+                              style: TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 13,
+                                  color: isDark ? Colors.white : Colors.black87)),
+                          const SizedBox(height: 2),
+                          Text(_outsideAreaMessage,
+                              style: TextStyle(
+                                  fontSize: 12,
+                                  color: isDark ? Colors.grey[300] : Colors.grey[700])),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
+            if (nearestBranchName.isNotEmpty && !_outsideDeliveryArea)
               Container(
                 padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(
