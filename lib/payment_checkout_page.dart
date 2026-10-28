@@ -100,8 +100,11 @@ class _PaymentCheckoutPageState extends State<PaymentCheckoutPage> {
 
     // 4) Back on our own site = the provider sent the customer home.
     if (uri.host == _shopHost) {
-      final lower = request.url.toLowerCase();
-      final cancelled = lower.contains('cancel') || lower.contains('fail');
+      // The server sends us to /templates/cancel.php or /templates/success.php.
+      // Look at the PATH only: the query (?order_id=...) is random text and
+      // could contain the letters "fail" by pure chance.
+      final path = uri.path.toLowerCase();
+      final cancelled = path.contains('cancel') || path.contains('fail');
       _finish(cancelled ? PaymentCheckoutResult.cancelled : PaymentCheckoutResult.success);
       return NavigationDecision.prevent;
     }
