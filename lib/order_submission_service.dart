@@ -170,6 +170,11 @@ class OrderSubmissionService {
     bool isGift = false,
     double? customerLat,
     double? customerLng,
+    // Where the flowers are actually going (the recipient for a gift, the
+    // customer otherwise). The server checks it against the branch's
+    // delivery radius.
+    double? destinationLat,
+    double? destinationLng,
     bool otpVerified = false,
     String? notes,
     // null = "as soon as possible" (what older app versions always meant).
@@ -224,6 +229,8 @@ class OrderSubmissionService {
         'isGift': isGift,
         if (customerLat != null) 'customerLat': customerLat,
         if (customerLng != null) 'customerLng': customerLng,
+        if (destinationLat != null) 'destinationLat': destinationLat,
+        if (destinationLng != null) 'destinationLng': destinationLng,
         if (trimmedNotes.isNotEmpty) 'notes': trimmedNotes,
         // Same JSON shape the website sends: {mode, date, slot}. The server
         // re-checks the 3-hour lead and 30-day limit and answers

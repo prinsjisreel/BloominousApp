@@ -1787,6 +1787,8 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
         isGift: sendAsGift,
         customerLat: _customerLat,
         customerLng: _customerLng,
+        destinationLat: sendAsGift ? _recipientLat : _customerLat,
+        destinationLng: sendAsGift ? _recipientLng : _customerLng,
         otpVerified: _otpVerifiedThisSession,
         notes: notesController.text,
         deliverySchedule: _currentSchedule(),
@@ -1871,6 +1873,12 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
         });
       } else if (e.code == 'BLOCKED') {
         setState(() => _isAccountBlocked = true);
+      } else if (e.code == 'OUT_OF_DELIVERY_AREA') {
+        // Server says this address is outside the branch's radius.
+        setState(() {
+          _outsideDeliveryArea = true;
+          _outsideAreaMessage = e.message;
+        });
       } else if (e.code == 'INVALID_SCHEDULE') {
         // The server rejected the chosen window (e.g. it slipped inside the
         // 3-hour lead): clear it so the customer must pick a valid one again.
