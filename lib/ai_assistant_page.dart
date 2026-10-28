@@ -401,7 +401,9 @@ class _AIAssistantPageState extends State<AIAssistantPage>
         SnackBar(
           content: Text('AI image generation failed: ${e.message}'),
           backgroundColor: const Color(0xFFDC3545),
-          duration: const Duration(seconds: 6),
+          // Long enough to read (and screenshot) the [DETAILS] lines while testing.
+          duration: const Duration(seconds: 30),
+          showCloseIcon: true,
         ),
       );
     } catch (e) {

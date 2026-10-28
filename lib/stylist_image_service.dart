@@ -96,9 +96,36 @@ class StylistImageService {
       'https://honeydew-duck-132160.hostingersite.com/generate_stylist_image.php';
 
   static const Duration _pollEvery = Duration(seconds: 4);
-  // About 3 minutes in total. The server may start a second model (GPT Image)
+  // About 4 minutes in total. The server may start a second model (GPT Image)
   // when the first one (Qwen) fails, so the wait can be longer than before.
-  static const int _maxPolls = 45;
+  static const int _maxPolls = 60;
+
+  // Starting a job uploads the room photo (hundreds of KB) and the server
+  // hands it to Pixazo before answering, which can be slow on mobile data.
+  // The cheap "status" checks keep the short limit.
+  static const Duration _submitTimeout = Duration(seconds: 90);
+  static const Duration _statusTimeout = Duration(seconds: 40);
+
+  // Remembers the last job we started. If the app gives up waiting (or the
+  // download fails) the job may STILL finish on Pixazo - and it is already
+  // paid for. "Try again" then picks up the SAME job instead of starting
+  // (and paying for) a brand-new one.
+  static String? _resumeSignature;
+  static String? _resumeRequestId;
+  static DateTime? _resumeStartedAt;
+  static const Duration _resumeMaxAge = Duration(minutes: 10);
+
+  static void _clearResume() {
+    _resumeSignature = null;
+    _resumeRequestId = null;
+    _resumeStartedAt = null;
+  }
+
+  /// A fingerprint of "what was asked": same action, prompt and photo = same job.
+  static String _signatureOf(Map<String, dynamic> body) {
+    final image = body['image']?.toString() ?? '';
+    return '${body['action']}|${body['prompt']}|${image.length}|${image.hashCode}';
+  }
   static const int _maxConsecutiveNetworkErrors = 3;
   static const int maxPromptChars = 1200; // same cap as the server
 
@@ -118,7 +145,9 @@ class StylistImageService {
       onStatus,
     );
     onStatus?.call('Downloading your preview...');
-    return StylistImageResult(provider: 'Pixazo', imageUrl: url, imageBytes: await _downloadImage(url));
+    final bytes = await _downloadImage(url);
+    _clearResume(); // finished and in hand: the next request is a new job
+    return StylistImageResult(provider: 'Pixazo', imageUrl: url, imageBytes: bytes);
   }
 
   // ---------------------------------------------------------------------
@@ -154,7 +183,9 @@ class StylistImageService {
       onStatus,
     );
     onStatus?.call('Downloading your preview...');
-    return StylistImageResult(provider: 'Pixazo', imageUrl: url, imageBytes: await _downloadImage(url));
+    final bytes = await _downloadImage(url);
+    _clearResume(); // finished and in hand: the next request is a new job
+    return StylistImageResult(provider: 'Pixazo', imageUrl: url, imageBytes: bytes);
   }
 
   // ---------------------------------------------------------------------
@@ -220,70 +251,112 @@ class StylistImageService {
     return trimmed.length > maxPromptChars ? trimmed.substring(0, maxPromptChars) : trimmed;
   }
 
-  /// Starts a Pixazo job through our server, then polls until it finishes.
-  /// Returns the finished image's URL.
+  /// Starts a Pixazo job through our server (or resumes the one we already
+  /// started), then polls until it finishes. Returns the finished image's URL.
   static Future<String> _runPixazoJob(
       Map<String, dynamic> startBody,
       void Function(String status)? onStatus,
       ) async {
-    final start = await _post(startBody);
-    final requestId = start['requestId'];
-    if (requestId is! String || requestId.isEmpty) {
-      throw StylistImageException('The image service gave an incomplete answer.', code: 'BAD_RESPONSE');
+    final signature = _signatureOf(startBody);
+    String requestId;
+
+    final canResume = _resumeSignature == signature &&
+        _resumeRequestId != null &&
+        _resumeStartedAt != null &&
+        DateTime.now().difference(_resumeStartedAt!) < _resumeMaxAge;
+
+    if (canResume) {
+      // Same photo + same prompt as a job that was already paid for.
+      requestId = _resumeRequestId!;
+      debugPrint('StylistImageService: resuming job $requestId instead of starting a new one.');
+      onStatus?.call('Checking your earlier design...');
+    } else {
+      final start = await _post(startBody, timeout: _submitTimeout);
+      final id = start['requestId'];
+      if (id is! String || id.isEmpty) {
+        throw StylistImageException('The image service gave an incomplete answer.', code: 'BAD_RESPONSE');
+      }
+      requestId = id;
+      _resumeSignature = signature;
+      _resumeRequestId = id;
+      _resumeStartedAt = DateTime.now();
+      onStatus?.call('Your design is in the queue...');
     }
-    onStatus?.call('Your design is in the queue...');
 
-    int consecutiveNetworkErrors = 0;
-    for (int attempt = 1; attempt <= _maxPolls; attempt++) {
-      await Future.delayed(_pollEvery);
+    try {
+      int consecutiveNetworkErrors = 0;
+      for (int attempt = 1; attempt <= _maxPolls; attempt++) {
+        await Future.delayed(_pollEvery);
 
-      Map<String, dynamic> status;
-      try {
-        status = await _post({'action': 'status', 'requestId': requestId});
-        consecutiveNetworkErrors = 0;
-      } on StylistImageException catch (e) {
-        final isBlip = e.code == 'NETWORK' || e.code == 'TIMEOUT';
-        if (isBlip && ++consecutiveNetworkErrors < _maxConsecutiveNetworkErrors) {
-          continue; // skip this round, try again next tick
+        Map<String, dynamic> status;
+        try {
+          status = await _post({'action': 'status', 'requestId': requestId}, timeout: _statusTimeout);
+          consecutiveNetworkErrors = 0;
+        } on StylistImageException catch (e) {
+          final isBlip = e.code == 'NETWORK' || e.code == 'TIMEOUT';
+          if (isBlip && ++consecutiveNetworkErrors < _maxConsecutiveNetworkErrors) {
+            continue; // skip this round, try again next tick
+          }
+          rethrow;
         }
-        rethrow;
+
+        final state = status['status']?.toString() ?? '';
+        if (state == 'COMPLETED') {
+          final url = status['imageUrl'];
+          if (url is String && url.startsWith('https://')) return url;
+          debugPrint('StylistImageService: COMPLETED but imageUrl was: $url');
+          throw StylistImageException('The preview finished without an image.', code: 'BAD_RESPONSE');
+        }
+
+        onStatus?.call(state == 'PROCESSING'
+            ? 'Arranging flowers in your room...'
+            : 'Your design is in the queue...');
       }
 
-      final state = status['status']?.toString() ?? '';
-      if (state == 'COMPLETED') {
-        final url = status['imageUrl'];
-        if (url is String && url.startsWith('https://')) return url;
-        throw StylistImageException('The preview finished without an image.', code: 'BAD_RESPONSE');
-      }
-
-      onStatus?.call(state == 'PROCESSING'
-          ? 'Arranging flowers in your room...'
-          : 'Your design is in the queue...');
+      throw StylistImageException('The preview is taking too long. Please try again.', code: 'TIMEOUT');
+    } on StylistImageException catch (e) {
+      // Only "we stopped waiting" problems can be resumed later. A real
+      // failure (the job itself failed) must not be resumed - start fresh.
+      final resumable = e.code == 'TIMEOUT' || e.code == 'NETWORK';
+      if (!resumable) _clearResume();
+      rethrow;
     }
-
-    throw StylistImageException('The preview is taking too long. Please try again.', code: 'TIMEOUT');
   }
 
   /// Downloads the finished image so the page can keep working with bytes
   /// (display + reservation upload), exactly like Gemini's results.
+  /// Tries up to 3 times: a single mobile-data hiccup must not throw away an
+  /// image that is already paid for.
   static Future<Uint8List> _downloadImage(String url) async {
-    try {
-      final response = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 30));
-      if (response.statusCode == 200 && response.bodyBytes.isNotEmpty) {
-        return response.bodyBytes;
+    String lastNote = 'no attempt';
+    for (int attempt = 1; attempt <= 3; attempt++) {
+      try {
+        final response = await http
+            .get(Uri.parse(url), headers: {'Accept': 'image/*'})
+            .timeout(const Duration(seconds: 45));
+        if (response.statusCode == 200 && response.bodyBytes.isNotEmpty) {
+          return response.bodyBytes;
+        }
+        lastNote = 'HTTP ${response.statusCode}, ${response.bodyBytes.length} bytes';
+        debugPrint('StylistImageService: download attempt $attempt: $lastNote');
+      } catch (e) {
+        lastNote = e.toString();
+        debugPrint('StylistImageService: download attempt $attempt failed: $e');
       }
-      debugPrint('StylistImageService: download HTTP ${response.statusCode}');
-    } catch (e) {
-      debugPrint('StylistImageService: download failed: $e');
+      if (attempt < 3) await Future.delayed(Duration(seconds: 2 * attempt));
     }
     throw StylistImageException(
-      'Your preview was created but could not be downloaded. Please try again.',
+      'Your preview was created but could not be downloaded. Please try again.'
+      '${_showProviderDetails ? ' ($lastNote)' : ''}',
       code: 'DOWNLOAD_FAILED',
     );
   }
 
   /// Same shape as OrderSubmissionService: fresh ID token, timeout, one error type.
-  static Future<Map<String, dynamic>> _post(Map<String, dynamic> payload) async {
+  static Future<Map<String, dynamic>> _post(
+    Map<String, dynamic> payload, {
+    Duration timeout = const Duration(seconds: 40),
+  }) async {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) {
       throw StylistImageException('Please sign in to use the Visual Stylist.', code: 'NO_SESSION');
@@ -301,7 +374,7 @@ class StylistImageService {
         },
         body: jsonEncode(payload),
       )
-          .timeout(const Duration(seconds: 40));
+          .timeout(timeout);
     } on TimeoutException {
       throw StylistImageException('The image service is slow to respond.', code: 'TIMEOUT');
     } catch (e) {
