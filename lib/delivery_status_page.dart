@@ -61,6 +61,7 @@ class _DeliveryStatusPageState extends State<DeliveryStatusPage> {
     }
     if (status == 'in transit') return 'In Transit';
     if (status == 'processing') return 'Processing';
+    if (status == 'prepared') return 'Prepared';
     return 'Pending';
   }
 
@@ -71,6 +72,8 @@ class _DeliveryStatusPageState extends State<DeliveryStatusPage> {
       case 'In Transit':
       case 'Processing':
         return _transitColor;
+      case 'Prepared':
+        return const Color(0xFF14B8A6); // teal, same as the staff Orders page
       default:
         return _pendingColor;
     }

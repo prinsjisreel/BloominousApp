@@ -25,6 +25,7 @@ class _MyOrdersPageState extends State<MyOrdersPage> {
     'All',
     'Pending',
     'Processing',
+    'Prepared',
     'Shipped',
     'Delivered',
     'Cancelled'
@@ -36,6 +37,8 @@ class _MyOrdersPageState extends State<MyOrdersPage> {
         return Colors.orange;
       case 'processing':
         return Colors.blue;
+      case 'prepared':
+        return Colors.teal;
       case 'shipped':
       case 'in transit':
         return Colors.purple;
@@ -55,6 +58,8 @@ class _MyOrdersPageState extends State<MyOrdersPage> {
         return Icons.hourglass_empty_rounded;
       case 'processing':
         return Icons.settings_rounded;
+      case 'prepared':
+        return Icons.inventory_2_rounded;
       case 'shipped':
       case 'in transit':
         return Icons.local_shipping_rounded;

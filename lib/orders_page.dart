@@ -114,50 +114,185 @@ class _OrdersPageState extends State<OrdersPage> {
     );
   }
 
-  Future<void> _updateOrderStatus(String orderId, String newStatus, {bool lock = false}) async {
-    try {
-      await FirebaseFirestore.instance.collection('orders').doc(orderId).set({
-        'status': newStatus,
-        'updatedAt': FieldValue.serverTimestamp(),
-        // lock = true freezes the order ("touch move"). The web page and the
-        // Firestore rules both look at this flag.
-        if (lock) 'locked': true,
-      }, SetOptions(merge: true));
+  // ---------------------------------------------------------------------
+  // STATUS FLOW — mirrors STATUS_FLOW in order_management.php (web)
+  // ---------------------------------------------------------------------
+  // The position in each list is the step number. A "next" button only ever
+  // moves an order ONE position forward, so a stage can never be skipped.
+  //   Online  : Pending -> Processing -> Prepared -> In Transit -> Confirmed
+  //             (Confirmed is set by the driver's proof of delivery, not here)
+  //   Walk-in : Pending -> Processing -> Prepared -> Confirmed
+  //             (+ a separate Cancel button any time before Confirmed)
+  static const List<String> _onlineFlow = ['PENDING', 'PROCESSING', 'PREPARED', 'IN TRANSIT', 'CONFIRMED'];
+  static const List<String> _walkInFlow = ['PENDING', 'PROCESSING', 'PREPARED', 'CONFIRMED'];
 
-      // General accountability logging — separate from
-      // _handleCancelWalkIn's override-specific logging below, which
-      // only fires for cancellations BEYOND the daily limit. This
-      // covers every routine status change: confirms, in-limit
-      // cancellations, online order status updates — everything that
-      // was previously invisible to any review process.
+  static const Map<String, String> _statusLabels = {
+    'PENDING': 'Pending',
+    'PROCESSING': 'Processing',
+    'PREPARED': 'Prepared',
+    'IN TRANSIT': 'In Transit',
+    'CONFIRMED': 'Confirmed',
+    'CANCELLED': 'Cancelled',
+  };
+
+  // Pill colours — the same palette the website uses.
+  static const Map<String, Color> _statusColors = {
+    'PENDING': Color(0xFFF59E0B),
+    'PROCESSING': Color(0xFF8B89F5),
+    'PREPARED': Color(0xFF00C4C7),
+    'IN TRANSIT': Color(0xFF4DA3FF),
+    'CONFIRMED': Color(0xFF2ECC71),
+    'CANCELLED': Color(0xFF9A9A9A),
+  };
+
+  // What each button SAYS (a verb, so staff know what a tap does) and its icon.
+  static const Map<String, String> _nextActionText = {
+    'PROCESSING': 'Start Processing',
+    'PREPARED': 'Mark Prepared',
+    'IN TRANSIT': 'Send Out',
+    'CONFIRMED': 'Confirm',
+  };
+  static const Map<String, IconData> _nextActionIcon = {
+    'PROCESSING': Icons.settings_outlined,
+    'PREPARED': Icons.inventory_2_outlined,
+    'IN TRANSIT': Icons.local_shipping_outlined,
+    'CONFIRMED': Icons.check_circle_outline,
+  };
+
+  // Orders whose button was just tapped. While an id is in here its buttons
+  // are disabled, so a double-tap can't send the same step twice.
+  final Set<String> _busyOrderIds = {};
+
+  /// Turns whatever is stored (any casing, older names) into one of this
+  /// channel's stages, or 'CANCELLED'. Same job as normalizeStatus() on the web.
+  /// The app has always stored 'COMPLETED' for a finished walk-in sale and the
+  /// web stores 'confirmed'; both land on 'CONFIRMED' here.
+  String _normalizeStatus(dynamic raw, bool online) {
+    final s = (raw ?? 'pending').toString().toUpperCase().trim().replaceAll('_', ' ');
+    if (s == 'CANCELLED') return 'CANCELLED';
+
+    final flow = online ? _onlineFlow : _walkInFlow;
+    if (flow.contains(s)) return s;
+
+    if (s == 'COMPLETED' || s == 'DELIVERED') return 'CONFIRMED';
+    if (online && (s == 'SHIPPED' || s == 'OUT FOR DELIVERY' || s == 'ON DELIVERY')) return 'IN TRANSIT';
+    return 'PENDING'; // includes 'PAID' and any unknown legacy value
+  }
+
+  /// The one stage after [status], or null when there is no button to show.
+  String? _nextStatusFor(String status, bool online) {
+    if (status == 'CANCELLED') return null;
+    final flow = online ? _onlineFlow : _walkInFlow;
+    final index = flow.indexOf(status);
+    if (index == -1 || index == flow.length - 1) return null;
+
+    final next = flow[index + 1];
+    // An online order becomes Confirmed only when the driver uploads the
+    // proof of delivery (Delivery Dashboard), never from this list.
+    if (online && next == 'CONFIRMED') return null;
+    return next;
+  }
+
+  void _showSnack(String message, {Color? color}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), backgroundColor: color, duration: const Duration(seconds: 3)),
+    );
+  }
+
+  /// The single write path for EVERY status change on this page (the same
+  /// idea as runGuardedTransition() on the web).
+  ///
+  /// It re-reads the order INSIDE a Firestore transaction and only writes if
+  /// the order is still at [expectedFrom]. If another phone or the website moved
+  /// it first, this refuses instead of jumping ahead or double-applying a step.
+  /// Returns true when the change was saved.
+  Future<bool> _runGuardedTransition({
+    required String orderId,
+    required String expectedFrom,
+    required bool online,
+    required Map<String, dynamic> updateData,
+    required String auditLabel,
+  }) async {
+    final ref = FirebaseFirestore.instance.collection('orders').doc(orderId);
+
+    try {
+      await FirebaseFirestore.instance.runTransaction((tx) async {
+        final snap = await tx.get(ref);
+        final data = snap.data();
+        if (!snap.exists || data == null) {
+          throw _StaleOrderException('This order no longer exists.');
+        }
+        if (data['locked'] == true) {
+          throw _StaleOrderException('This order is already final and can no longer be changed.');
+        }
+        final current = _normalizeStatus(data['status'], online);
+        if (current != expectedFrom) {
+          throw _StaleOrderException(
+              'This order is already "${_statusLabels[current]}". The list has refreshed — please check it again.');
+        }
+        tx.update(ref, updateData);
+      });
+    } on _StaleOrderException catch (e) {
+      _showSnack(e.message, color: Colors.orange);
+      return false;
+    } catch (e) {
+      _showSnack('Failed to update status: $e');
+      return false;
+    }
+
+    // Accountability record — the same 'order_status_change' entry the website
+    // writes, so both show up together in the Admin Activity Log. It must
+    // never undo or block a status change that already succeeded.
+    try {
       await AdminAuditService.logAction(
         action: 'order_status_change',
         targetUid: orderId,
         targetEmail: null,
-        details: 'Order status changed to "$newStatus".',
+        details: 'Order status changed to "$auditLabel".',
       );
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Order status updated to "$newStatus"'),
-            backgroundColor: Colors.green,
-            duration: const Duration(seconds: 2),
-          ),
-        );
-      }
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to update status: $e')),
-        );
+      debugPrint('Audit log write failed (status still updated): $e');
+    }
+    return true;
+  }
+
+  /// Taps on a row's "next step" button. Moves the order exactly ONE stage forward.
+  Future<void> _advanceOrder(String orderId, bool online, String from) async {
+    final next = _nextStatusFor(from, online);
+    if (next == null || _busyOrderIds.contains(orderId)) return;
+
+    // A finished walk-in sale locks the order for good, so it asks first.
+    if (!online && next == 'CONFIRMED') {
+      await _handleConfirmWalkIn(orderId, from);
+      return;
+    }
+
+    setState(() => _busyOrderIds.add(orderId));
+    try {
+      final saved = await _runGuardedTransition(
+        orderId: orderId,
+        expectedFrom: from,
+        online: online,
+        updateData: {
+          'status': next,
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+        auditLabel: _statusLabels[next] ?? next,
+      );
+      if (saved) {
+        // No manual list update needed: the orders stream fires after the
+        // write and redraws this row with the new pill and the next button.
+        _showSnack('Order moved to "${_statusLabels[next]}"', color: Colors.green);
       }
+    } finally {
+      if (mounted) setState(() => _busyOrderIds.remove(orderId));
     }
   }
 
-  /// Walk-in CONFIRM button. Asks once ("this is final"), re-checks that
-  /// nobody else finalised the order meanwhile, then saves + locks it.
-  Future<void> _handleConfirmWalkIn(String orderId) async {
+  /// Walk-in CONFIRM (the last step). Asks once ("this is final"), re-checks
+  /// that nobody else finalised the order meanwhile, then saves + locks it.
+  Future<void> _handleConfirmWalkIn(String orderId, String from) async {
     if (await _isAlreadyFinal(orderId)) {
       _showAlreadyFinalMessage();
       return;
@@ -169,7 +304,29 @@ class _OrdersPageState extends State<OrdersPage> {
       okLabel: 'CONFIRM ORDER',
       okColor: Colors.green,
     );
-    if (confirmed) await _updateOrderStatus(orderId, 'COMPLETED', lock: true);
+    if (!confirmed) return;
+
+    setState(() => _busyOrderIds.add(orderId));
+    try {
+      final saved = await _runGuardedTransition(
+        orderId: orderId,
+        expectedFrom: from,
+        online: false,
+        updateData: {
+          // The app has always written 'COMPLETED' for a finished walk-in sale
+          // (Sales Report counts it); the website reads it as "Confirmed".
+          'status': 'COMPLETED',
+          'locked': true,
+          // A sale completed at the counter is paid (same rule as the website).
+          'paymentStatus': 'Paid',
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+        auditLabel: 'COMPLETED',
+      );
+      if (saved) _showSnack('Order confirmed', color: Colors.green);
+    } finally {
+      if (mounted) setState(() => _busyOrderIds.remove(orderId));
+    }
   }
 
   /// Counts today's WALK-IN cancellations for a specific branch, computed
@@ -212,6 +369,15 @@ class _OrdersPageState extends State<OrdersPage> {
       ) async {
     final branchId = (order['branchId'] ?? _selectedBranchId ?? '').toString();
 
+    // The stage the order is at RIGHT NOW on this screen. The cancel write
+    // re-checks it inside a transaction, so a stale screen can't cancel an
+    // order somebody else just moved or finalised.
+    final fromStatus = _normalizeStatus(order['status'], false);
+    if (fromStatus == 'CONFIRMED' || fromStatus == 'CANCELLED') {
+      _showAlreadyFinalMessage();
+      return;
+    }
+
     // Check FIRST, so a wasted override code is never burned on an order
     // that somebody else already finalised.
     if (await _isAlreadyFinal(orderId)) {
@@ -234,7 +400,7 @@ class _OrdersPageState extends State<OrdersPage> {
         okLabel: 'CANCEL ORDER',
         okColor: Colors.red,
       );
-      if (confirmed) await _finalizeCancellation(orderId);
+      if (confirmed) await _finalizeCancellation(orderId, fromStatus);
       return;
     }
 
@@ -278,8 +444,8 @@ class _OrdersPageState extends State<OrdersPage> {
       return;
     }
 
-    await _finalizeCancellation(orderId);
-    if (mounted) {
+    final cancelled = await _finalizeCancellation(orderId, fromStatus);
+    if (cancelled && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text('Override accepted. Order cancelled.'),
@@ -289,39 +455,36 @@ class _OrdersPageState extends State<OrdersPage> {
     }
   }
 
-  Future<void> _finalizeCancellation(String orderId) async {
+  /// Cancels a walk-in order through the same guarded transaction as every
+  /// other status change. Returns true when the cancellation was saved.
+  Future<bool> _finalizeCancellation(String orderId, String fromStatus) async {
+    if (_busyOrderIds.contains(orderId)) return false;
+    setState(() => _busyOrderIds.add(orderId));
     try {
-      await FirebaseFirestore.instance.collection('orders').doc(orderId).set({
-        'status': 'CANCELLED',
-        'updatedAt': FieldValue.serverTimestamp(),
-        // cancelledAt specifically (separate from updatedAt, which any
-        // future edit would overwrite) is what the daily-limit count
-        // above filters on.
-        'cancelledAt': FieldValue.serverTimestamp(),
-        // Same fields the web page writes, so both sides agree the order is
-        // finished and nobody can reopen it.
-        'locked': true,
-        'paymentStatus': 'Voided',
-        'cancelledBy': FirebaseAuth.instance.currentUser?.email ?? 'Staff',
-      }, SetOptions(merge: true));
-
-      // Matches _updateOrderStatus's own logging — cancellations that
-      // route through this path (whether under or over the daily limit)
-      // still get the same general order_status_change record, in
-      // addition to walkin_cancel_override's own entry when the
-      // override path was used.
-      await AdminAuditService.logAction(
-        action: 'order_status_change',
-        targetUid: orderId,
-        targetEmail: null,
-        details: 'Order status changed to "CANCELLED".',
+      return await _runGuardedTransition(
+        orderId: orderId,
+        expectedFrom: fromStatus,
+        online: false,
+        updateData: {
+          'status': 'CANCELLED',
+          'updatedAt': FieldValue.serverTimestamp(),
+          // cancelledAt specifically (separate from updatedAt, which any
+          // future edit would overwrite) is what the daily-limit count
+          // filters on.
+          'cancelledAt': FieldValue.serverTimestamp(),
+          // Same fields the web page writes, so both sides agree the order is
+          // finished and nobody can reopen it.
+          'locked': true,
+          'paymentStatus': 'Voided',
+          'cancelledBy': FirebaseAuth.instance.currentUser?.email ?? 'Staff',
+        },
+        // Every cancellation (under or over the daily limit) still gets the
+        // general order_status_change record, in addition to the override
+        // path's own walkin_cancel_override entry.
+        auditLabel: 'CANCELLED',
       );
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to cancel order: $e')),
-        );
-      }
+    } finally {
+      if (mounted) setState(() => _busyOrderIds.remove(orderId));
     }
   }
 
@@ -544,7 +707,8 @@ class _OrdersPageState extends State<OrdersPage> {
                 int commerceVolume = currentList.length;
                 int pendingResolution = currentList.where((o) {
                   final st = (o['status'] ?? 'pending').toString().toLowerCase();
-                  return st.contains('pending') || st.contains('processing');
+                  // "Prepared" is still open work: the order has not left the shop yet.
+                  return st.contains('pending') || st.contains('processing') || st.contains('prepared');
                 }).length;
 
                 double liquidityPipeline = 0.0;
@@ -829,7 +993,7 @@ class _OrdersPageState extends State<OrdersPage> {
                                                       ),
                                                     ),
                                                     Expanded(
-                                                      flex: 4,
+                                                      flex: 3,
                                                       child: Text(
                                                         'PAYLOAD SUMMARY',
                                                         style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: subTextColor, letterSpacing: 1.0),
@@ -850,9 +1014,9 @@ class _OrdersPageState extends State<OrdersPage> {
                                                       ),
                                                     ),
                                                     Expanded(
-                                                      flex: 3,
+                                                      flex: 4,
                                                       child: Text(
-                                                        _selectedTab == 0 ? 'STATUS' : 'ACTIONS / STATUS',
+                                                        'FULFILLMENT STEP',
                                                         style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: subTextColor, letterSpacing: 1.0),
                                                       ),
                                                     ),
@@ -910,14 +1074,6 @@ class _OrdersPageState extends State<OrdersPage> {
                                                     }
                                                     final timelineStr = DateFormat('M/d/yyyy').format(date);
 
-                                                    final currentStatus = (order['status'] ?? 'PENDING').toString().toUpperCase();
-                                                    // "Touch move": once confirmed / cancelled / locked, no buttons.
-                                                    // 'CONFIRMED' is what the web page writes, 'COMPLETED' what the app writes.
-                                                    final bool isCancelled = currentStatus == 'CANCELLED';
-                                                    final bool isConfirmed = currentStatus == 'COMPLETED' ||
-                                                        currentStatus == 'CONFIRMED' ||
-                                                        currentStatus == 'DELIVERED';
-                                                    final bool isLockedOther = order['locked'] == true && !isCancelled && !isConfirmed;
 
                                                     // POS proof-of-order photo (null when the order has none).
                                                     final proofUrl = proofOfOrderUrl(order);
@@ -970,7 +1126,7 @@ class _OrdersPageState extends State<OrdersPage> {
                                                             ),
                                                           ),
                                                           Expanded(
-                                                            flex: 4,
+                                                            flex: 3,
                                                             child: Padding(
                                                               padding: const EdgeInsets.only(right: 12.0),
                                                               child: Text(
@@ -1005,117 +1161,18 @@ class _OrdersPageState extends State<OrdersPage> {
                                                               ),
                                                             ),
                                                           ),
-                                                          Expanded(
-                                                            flex: 3,
-                                                            child: _selectedTab == 0
-                                                                ? Container(
-                                                              height: 36,
-                                                              padding: const EdgeInsets.symmetric(horizontal: 10),
-                                                              decoration: BoxDecoration(
-                                                                color: isDark ? const Color(0xFF222222) : const Color(0xFFF1F5F9),
-                                                                borderRadius: BorderRadius.circular(8),
-                                                                border: Border.all(color: borderColor),
-                                                              ),
-                                                              child: DropdownButtonHideUnderline(
-                                                                child: DropdownButton<String>(
-                                                                  value: ['PENDING', 'PROCESSING', 'IN TRANSIT'].contains(currentStatus)
-                                                                      ? currentStatus
-                                                                      : 'PENDING',
-                                                                  dropdownColor: cardColor,
-                                                                  isExpanded: true,
-                                                                  icon: Icon(Icons.keyboard_arrow_down, color: subTextColor, size: 18),
-                                                                  style: TextStyle(
-                                                                    color: textColor,
-                                                                    fontSize: 11,
-                                                                    fontWeight: FontWeight.w600,
-                                                                  ),
-                                                                  items: const [
-                                                                    DropdownMenuItem(value: 'PENDING', child: Text('PENDING')),
-                                                                    DropdownMenuItem(value: 'PROCESSING', child: Text('PROCESSING')),
-                                                                    DropdownMenuItem(value: 'IN TRANSIT', child: Text('IN TRANSIT')),
-                                                                  ],
-                                                                  // Employees may only update WALK-IN orders (the
-                                                                  // Firestore rules enforce it). null = greyed out.
-                                                                  onChanged: !isAdmin
-                                                                      ? null
-                                                                      : (val) {
-                                                                    if (val != null) _updateOrderStatus(orderId, val);
-                                                                  },
-                                                                ),
-                                                              ),
-                                                            )
-                                                                : Row(
-                                                              children: [
-                                                                if (isCancelled)
-                                                                  Container(
-                                                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                                                                    decoration: BoxDecoration(
-                                                                      color: Colors.red.withValues(alpha: 0.1),
-                                                                      borderRadius: BorderRadius.circular(6),
-                                                                    ),
-                                                                    child: const Text(
-                                                                      'CANCELLED',
-                                                                      style: TextStyle(
-                                                                        fontSize: 10,
-                                                                        fontWeight: FontWeight.bold,
-                                                                        color: Colors.red,
-                                                                      ),
-                                                                    ),
-                                                                  )
-                                                                else if (isConfirmed || isLockedOther)
-                                                                  Container(
-                                                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                                                                    decoration: BoxDecoration(
-                                                                      color: Colors.green.withValues(alpha: 0.1),
-                                                                      borderRadius: BorderRadius.circular(6),
-                                                                    ),
-                                                                    child: Row(
-                                                                      mainAxisSize: MainAxisSize.min,
-                                                                      children: [
-                                                                        const Icon(Icons.lock, size: 11, color: Colors.green),
-                                                                        const SizedBox(width: 4),
-                                                                        Text(
-                                                                          isConfirmed ? 'CONFIRMED' : 'LOCKED',
-                                                                          style: const TextStyle(
-                                                                            fontSize: 10,
-                                                                            fontWeight: FontWeight.bold,
-                                                                            color: Colors.green,
-                                                                          ),
-                                                                        ),
-                                                                      ],
-                                                                    ),
-                                                                  )
-                                                                else ...[
-                                                                    ElevatedButton(
-                                                                      onPressed: () => _handleConfirmWalkIn(orderId),
-                                                                      style: ElevatedButton.styleFrom(
-                                                                        backgroundColor: Colors.green[600],
-                                                                        foregroundColor: Colors.white,
-                                                                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                                                                        minimumSize: Size.zero,
-                                                                        elevation: 0,
-                                                                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
-                                                                      ),
-                                                                      child: const Text('CONFIRM', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
-                                                                    ),
-                                                                    const SizedBox(width: 8),
-                                                                    OutlinedButton(
-                                                                      onPressed: () => _handleCancelWalkIn(
-                                                                          orderId, order, todaysCancelCount),
-                                                                      style: OutlinedButton.styleFrom(
-                                                                        foregroundColor: Colors.redAccent,
-                                                                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                                                                        minimumSize: Size.zero,
-                                                                        side: const BorderSide(color: Colors.redAccent),
-                                                                        elevation: 0,
-                                                                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
-                                                                      ),
-                                                                      child: const Text('CANCEL', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
-                                                                    ),
-                                                                  ],
-                                                              ],
-                                                            ),
-                                                          ),
+                                                    Expanded(
+                                                      flex: 4,
+                                                      child: _buildStatusCell(
+                                                        orderId: orderId,
+                                                        order: order,
+                                                        online: _selectedTab == 0,
+                                                        todaysCancelCount: todaysCancelCount,
+                                                        isDark: isDark,
+                                                        textColor: textColor,
+                                                        subTextColor: subTextColor,
+                                                      ),
+                                                    ),
                                                         ],
                                                       ),
                                                     );
@@ -1154,6 +1211,155 @@ class _OrdersPageState extends State<OrdersPage> {
           ),
         ],
       ),
+    );
+  }
+
+  /// The "Fulfillment Step" cell of one row (the app's version of
+  /// buildStatusCell() on the website): a coloured status pill, small progress
+  /// dots, and ONE button for the next step. There is no dropdown any more, so a
+  /// stage can't be skipped. Walk-in orders also get a Cancel button.
+  Widget _buildStatusCell({
+    required String orderId,
+    required Map<String, dynamic> order,
+    required bool online,
+    required int todaysCancelCount,
+    required bool isDark,
+    required Color textColor,
+    required Color subTextColor,
+  }) {
+    final status = _normalizeStatus(order['status'], online);
+    final flow = online ? _onlineFlow : _walkInFlow;
+    final reachedIndex = flow.indexOf(status); // -1 for cancelled
+    final next = _nextStatusFor(status, online);
+    final busy = _busyOrderIds.contains(orderId);
+
+    final bool isCancelled = status == 'CANCELLED';
+    final bool isConfirmed = status == 'CONFIRMED';
+    // Locked by something other than "finished" (e.g. a void in progress): hands off.
+    final bool isLockedOther = order['locked'] == true && !isCancelled && !isConfirmed;
+    final bool awaitingDriver = online && status == 'IN TRANSIT';
+
+    final pillColor = _statusColors[status] ?? Colors.grey;
+
+    // ---- Buttons / note ----
+    final List<Widget> actions = [];
+
+    if (!isLockedOther && next != null) {
+      actions.add(
+        ElevatedButton.icon(
+          onPressed: busy ? null : () => _advanceOrder(orderId, online, status),
+          icon: busy
+              ? const SizedBox(
+              width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+              : Icon(_nextActionIcon[next] ?? Icons.arrow_forward, size: 14),
+          label: Text(
+            (_nextActionText[next] ?? 'Next').toUpperCase(),
+            style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 0.3),
+          ),
+          style: ElevatedButton.styleFrom(
+            backgroundColor: const Color(0xFFF59E0B),
+            foregroundColor: Colors.white,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+            minimumSize: Size.zero,
+            elevation: 0,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          ),
+        ),
+      );
+    }
+
+    // Walk-in only: Cancel stays available until the sale is Confirmed.
+    if (!online && !isConfirmed && !isCancelled && !isLockedOther) {
+      actions.add(
+        OutlinedButton.icon(
+          onPressed: busy ? null : () => _handleCancelWalkIn(orderId, order, todaysCancelCount),
+          icon: const Icon(Icons.block, size: 13),
+          label: const Text('CANCEL', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
+          style: OutlinedButton.styleFrom(
+            foregroundColor: Colors.redAccent,
+            side: BorderSide(color: Colors.redAccent.withOpacity(0.5)),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+            minimumSize: Size.zero,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          ),
+        ),
+      );
+    }
+
+    String? note;
+    if (isLockedOther) {
+      note = 'Locked — no further steps.';
+    } else if (isCancelled) {
+      note = 'Order voided — no further steps.';
+    } else if (isConfirmed) {
+      note = 'Completed — no further steps.';
+    } else if (awaitingDriver) {
+      note = "Waiting for the driver's proof of delivery.";
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Flexible(
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                decoration: BoxDecoration(
+                  color: pillColor.withOpacity(0.16),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Text(
+                  (_statusLabels[status] ?? status).toUpperCase(),
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 0.6,
+                    color: pillColor,
+                    decoration: isCancelled ? TextDecoration.lineThrough : null,
+                  ),
+                ),
+              ),
+            ),
+            if (!isCancelled) ...[
+              const SizedBox(width: 8),
+              // Progress dots: one per stage in this channel's flow; filled = already reached.
+              for (int i = 0; i < flow.length; i++)
+                Container(
+                  width: 7,
+                  height: 7,
+                  margin: const EdgeInsets.only(right: 4),
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: i <= reachedIndex
+                        ? const Color(0xFFF59E0B)
+                        : (isDark ? const Color(0xFF3A3A3A) : const Color(0xFFE5E5E5)),
+                  ),
+                ),
+            ],
+          ],
+        ),
+        const SizedBox(height: 8),
+        if (actions.isNotEmpty) Wrap(spacing: 8, runSpacing: 6, children: actions),
+        if (note != null)
+          Padding(
+            padding: EdgeInsets.only(top: actions.isNotEmpty ? 6 : 0),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (isLockedOther || isConfirmed) ...[
+                  const Icon(Icons.lock, size: 11, color: Colors.green),
+                  const SizedBox(width: 4),
+                ],
+                Flexible(
+                  child: Text(note, style: TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: subTextColor)),
+                ),
+              ],
+            ),
+          ),
+      ],
     );
   }
 
@@ -1425,4 +1631,11 @@ class _OrdersPageState extends State<OrdersPage> {
       ),
     );
   }
+}
+
+/// Thrown inside the status transaction when the order is no longer where this
+/// screen thinks it is (moved, locked, or deleted by someone else).
+class _StaleOrderException implements Exception {
+  final String message;
+  _StaleOrderException(this.message);
 }

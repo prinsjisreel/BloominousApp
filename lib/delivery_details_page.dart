@@ -5,17 +5,21 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'inventory_data.dart';
 import 'payment_service.dart';
+import 'payment_checkout_page.dart';
 import 'order_success_page.dart';
 import 'google_maps_service.dart';
 import 'order_submission_service.dart';
 import 'psgc_service.dart';
+import 'delivery_schedule.dart';
+import 'delivery_schedule_section.dart';
+import 'saved_address_service.dart';
+import 'saved_addresses_sheet.dart';
 
 const Map<String, String> postalCodes = {
   "Meycauayan": "3020",
@@ -135,6 +139,23 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
   bool _isSearchingStreet = false;
   Timer? _streetSearchDebounce;
 
+  // --- Delivery date & time (same rules as web checkout.php) ---
+  // false = "As soon as possible" (the default, and what older orders meant).
+  bool _scheduleEnabled = false;
+  DateTime? _scheduleDate;
+  DeliverySlot? _scheduleSlot;
+
+  // --- Address book (customers/{uid}/addresses, shared with the website) ---
+  List<SavedAddress> _savedAddresses = [];
+  String? _activeSavedAddressId; // the saved address currently shown in the form
+  String? _editingAddressId; // set while the customer is editing a saved address
+  bool _saveAddressForLater = false; // "Save this address for next time" tick box
+  bool _isSavingAddress = false;
+  bool _isApplyingSavedAddress = false;
+  // While we fill the street box from code (not by typing), the street
+  // search must stay quiet, or a suggestion list would pop open by itself.
+  bool _suppressStreetSearch = false;
+
   // --- Account-restriction / phone-trust-restore state ---
   // FRAUD ACTIVITY MODEL: there is no fraud score anymore. The server
   // (submit_order.php) records fraud activities for admins to review and
@@ -177,7 +198,10 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
     streetController.addListener(_onStreetTextChanged);
     postalCodeController.addListener(_updateFullAddress);
     _checkUserFraudStatus();
-    _loadRegions();
+    // Regions must be loaded BEFORE a saved address can be applied (the
+    // address is matched against the region list), so the address book loads
+    // right after them.
+    _loadRegions().whenComplete(_loadAddressBook);
   }
 
   @override
@@ -696,6 +720,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
 
   void _onStreetTextChanged() {
     _updateFullAddress();
+    if (_suppressStreetSearch) return;
     _streetSearchDebounce?.cancel();
     final query = streetController.text.trim();
     if (query.length < 4) {
@@ -853,6 +878,407 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
     }
   }
 
+  // ---------------------------------------------------------------------
+  // DELIVERY DATE & TIME
+  // ---------------------------------------------------------------------
+
+  /// What the customer has picked right now, as an object the rules and the
+  /// order service both understand.
+  DeliverySchedule _currentSchedule() => _scheduleEnabled
+      ? DeliverySchedule.scheduled(date: _scheduleDate, slot: _scheduleSlot)
+      : const DeliverySchedule.asap();
+
+  void _onScheduleModeChanged(bool scheduled) {
+    setState(() {
+      _scheduleEnabled = scheduled;
+      // First time they pick "Pick date & time": jump to the first day that
+      // still has a bookable window, so the time chips show up immediately.
+      if (scheduled && _scheduleDate == null) {
+        _scheduleDate = DeliveryScheduleRules.earliestSelectableDate();
+        _scheduleSlot = null;
+      }
+    });
+  }
+
+  Future<void> _pickScheduleDate() async {
+    final first = DeliveryScheduleRules.earliestSelectableDate();
+    if (first == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text('No delivery windows are open right now. Please choose "As soon as possible".')),
+      );
+      return;
+    }
+    final last = DeliveryScheduleRules.lastSelectableDate();
+
+    // showDatePicker crashes if the starting date is not allowed, so make sure it is.
+    var initial = _scheduleDate ?? first;
+    if (initial.isBefore(first) || !DeliveryScheduleRules.isDateSelectable(initial)) {
+      initial = first;
+    }
+
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: DateTime(initial.year, initial.month, initial.day),
+      firstDate: DateTime(first.year, first.month, first.day),
+      lastDate: DateTime(last.year, last.month, last.day),
+      helpText: 'DELIVERY DATE',
+      // Days where every window is already too soon stay greyed out.
+      selectableDayPredicate: (day) =>
+          DeliveryScheduleRules.isDateSelectable(DeliveryScheduleRules.dateOnly(day)),
+    );
+    if (picked == null || !mounted) return;
+
+    setState(() {
+      final newDate = DeliveryScheduleRules.dateOnly(picked);
+      // A window picked for the old day may not exist on the new one: drop it.
+      if (_scheduleSlot != null && !DeliveryScheduleRules.isSlotAvailable(newDate, _scheduleSlot!)) {
+        _scheduleSlot = null;
+      }
+      _scheduleDate = newDate;
+    });
+  }
+
+  // ---------------------------------------------------------------------
+  // ADDRESS BOOK (saved addresses)
+  // ---------------------------------------------------------------------
+
+  /// Loads the customer's saved addresses once the region list is ready and,
+  /// if the form is still empty, fills it with the default address.
+  Future<void> _loadAddressBook() async {
+    try {
+      final list = await SavedAddressService.fetchAll();
+      if (!mounted) return;
+      setState(() {
+        _savedAddresses = list;
+        // A customer with no saved address yet gets the "save it" box ticked.
+        if (list.isEmpty) _saveAddressForLater = true;
+      });
+      if (list.isEmpty) return;
+
+      // Never overwrite something the customer already started typing.
+      if (selectedRegionCode != null || streetController.text.trim().isNotEmpty) return;
+
+      final defaultAddress = list.firstWhere((a) => a.isDefault, orElse: () => list.first);
+      await _applySavedAddress(defaultAddress);
+    } catch (e) {
+      debugPrint('Could not load the address book: $e');
+    }
+  }
+
+  Future<void> _refreshSavedAddresses() async {
+    try {
+      final list = await SavedAddressService.fetchAll();
+      if (!mounted) return;
+      setState(() {
+        _savedAddresses = list;
+        // If the address on screen was deleted, forget the link to it.
+        if (!list.any((a) => a.id == _activeSavedAddressId)) _activeSavedAddressId = null;
+        if (!list.any((a) => a.id == _editingAddressId)) _editingAddressId = null;
+      });
+    } catch (e) {
+      debugPrint('Could not refresh saved addresses: $e');
+    }
+  }
+
+  Future<void> _openAddressBook() async {
+    final result = await showSavedAddressesSheet(context, selectedId: _activeSavedAddressId);
+    // The sheet can delete / re-default addresses, so re-read the list afterwards.
+    await _refreshSavedAddresses();
+    if (result == null || !mounted) return;
+
+    switch (result.action) {
+      case SavedAddressAction.use:
+        setState(() => _editingAddressId = null);
+        await _applySavedAddress(result.address!);
+        break;
+      case SavedAddressAction.edit:
+        await _applySavedAddress(result.address!);
+        if (!mounted) return;
+        setState(() => _editingAddressId = result.address!.id);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Change what you need, then tap "Update saved address".')),
+        );
+        break;
+      case SavedAddressAction.addNew:
+        _resetAddressForm();
+        break;
+    }
+  }
+
+  PsgcItem? _findByCode(List<PsgcItem> items, String? code) {
+    if (code == null) return null;
+    for (final item in items) {
+      if (item.code == code) return item;
+    }
+    return null;
+  }
+
+  /// Fills the whole checkout form from one saved address — exactly as if the
+  /// customer had typed it: recipient, phone, then Region -> Province ->
+  /// City -> Barangay (each choice loads the next list), street, postal code,
+  /// and finally the delivery fee from the saved map point.
+  Future<void> _applySavedAddress(SavedAddress a) async {
+    setState(() => _isApplyingSavedAddress = true);
+    try {
+      if (_regions.isEmpty) await _loadRegions();
+      if (!mounted) return;
+
+      recipientController.text = a.fullName;
+      phoneController.text = a.phone;
+
+      // The street box has a listener that searches for suggestions; silence
+      // it while we set the text from code.
+      _suppressStreetSearch = true;
+      streetController.text = a.street;
+      _suppressStreetSearch = false;
+      setState(() => _streetSuggestions = []);
+
+      // ---- Region ---- (PSGC code first; the saved name is the backup)
+      final region = _findByCode(_regions, a.regionCode) ?? _matchRegion([a.regionName]);
+      if (region == null) {
+        _updateFullAddress();
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+              content: Text('We could not match the saved region. Please choose Region, Province, City and Barangay again.')),
+        );
+        return;
+      }
+      await _onRegionSelected(region);
+      if (!mounted) return;
+
+      // ---- Province (Metro Manila has none) and City ----
+      PsgcItem? province;
+      PsgcItem? city;
+      if (_isMetroManilaSelected) {
+        city = _findByCode(_cities, a.cityCode) ?? _matchItem(_cities, [a.cityName]);
+      } else {
+        province = _findByCode(_provinces, a.provinceCode) ??
+            _matchItem(_provinces, [a.provinceName]) ??
+            await _findProvinceByCity([a.cityName]);
+        if (!mounted) return;
+        if (province != null) {
+          await _onProvinceSelected(province);
+          if (!mounted) return;
+          city = _findByCode(_cities, a.cityCode) ?? _matchItem(_cities, [a.cityName]);
+        }
+      }
+
+      // ---- Barangay ----
+      PsgcItem? barangay;
+      if (city != null) {
+        // recalcFee:false -> the fee is calculated ONCE below, from the saved map point.
+        await _onCitySelected(city, recalcFee: false);
+        if (!mounted) return;
+        barangay = _matchItem(_barangays, [a.barangay]);
+      }
+
+      setState(() {
+        // The dropdown crashes if its value is not in its list, so only set a barangay we matched.
+        selectedBarangayName = barangay?.name;
+        // Postal code goes in LAST: _onCitySelected overwrites it for cities outside our small table.
+        postalCodeController.text = a.postalCode;
+        _activeSavedAddressId = a.id;
+        _updateFullAddress();
+      });
+
+      // ---- Delivery fee ----
+      // Reuse the saved map point. Without one, the city's rough centre is used (not for gifts).
+      if (a.destLat != null && a.destLng != null) {
+        if (sendAsGift) {
+          setState(() {
+            _recipientLat = a.destLat;
+            _recipientLng = a.destLng;
+          });
+          await _calculateDeliveryFeeForDestination(a.destLat!, a.destLng!);
+        } else {
+          await _calculateDeliveryFeeForDestination(a.destLat!, a.destLng!, isSenderLocation: true);
+        }
+      } else if (!sendAsGift) {
+        setState(() {
+          _customerLat = null;
+          _customerLng = null;
+        });
+        await _calculateDeliveryFeeFromGps();
+      }
+
+      if (!mounted) return;
+      final missing = <String>[];
+      if (!_isMetroManilaSelected && province == null) missing.add('Province');
+      if (city == null) missing.add('City/Municipality');
+      if (barangay == null) missing.add('Barangay');
+      if (missing.isNotEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Address loaded, but please choose ${missing.join(' and ')} again.')),
+        );
+      }
+    } catch (e) {
+      debugPrint('Applying saved address failed: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not load that address: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isApplyingSavedAddress = false);
+    }
+  }
+
+  /// "Add New Address": empties the location part of the form (recipient name
+  /// and phone stay, they are quick to change) and forgets the fee and route.
+  void _resetAddressForm() {
+    _suppressStreetSearch = true;
+    streetController.clear();
+    _suppressStreetSearch = false;
+    postalCodeController.clear();
+    setState(() {
+      selectedRegionCode = null;
+      selectedRegionName = null;
+      selectedProvinceCode = null;
+      selectedProvinceName = null;
+      selectedCityCode = null;
+      selectedCityName = null;
+      selectedBarangayName = null;
+      _provinces = [];
+      _cities = [];
+      _barangays = [];
+      _isMetroManilaSelected = false;
+      _streetSuggestions = [];
+      _customerLat = null;
+      _customerLng = null;
+      _recipientLat = null;
+      _recipientLng = null;
+      _branchLat = null;
+      _branchLng = null;
+      distanceKm = 0;
+      deliveryFee = 0;
+      nearestBranchName = '';
+      _activeSavedAddressId = null;
+      _editingAddressId = null;
+      _saveAddressForLater = _savedAddresses.length < SavedAddressService.maxAddresses;
+      _updateFullAddress();
+    });
+  }
+
+  String _capText(String s, int max) => s.length > max ? s.substring(0, max) : s;
+
+  /// Reads the form into a SavedAddress, or explains what is missing.
+  /// (A Dart "record" returns two things at once: the address OR the error.)
+  ({SavedAddress? address, String? error}) _buildAddressFromForm({String id = '', bool isDefault = false}) {
+    _updateFullAddress();
+
+    final name = recipientController.text.trim();
+    final phone = normalizePhPhone(phoneController.text);
+    final street = streetController.text.trim();
+    final fullAddress = addressController.text.trim();
+
+    if (name.isEmpty) return (address: null, error: 'Enter the recipient name first.');
+    if (phone.length < 7 || phone.length > 20) {
+      return (address: null, error: 'Enter a valid phone number first.');
+    }
+    if (selectedRegionCode == null || selectedCityCode == null || selectedBarangayName == null) {
+      return (address: null, error: 'Choose Region, City/Municipality and Barangay first.');
+    }
+    if (!_isMetroManilaSelected && selectedProvinceCode == null) {
+      return (address: null, error: 'Choose a Province first.');
+    }
+    if (street.isEmpty) {
+      return (address: null, error: 'Enter the street / building / house number first.');
+    }
+    if (fullAddress.length < 10) {
+      return (address: null, error: 'The address is too short to save.');
+    }
+
+    // Same map point the delivery fee used (recipient's for gifts, customer's otherwise).
+    final lat = sendAsGift ? _recipientLat : _customerLat;
+    final lng = sendAsGift ? _recipientLng : _customerLng;
+
+    return (
+    address: SavedAddress(
+      id: id,
+      fullName: _capText(name, 100),
+      phone: phone,
+      address: _capText(fullAddress, 400),
+      regionCode: selectedRegionCode,
+      regionName: _capText(selectedRegionName ?? '', 100),
+      provinceCode: _isMetroManilaSelected ? null : selectedProvinceCode,
+      provinceName: _capText(selectedProvinceName ?? '', 100),
+      cityCode: selectedCityCode,
+      cityName: _capText(selectedCityName ?? '', 100),
+      barangay: _capText(selectedBarangayName!, 100),
+      street: _capText(street, 200),
+      postalCode: _capText(postalCodeController.text.trim(), 10),
+      destLat: lat,
+      destLng: lng,
+      isDefault: isDefault,
+    ),
+    error: null,
+    );
+  }
+
+  /// "Update saved address" button (only visible while editing one).
+  Future<void> _updateEditedAddress() async {
+    final editingId = _editingAddressId;
+    if (editingId == null) return;
+
+    final wasDefault = _savedAddresses.any((a) => a.id == editingId && a.isDefault);
+    final built = _buildAddressFromForm(id: editingId, isDefault: wasDefault);
+    if (built.address == null) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(built.error!)));
+      return;
+    }
+
+    setState(() => _isSavingAddress = true);
+    try {
+      final id = await SavedAddressService.save(built.address!);
+      await _refreshSavedAddresses();
+      if (!mounted) return;
+      setState(() {
+        _editingAddressId = null;
+        _activeSavedAddressId = id;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Saved address updated.'), backgroundColor: Colors.green),
+      );
+    } on SavedAddressException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(e.message), backgroundColor: Colors.redAccent),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not update the address: $e'), backgroundColor: Colors.redAccent),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isSavingAddress = false);
+    }
+  }
+
+  /// Runs right after an order is accepted: if the customer ticked "Save this
+  /// address", store it. It NEVER blocks or fails the order — the order is
+  /// already placed, so any problem here is only logged.
+  Future<void> _autoSaveAddressAfterOrder() async {
+    if (!_saveAddressForLater || _editingAddressId != null) return;
+    try {
+      final built = _buildAddressFromForm();
+      final candidate = built.address;
+      if (candidate == null) return;
+
+      // Same address + same phone already saved? Nothing to do.
+      if (_savedAddresses.any((s) => s.sameAs(candidate.address, candidate.phone))) return;
+      if (_savedAddresses.length >= SavedAddressService.maxAddresses) return;
+
+      final id = await SavedAddressService.save(candidate);
+      await _refreshSavedAddresses();
+      if (mounted) setState(() => _activeSavedAddressId = id);
+    } catch (e) {
+      debugPrint('Auto-save of the address failed (order is unaffected): $e');
+    }
+  }
+
   double get total => subtotal + deliveryFee;
 
   String _formatFee(double amount) {
@@ -881,6 +1307,14 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
         const SnackBar(
             content: Text('Please fill in all recipient, contact and location choices.')),
       );
+      return;
+    }
+
+    // Check the delivery date/time BEFORE the phone-verification sheet, so a
+    // customer never verifies their phone only to be stopped by a bad time.
+    final scheduleError = DeliveryScheduleRules.validate(_currentSchedule());
+    if (scheduleError != null) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(scheduleError)));
       return;
     }
 
@@ -1249,6 +1683,14 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
       return;
     }
 
+    // Time may have passed since the customer picked a window (or since they
+    // verified their phone), so check it again right before sending.
+    final scheduleError = DeliveryScheduleRules.validate(_currentSchedule());
+    if (scheduleError != null) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(scheduleError)));
+      return;
+    }
+
     setState(() => isLoading = true);
     final user = FirebaseAuth.instance.currentUser;
 
@@ -1276,9 +1718,13 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
         customerLng: _customerLng,
         otpVerified: _otpVerifiedThisSession,
         notes: notesController.text,
+        deliverySchedule: _currentSchedule(),
       );
 
       debugPrint('Order placed: ${result.invoiceId} (${result.orderId})');
+
+      // The order exists now, so it is safe to remember the address for next time.
+      await _autoSaveAddressAfterOrder();
 
       if (method == 'gcash' || method == 'maya') {
         // STEP 2 (e-wallet only) — the order exists now, so open payment.
@@ -1299,11 +1745,39 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
           throw 'Your order ${result.invoiceId} was received, but the payment page could not be opened. Please contact the shop to complete payment.';
         }
 
-        final url = Uri.parse(checkoutUrl);
-        if (await canLaunchUrl(url)) {
-          await launchUrl(url, mode: LaunchMode.externalApplication);
+        // Open the payment INSIDE the app (WebView) instead of the phone's
+        // browser. It pops with how the customer left the page.
+        if (!mounted) return;
+        final payResult = await Navigator.push<PaymentCheckoutResult>(
+          context,
+          MaterialPageRoute(
+            builder: (context) => PaymentCheckoutPage(
+              checkoutUrl: checkoutUrl,
+              title: method == 'gcash' ? 'Pay with GCash' : 'Pay with Maya',
+            ),
+          ),
+        );
+
+        // A WebView only knows which page it ended on, not whether money
+        // moved. The server marks the order Paid in Firestore, so ask it.
+        final paid = await _isOrderPaid(result.orderId);
+        if (!mounted) return;
+
+        if (paid || payResult == PaymentCheckoutResult.success) {
+          Navigator.push(
+            context,
+            MaterialPageRoute(builder: (context) => const OrderSuccessPage()),
+          );
         } else {
-          throw 'Your order ${result.invoiceId} was received, but the payment page could not be opened. Please contact the shop to complete payment.';
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                'Order ${result.invoiceId} is saved but not paid yet. '
+                'You can find it under My Orders > To Pay.',
+              ),
+              duration: const Duration(seconds: 6),
+            ),
+          );
         }
       } else {
         // COD: nothing left to do but show success.
@@ -1326,6 +1800,10 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
         });
       } else if (e.code == 'BLOCKED') {
         setState(() => _isAccountBlocked = true);
+      } else if (e.code == 'INVALID_SCHEDULE') {
+        // The server rejected the chosen window (e.g. it slipped inside the
+        // 3-hour lead): clear it so the customer must pick a valid one again.
+        setState(() => _scheduleSlot = null);
       }
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -1340,6 +1818,22 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
       }
     } finally {
       if (mounted) setState(() => isLoading = false);
+    }
+  }
+
+  /// Reads the order back from Firestore and says whether it is marked Paid.
+  /// Rules allow the owner to read their own order. Any failure = "not paid
+  /// as far as we can tell" (never a crash).
+  Future<bool> _isOrderPaid(String orderId) async {
+    try {
+      final doc = await FirebaseFirestore.instance.collection('orders').doc(orderId).get();
+      final data = doc.data();
+      if (data == null) return false;
+      final status = (data['paymentStatus'] ?? data['payment_status'] ?? '').toString();
+      return status.toLowerCase() == 'paid';
+    } catch (e) {
+      debugPrint('DeliveryDetails: paid-check failed: $e');
+      return false;
     }
   }
 
@@ -1442,8 +1936,11 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
         elevation: 0,
         foregroundColor: isDark ? Colors.white : Colors.black,
       ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(24),
+      // SafeArea(bottom) keeps the last button above the phone's gesture/nav bar.
+      body: SafeArea(
+        top: false,
+        child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(24, 24, 24, 40),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
@@ -1513,6 +2010,81 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
                     });
                   },
                 ),
+              ],
+            ),
+
+            const SizedBox(height: 20),
+
+            _sectionCard(
+              context,
+              title: 'Saved Addresses',
+              children: [
+                OutlinedButton.icon(
+                  onPressed: _isApplyingSavedAddress ? null : _openAddressBook,
+                  icon: _isApplyingSavedAddress
+                      ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.bookmarks_outlined, size: 18),
+                  label: Text(_savedAddresses.isEmpty
+                      ? 'My Address (none saved yet)'
+                      : 'My Address (${_savedAddresses.length} saved)'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: const Color(0xFFF4B400),
+                    side: const BorderSide(color: Color(0xFFF4B400)),
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                if (_editingAddressId != null) ...[
+                  Text(
+                    'You are editing a saved address. Change the details below, then update it.',
+                    style: TextStyle(fontSize: 11, color: isDark ? Colors.grey[400] : Colors.grey[600]),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: ElevatedButton(
+                          onPressed: _isSavingAddress ? null : _updateEditedAddress,
+                          style: _actionButtonStyle(const Color(0xFFF4B400)),
+                          child: _isSavingAddress
+                              ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                              : const Text('UPDATE SAVED ADDRESS',
+                              style: TextStyle(fontWeight: FontWeight.w800, fontSize: 12)),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      TextButton(
+                        onPressed: _isSavingAddress ? null : () => setState(() => _editingAddressId = null),
+                        child: const Text('Cancel'),
+                      ),
+                    ],
+                  ),
+                ] else
+                  CheckboxListTile(
+                    contentPadding: EdgeInsets.zero,
+                    controlAffinity: ListTileControlAffinity.leading,
+                    activeColor: const Color(0xFFF4B400),
+                    value: _saveAddressForLater &&
+                        _savedAddresses.length < SavedAddressService.maxAddresses,
+                    onChanged: _savedAddresses.length >= SavedAddressService.maxAddresses
+                        ? null
+                        : (val) => setState(() => _saveAddressForLater = val ?? false),
+                    title: Text(
+                      'Save this address for next time',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 13,
+                        color: isDark ? Colors.white : Colors.black87,
+                      ),
+                    ),
+                    subtitle: Text(
+                      _savedAddresses.length >= SavedAddressService.maxAddresses
+                          ? 'Your address book is full (${SavedAddressService.maxAddresses}). Delete one to save another.'
+                          : 'Saved to your account only, and shared with the website. Saved after your order is placed.',
+                      style: TextStyle(fontSize: 11, color: isDark ? Colors.grey[400] : Colors.grey[600]),
+                    ),
+                  ),
               ],
             ),
 
@@ -1724,6 +2296,23 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
 
             _sectionCard(
               context,
+              title: 'Delivery Date & Time',
+              children: [
+                DeliveryScheduleSection(
+                  isScheduled: _scheduleEnabled,
+                  date: _scheduleDate,
+                  slot: _scheduleSlot,
+                  onModeChanged: _onScheduleModeChanged,
+                  onPickDate: _pickScheduleDate,
+                  onSlotSelected: (slot) => setState(() => _scheduleSlot = slot),
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 20),
+
+            _sectionCard(
+              context,
               title: 'Payment Method',
               children: [
                 DropdownButtonFormField<String>(
@@ -1781,6 +2370,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
           .animate()
           .fadeIn(duration: 400.ms, curve: Curves.easeOut)
           .slideX(begin: -0.15, end: 0, duration: 400.ms, curve: Curves.easeOut),
+      ),
     );
   }
 
@@ -2022,6 +2612,25 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
             context,
             distanceKm > 0 ? 'Delivery Fee (${distanceKm.toStringAsFixed(1)}km × ₱1)' : 'Delivery Fee',
             _formatFee(deliveryFee),
+          ),
+          // What the customer chose on the Delivery Date & Time card.
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 4),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text('Delivery', style: TextStyle(color: isDark ? Colors.grey[400] : Colors.grey)),
+                const SizedBox(width: 16),
+                Flexible(
+                  child: Text(
+                    _currentSchedule().summary,
+                    textAlign: TextAlign.right,
+                    style: TextStyle(fontSize: 12, color: isDark ? Colors.white : Colors.black87),
+                  ),
+                ),
+              ],
+            ),
           ),
           Divider(height: 24, color: isDark ? Colors.white.withOpacity(0.1) : null),
           Row(

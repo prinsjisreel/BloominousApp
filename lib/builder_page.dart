@@ -630,6 +630,9 @@ class _BuilderPageState extends State<BuilderPage> {
   @override
   Widget build(BuildContext context) {
     final bool narrow = MediaQuery.of(context).size.width < 600;
+    // Height of the phone's gesture/nav bar. viewPadding (not padding) is used
+    // because this Scaffold has resizeToAvoidBottomInset: false.
+    final double bottomInset = MediaQuery.of(context).viewPadding.bottom;
     final Color topBarText = _isArEnabled ? Colors.white70 : _kRoseDeep;
 
     return Scaffold(
@@ -644,7 +647,7 @@ class _BuilderPageState extends State<BuilderPage> {
           // (even with an empty bouquet) so it never "disappears".
           Positioned(
             top: 100, // Pushed down to clear the top logo bar
-            bottom: 100, // Pushed up to clear AR toggles
+            bottom: 100 + bottomInset, // Pushed up to clear AR toggles + system bar
             left: 16,
             // Dynamically adjust right padding based on device width and panel state to prevent squishing
             right: _isMenuOpen && _showPanel ? (narrow ? 300 : 370) : 16,
@@ -767,7 +770,7 @@ class _BuilderPageState extends State<BuilderPage> {
                       _buildSidebarIcon(Icons.settings_outlined),
                       _buildSidebarIcon(Icons.layers_outlined),
                       _buildSidebarIcon(Icons.share_outlined),
-                      const SizedBox(height: 30),
+                      SizedBox(height: 30 + bottomInset),
                     ],
                   ),
                 ),
@@ -780,7 +783,7 @@ class _BuilderPageState extends State<BuilderPage> {
             Positioned(
               right: narrow ? 10 : 20,
               top: 80,
-              bottom: 20,
+              bottom: 20 + bottomInset,
               width: narrow ? 280 : 350,
               child: Column(
                 children: [
@@ -795,7 +798,7 @@ class _BuilderPageState extends State<BuilderPage> {
 
           // 5. AR TRACKING INDICATOR & TOGGLE
           Positioned(
-            bottom: 120,
+            bottom: 120 + bottomInset,
             left: narrow ? 60 : 90,
             child: GestureDetector(
               onTap: () => setState(() => _isArEnabled = !_isArEnabled),
@@ -854,7 +857,7 @@ class _BuilderPageState extends State<BuilderPage> {
 
           // 6. TOGGLE INTERFACE BUTTON
           Positioned(
-            bottom: 180,
+            bottom: 180 + bottomInset,
             right: _isMenuOpen && _showPanel ? (narrow ? 300 : 380) : 20,
             child: FloatingActionButton.small(
               heroTag: 'toggle_ui',
@@ -868,7 +871,7 @@ class _BuilderPageState extends State<BuilderPage> {
 
           // 7. TOGGLE WRAPPER COVER BUTTON
           Positioned(
-            bottom: 240,
+            bottom: 240 + bottomInset,
             right: _isMenuOpen && _showPanel ? (narrow ? 300 : 380) : 20,
             child: FloatingActionButton.small(
               heroTag: 'toggle_wrapper',

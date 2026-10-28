@@ -5,11 +5,12 @@ import 'package:http/http.dart' as http;
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'device_security_service.dart';
+import 'delivery_schedule.dart';
 
 /// Thrown when an order can't be placed. `code` mirrors the server's
 /// machine-readable reason when present (RESTRICTED, BLOCKED,
-/// EMAIL_UNREACHABLE), or a client-side reason (TIMEOUT, NETWORK,
-/// BAD_RESPONSE), so the UI can react differently per case.
+/// EMAIL_UNREACHABLE, INVALID_SCHEDULE, ...), or a client-side reason
+/// (TIMEOUT, NETWORK, BAD_RESPONSE), so the UI can react differently per case.
 class OrderSubmissionException implements Exception {
   final String message;
   final String? code;
@@ -117,6 +118,45 @@ class OrderSubmissionService {
     return null;
   }
 
+  /// Turns ANY cart row into the small, JSON-safe shape the server expects:
+  /// {id, name, price, qty, image, branchId?}  (same as the catalog sends).
+  ///
+  /// Why: the AR builder hands us raw Firestore inventory rows, which can
+  /// contain Timestamp / GeoPoint / DocumentReference values. `jsonEncode`
+  /// cannot turn those into text and throws — which used to be reported as
+  /// a fake "internet connection" problem. A whitelist means only the
+  /// fields we name can ever reach the network.
+  static List<Map<String, dynamic>> _cleanItems(List<Map<String, dynamic>> items) {
+    return items.map((raw) {
+      final price = raw['price'];
+      final qty = raw['qty'];
+      final image = raw['image'];
+      final branch = raw['branchId'];
+
+      return <String, dynamic>{
+        'id': raw['id']?.toString() ?? '',
+        'name': raw['name']?.toString() ?? '',
+        'price': price is num ? price : (num.tryParse('$price') ?? 0),
+        'qty': qty is num && qty >= 1 ? qty.toInt() : 1,
+        'image': image is String ? image : null,
+        if (branch is String && branch.isNotEmpty) 'branchId': branch,
+      };
+    }).toList();
+  }
+
+  /// True only when the failure really looks like "no connection / host
+  /// unreachable". Everything else is reported honestly as something else.
+  static bool _looksLikeNetworkError(Object e) {
+    if (e is http.ClientException) return true;
+    final text = e.toString();
+    return text.contains('SocketException') ||
+        text.contains('Failed host lookup') ||
+        text.contains('HandshakeException') ||
+        text.contains('Connection refused') ||
+        text.contains('Connection reset') ||
+        text.contains('Network is unreachable');
+  }
+
   Future<OrderSubmissionResult> submitOrder({
     required String name,
     required String phone,
@@ -132,13 +172,32 @@ class OrderSubmissionService {
     double? customerLng,
     bool otpVerified = false,
     String? notes,
+    // null = "as soon as possible" (what older app versions always meant).
+    DeliverySchedule? deliverySchedule,
   }) async {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) {
       throw OrderSubmissionException('You must be signed in to place an order.');
     }
 
-    final idToken = await user.getIdToken();
+    // Getting the login token can itself fail (offline, expired session).
+    // Handle it here so it is never mistaken for a problem with the order.
+    String? idToken;
+    try {
+      idToken = await user.getIdToken();
+    } on FirebaseAuthException catch (e) {
+      debugPrint('OrderSubmissionService: getIdToken failed: ${e.code}');
+      if (e.code == 'network-request-failed') {
+        throw OrderSubmissionException(
+          'Could not reach the server. Please check your internet connection and try again.',
+          code: 'NETWORK',
+        );
+      }
+      throw OrderSubmissionException(
+        'Your session has expired. Please sign out and sign in again.',
+        code: 'AUTH',
+      );
+    }
     final deviceHash = await _readDeviceHash();
     final trimmedNotes = notes?.trim() ?? '';
 
@@ -146,44 +205,68 @@ class OrderSubmissionService {
     // between this phone and the server. Used only by the recovery check.
     final requestStartedAt = DateTime.now().subtract(const Duration(minutes: 1));
 
+    // --- Build the request body (no network yet) ---
+    // Encoding is its own step so a data problem is reported as a data
+    // problem, not as "check your internet".
+    final String body;
+    try {
+      body = jsonEncode({
+        'user_id': user.uid,
+        'name': name,
+        'phone': phone,
+        'address': address,
+        'email': email ?? user.email ?? '',
+        'items': _cleanItems(items),
+        'subtotal': subtotal,
+        'shippingFee': shippingFee,
+        'paymentMethod': paymentMethod,
+        'branchId': branchId,
+        'isGift': isGift,
+        if (customerLat != null) 'customerLat': customerLat,
+        if (customerLng != null) 'customerLng': customerLng,
+        if (trimmedNotes.isNotEmpty) 'notes': trimmedNotes,
+        // Same JSON shape the website sends: {mode, date, slot}. The server
+        // re-checks the 3-hour lead and 30-day limit and answers
+        // INVALID_SCHEDULE if the choice does not hold up.
+        if (deliverySchedule != null) 'deliverySchedule': deliverySchedule.toPayload(),
+        'otpVerified': otpVerified,
+        if (deviceHash != null) 'deviceHash': deviceHash,
+      });
+    } catch (e) {
+      debugPrint('OrderSubmissionService: could not build request body: $e');
+      throw OrderSubmissionException(
+        'We could not prepare your order. Please go back to your cart and try again.',
+        code: 'BAD_REQUEST',
+      );
+    }
+
     // --- Send the order ---
     http.Response? response;
     bool timedOut = false;
     try {
       response = await http
           .post(
-        Uri.parse(_endpoint),
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer $idToken',
-        },
-        body: jsonEncode({
-          'user_id': user.uid,
-          'name': name,
-          'phone': phone,
-          'address': address,
-          'email': email ?? user.email ?? '',
-          'items': items,
-          'subtotal': subtotal,
-          'shippingFee': shippingFee,
-          'paymentMethod': paymentMethod,
-          'branchId': branchId,
-          'isGift': isGift,
-          if (customerLat != null) 'customerLat': customerLat,
-          if (customerLng != null) 'customerLng': customerLng,
-          if (trimmedNotes.isNotEmpty) 'notes': trimmedNotes,
-          'otpVerified': otpVerified,
-          if (deviceHash != null) 'deviceHash': deviceHash,
-        }),
-      )
+            Uri.parse(_endpoint),
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer $idToken',
+            },
+            body: body,
+          )
           .timeout(_requestTimeout);
     } on TimeoutException {
       timedOut = true;
     } catch (e) {
       debugPrint('OrderSubmissionService: request failed: $e');
+      if (_looksLikeNetworkError(e)) {
+        throw OrderSubmissionException(
+          'Could not reach the server. Please check your internet connection and try again.',
+          code: 'NETWORK',
+        );
+      }
       throw OrderSubmissionException(
-        'Could not reach the server. Please check your internet connection and try again.',
-        code: 'NETWORK',
+        'Something went wrong while sending your order. Please try again.',
+        code: 'UNEXPECTED',
       );
     }
 
@@ -211,7 +294,7 @@ class OrderSubmissionService {
       data = jsonDecode(response!.body) as Map<String, dynamic>;
     } catch (_) {
       throw OrderSubmissionException(
-        'The server returned an unexpected response. Please try again.',
+        'The server returned an unexpected response (HTTP ${response!.statusCode}). Please try again.',
         code: 'BAD_RESPONSE',
       );
     }
