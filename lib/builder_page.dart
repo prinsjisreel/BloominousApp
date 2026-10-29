@@ -1,12 +1,14 @@
+import 'dart:convert'; // jsonEncode / base64Encode: how models travel to the 3D scene
+import 'dart:typed_data'; // Uint8List: raw bytes of a .glb file
+import 'dart:ui'; // Added for Glassmorphism blur effects
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show rootBundle; // reads the app's own assets
 import 'package:google_fonts/google_fonts.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart'; // reads every branch's inventory
 import 'package:url_launcher/url_launcher.dart';
-import 'package:model_viewer_plus/model_viewer_plus.dart';
 import 'package:camera/camera.dart';
-import 'dart:math' as math;
-import 'dart:ui'; // Added for Glassmorphism blur effects
+import 'package:webview_flutter/webview_flutter.dart'; // the 3D scene lives in one WebView
 import 'inventory_data.dart';
 import 'payment_service.dart';
 import 'delivery_details_page.dart';
@@ -23,6 +25,32 @@ const Color _kRose = Color(0xFF9E5460); // same family as the wrapper paper
 const Color _kRoseDeep = Color(0xFF5A2A32); // dark text on light backgrounds
 const Color _kBlush = Color(0xFFFFF1F3); // soft petal pink
 const Color _kCharcoal = Color(0xFF4A5C66); // left sidebar
+
+// ---------------------------------------------------------------------------
+// WRAPPER COLOUR CHOICES
+// One entry = one round swatch in the "WRAPPER COLOUR" panel.
+//   color == null  -> keep the wrapper model's own colours (no tint)
+//   color != null  -> the wrapper is tinted with this colour
+// To add a colour, add one line here. Nothing else needs to change.
+// ---------------------------------------------------------------------------
+class _WrapSwatch {
+  final String name;
+  final Color? color;
+  const _WrapSwatch(this.name, this.color);
+}
+
+const List<_WrapSwatch> _kWrapSwatches = [
+  _WrapSwatch('Original', null),
+  _WrapSwatch('Blush', Color(0xFFF4B6C2)),
+  _WrapSwatch('Rose', Color(0xFFD9708A)),
+  _WrapSwatch('Red', Color(0xFFC62828)),
+  _WrapSwatch('Lavender', Color(0xFFB39DDB)),
+  _WrapSwatch('Sky', Color(0xFF90CAF9)),
+  _WrapSwatch('Mint', Color(0xFFA5D6A7)),
+  _WrapSwatch('Sunshine', Color(0xFFFFE082)),
+  _WrapSwatch('Cream', Color(0xFFFFF3E0)),
+  _WrapSwatch('Charcoal', Color(0xFF455A64)),
+];
 
 class BuilderPage extends StatefulWidget {
   const BuilderPage({super.key});
@@ -56,24 +84,36 @@ class _BuilderPageState extends State<BuilderPage> {
   late Stream<List<Map<String, dynamic>>> _inventoryStream;
 
   // -------------------------------------------------------------------------
-  // OPTIONAL 3D WRAPPER
-  // Today the wrapper is drawn by Flutter code (the two painter classes at the
-  // bottom of this file). If you ever get real .glb wrapper models, put the
-  // asset paths here and the painters are replaced automatically:
-  //   _wrapperBackModel  = the paper BEHIND the flowers
-  //   _wrapperFrontModel = the collar, skirt and ribbon IN FRONT of the flowers
-  // Leave both null to keep the drawn wrapper.
+  // THE 3D BOUQUET SCENE
+  // The wrapper and ALL the flowers live together in ONE 3D scene (one WebView).
+  // That is what lets the whole bouquet turn 360 degrees as one piece, and what
+  // makes the flowers sit truly INSIDE the wrapper (the scene handles depth).
+  // The look (sizes, how far flowers fan out, spin speed) is tuned in the
+  // CONFIG block at the top of _sceneHtml, at the bottom of this class.
   // -------------------------------------------------------------------------
-  final String? _wrapperBackModel = null; // e.g. 'assets/models/wrapper_back.glb'
-  final String? _wrapperFrontModel = null; // e.g. 'assets/models/wrapper_front.glb'
+  final String? _wrapperModel = 'assets/models/wrapper.glb';
 
-  // -------------------------------------------------------------------------
-  // FLOWER LAYOUT TUNING (all numbers are in the 320 x 440 bouquet space)
-  // -------------------------------------------------------------------------
-  static const double _flowerBoxW = 350.0; // a flower's viewer box at scale 1.0
-  static const double _flowerBoxH = 311.6; // (380 * 0.82, same crop as before)
-  static const double _stemBaseX = 160.0; // middle of the bouquet
-  static const double _headFromTop = 0.25; // flower head sits 25% below the box top
+  // Safety limits so the phone never has to draw an enormous bouquet.
+  static const int _maxPerType = 12; // most stems shown of ONE flower type
+  static const int _maxFlowers = 24; // most stems shown in total
+
+  late final WebViewController _web;
+  bool _sceneReady = false; // the 3D page started and can receive models
+  bool _sceneSynced = false; // the first batch of flowers has been sent
+  bool _syncing = false; // a send is running right now
+  bool _syncAgain = false; // flowers changed again while a send was running
+  final Set<String> _sentModels = {}; // models the scene already has
+  final Set<String> _failedModels = {}; // models that could not be loaded
+  final Map<String, Future<void>> _modelJobs = {}; // one download + send per model
+  final Set<String> _knownSources = {}; // models of the flowers in the list
+  bool _prefetching = false; // the background pre-loader is running
+  final Set<String> _loadingModels = {}; // server models the page is fetching right now
+  static const int _maxPrefetch = 0; // 0 = a model loads only when a flower is picked
+  String? _wrapperNote; // e.g. "wrapper.glb not found"
+  String? _flowerNote; // e.g. "2 flower(s) have no 3D model yet"
+
+  // The colour the customer picked for the wrapper (starts on "Original").
+  _WrapSwatch _wrapSwatch = _kWrapSwatches.first;
 
   final Map<String, String> _modelMapping = {
     'Red Rose': 'assets/models/Rose.glb',
@@ -105,6 +145,8 @@ class _BuilderPageState extends State<BuilderPage> {
       _selectedItems.add(item);
       _manualModelSelection = item['name'];
     });
+    _pushFlowers(); // the flower shows up at once (a stand-in until its model arrives)
+    _syncScene(); // then make sure the real model gets there
   }
 
   void _removeItem(String id) {
@@ -114,6 +156,8 @@ class _BuilderPageState extends State<BuilderPage> {
         _selectedItems.removeAt(index);
       }
     });
+    _pushFlowers(); // the flower disappears at once
+    _syncScene();
   }
 
   int _getItemCount(String id) {
@@ -204,6 +248,7 @@ class _BuilderPageState extends State<BuilderPage> {
     InventoryData.seedInventoryIfEmpty();
     _inventoryStream = _buildInventoryStream();
     _initializeCamera();
+    _initScene();
   }
 
   // "Red Rose", " red  rose " and "RED ROSE" all count as the same product.
@@ -277,6 +322,7 @@ class _BuilderPageState extends State<BuilderPage> {
           .toString()
           .toLowerCase()
           .compareTo((b['name'] ?? '').toString().toLowerCase()));
+      _rememberSources(rows); // start loading their 3D models in the background
       return rows;
     });
   }
@@ -320,251 +366,282 @@ class _BuilderPageState extends State<BuilderPage> {
     super.dispose();
   }
 
-  // One wrapper layer (back or front): a 3D model if a path was given,
-  // otherwise the Flutter-drawn painter.
-  Widget _buildWrapperLayer({
-    required String? modelPath,
-    required CustomPainter painter,
-  }) {
-    if (modelPath == null) {
-      return IgnorePointer(
-        child: CustomPaint(size: const Size(320, 440), painter: painter),
-      );
-    }
-    return IgnorePointer(
-      child: SizedBox(
-        width: 320,
-        height: 440,
-        child: ModelViewer(
-          key: ValueKey('wrapper_$modelPath'),
-          src: modelPath,
-          ar: false,
-          autoRotate: false,
-          cameraControls: false,
-          disableZoom: true,
-          backgroundColor: Colors.transparent,
-          cameraOrbit: '0deg 80deg auto',
-        ),
-      ),
-    );
+  // ---------------------------------------------------------------------
+  // 3D SCENE: Flutter <-> web page
+  //   Flutter -> page : _web.runJavaScript('bloomXxx(...)')
+  //   page -> Flutter : BloomChannel.postMessage('ready' / 'error:...')
+  // ---------------------------------------------------------------------
+
+  // Creates the WebView and loads the 3D page into it.
+  void _initScene() {
+    _web = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setBackgroundColor(Colors.transparent) // the camera shows through
+      ..addJavaScriptChannel('BloomChannel', onMessageReceived: _onSceneMessage)
+      ..loadHtmlString(_sceneHtml);
+
+    // Safety net: if the 3D engine never starts (e.g. no internet), say so.
+    Future.delayed(const Duration(seconds: 30), () {
+      if (mounted && !_sceneReady) {
+        setState(() => _wrapperNote =
+        'The 3D view is taking too long. Check your internet connection.');
+      }
+    });
   }
 
-  Widget _buildModelLayer() {
-    if (_selectedItems.isEmpty) {
-      // Sits in the open space above the wrapper, so the wrapper stays visible.
-      return Align(
-        alignment: const Alignment(0, -0.62),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.local_florist_outlined,
-                size: 52,
-                color: _isArEnabled
-                    ? Colors.white.withOpacity(0.55)
-                    : _kRose.withOpacity(0.55)),
-            const SizedBox(height: 10),
-            Text(
-              'YOUR BOUQUET IS EMPTY',
-              style: GoogleFonts.inter(
-                fontSize: 12,
-                fontWeight: FontWeight.bold,
-                color: _isArEnabled
-                    ? Colors.white.withOpacity(0.85)
-                    : _kRose.withOpacity(0.8),
-                letterSpacing: 2,
-              ),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              'Pick a flower from the list',
-              style: GoogleFonts.inter(
-                fontSize: 11,
-                color: _isArEnabled
-                    ? Colors.white.withOpacity(0.6)
-                    : _kRose.withOpacity(0.6),
-              ),
-            ),
-          ],
-        ),
-      );
+  // Messages sent FROM the page TO Flutter.
+  void _onSceneMessage(JavaScriptMessage message) {
+    final String msg = message.message;
+    if (msg == 'ready') {
+      // The page is alive: send the wrapper, then the flowers picked so far.
+      _sceneReady = true;
+      _pushWrapperToScene();
+      _syncScene();
+      _prefetchAll(); // warm up the models of the flowers in the list
+    } else if (msg.startsWith('modelready:')) {
+      // The page finished reading a model: hide the "Loading..." note.
+      final String src = msg.substring('modelready:'.length);
+      if (mounted) setState(() => _loadingModels.remove(src));
+    } else if (msg.startsWith('modelerror:')) {
+      // A flower model downloaded fine but the 3D page could not read it.
+      // Format: modelerror:<source>|<reason>
+      final String body = msg.substring('modelerror:'.length);
+      final int cut = body.indexOf('|');
+      final String src = cut == -1 ? body : body.substring(0, cut);
+      final String why = cut == -1 ? '' : body.substring(cut + 1);
+      debugPrint('3D model unreadable ($src): $why');
+      _sentModels.remove(src);
+      _failedModels.add(src);
+      if (mounted) setState(() => _loadingModels.remove(src));
+      _syncScene(); // refresh the "no 3D model" note
+    } else if (msg.startsWith('info:')) {
+      // Measurements the page took (wrapper size, flower head size): handy for tuning.
+      debugPrint('3D scene $msg');
+    } else if (msg.startsWith('error:')) {
+      debugPrint('3D scene: $msg');
     }
+  }
 
-    // ---- 1. Group the picked items: one prototype per flower name ----
-    final Map<String, Map<String, dynamic>> itemPrototypes = {};
-    final Map<String, int> itemGroups = {};
+  // Runs one JavaScript call in the page (does nothing before the page is ready).
+  Future<void> _runJs(String js) async {
+    if (!_sceneReady || !mounted) return;
+    try {
+      await _web.runJavaScript(js);
+    } catch (e) {
+      debugPrint('3D scene call failed: $e');
+    }
+  }
+
+  // '#RRGGBB' text that the page understands.
+  String _cssHex(Color c) =>
+      '#${(c.value & 0xFFFFFF).toRadixString(16).padLeft(6, '0')}';
+
+  // Gets the raw bytes of a model that lives INSIDE the app ('assets/...').
+  // Returns null if it cannot be read. (Server models are not handled here:
+  // the 3D page fetches those links itself, see _ensureModelInScene.)
+  Future<Uint8List?> _loadAssetBytes(String path) async {
+    try {
+      final ByteData data = await rootBundle.load(path);
+      return data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
+    } catch (e) {
+      debugPrint('Asset failed to load ($path): $e');
+      return null;
+    }
+  }
+
+  // Sends the wrapper model, its colour and whether it is visible.
+  Future<void> _pushWrapperToScene() async {
+    final String? path = _wrapperModel;
+    if (path != null) {
+      final Uint8List? bytes = await _loadAssetBytes(path);
+      if (bytes != null) {
+        await _runJs('bloomSetWrapper(${jsonEncode(base64Encode(bytes))});');
+      } else if (mounted) {
+        setState(() => _wrapperNote = 'Wrapper model not found ($path).');
+      }
+    }
+    await _applyWrapperColor();
+    await _applyWrapperVisibility();
+  }
+
+  Future<void> _applyWrapperColor() {
+    final Color? c = _wrapSwatch.color;
+    // '' means "Original": the page puts the model's own colours back.
+    return _runJs("bloomSetWrapperColor('${c == null ? '' : _cssHex(c)}');");
+  }
+
+  Future<void> _applyWrapperVisibility() =>
+      _runJs('bloomShowWrapper($_showWrapper);');
+
+  // Which model file a picked flower uses: its own link, else the built-in one.
+  String _modelSourceFor(Map<String, dynamic> item) {
+    final String name = (item['name'] ?? '').toString();
+    final String model = (item['model'] ?? '').toString().trim();
+    if (model.isNotEmpty) return model;
+    return _modelMapping[name] ?? _modelMapping['Red Rose']!;
+  }
+
+  // What the scene should show: one entry per model, with how many copies.
+  // Example: [{src: 'assets/models/Rose.glb', count: 3}, {src: 'https://..', count: 2}]
+  List<Map<String, dynamic>> _desiredFlowers() {
+    final Map<String, int> countBySrc = {};
+    final Map<String, int> countByName = {};
+    int total = 0;
     for (final item in _selectedItems) {
-      final name = item['name'] as String;
-      itemGroups[name] = (itemGroups[name] ?? 0) + 1;
-      itemPrototypes.putIfAbsent(name, () => item);
-    }
-
-    // ---- 2. Flatten to one entry per visible flower ----
-    List<Map<String, dynamic>> visualItems = [];
-    itemGroups.forEach((name, count) {
-      final proto = itemPrototypes[name]!;
-      final String src =
-      (proto['model'] != null && proto['model'].toString().trim().isNotEmpty)
-          ? proto['model'].toString().trim()
-          : (_modelMapping[name] ?? _modelMapping['Red Rose']!);
-
-      // Limit to 6 visible of each flower type to avoid heavy resources but show fullness
-      final int limit = count > 6 ? 6 : count;
-      for (int i = 0; i < limit; i++) {
-        visualItems.add({'name': name, 'src': src, 'index': i});
+      final String name = (item['name'] ?? '').toString();
+      if (total >= _maxFlowers || (countByName[name] ?? 0) >= _maxPerType) {
+        continue;
       }
-    });
-
-    // Every flower is a WebView, so cap the total (max 18 across all varieties)
-    if (visualItems.length > 18) {
-      visualItems = visualItems.sublist(0, 18);
+      final String src = _modelSourceFor(item);
+      countByName[name] = (countByName[name] ?? 0) + 1;
+      countBySrc[src] = (countBySrc[src] ?? 0) + 1;
+      total++;
     }
+    return countBySrc.entries
+        .map((e) => <String, dynamic>{'src': e.key, 'count': e.value})
+        .toList();
+  }
 
-    // ---- 3. Decide HOW MANY ROWS and HOW BIG each flower is ----
-    // Few flowers = one row of big heads. Many flowers = 2-3 rows of smaller
-    // heads, so the wrapper opening never turns into a pile of overlapping blobs.
-    final int total = visualItems.length;
-    final int rows = total <= 5 ? 1 : (total <= 11 ? 2 : 3);
-    final double baseScale = total <= 1
-        ? 0.80
-        : total <= 3
-        ? 0.72
-        : total <= 5
-        ? 0.64
-        : total <= 11
-        ? 0.56
-        : 0.48;
+  // Tells the scene right now how many flowers of each model to show. It does
+  // NOT wait for any download: flowers whose model is still on its way are drawn
+  // as a stand-in bud, then swapped by the real model when it arrives.
+  // Models that failed to load are left out, so no fake bud stays forever.
+  Future<void> _pushFlowers() {
+    final List<Map<String, dynamic>> shown = _desiredFlowers()
+        .where((d) => !_failedModels.contains(d['src']))
+        .toList();
+    return _runJs('bloomSetFlowers(${jsonEncode(shown)});');
+  }
 
-    // ---- 4. Work out where each flower HEAD goes ----
-    final List<Map<String, dynamic>> placed = [];
-    for (int i = 0; i < total; i++) {
-      final item = visualItems[i];
-
-      // Deal flowers out like cards: row 0, row 1, row 2, row 0, row 1 ...
-      final int row = i % rows;
-      final int indexInRow = i ~/ rows;
-      final int rowCount = (total - row + rows - 1) ~/ rows;
-
-      // norm: -1 = far left of its row, 0 = middle, +1 = far right
-      final double norm =
-      rowCount == 1 ? 0.0 : (indexInRow / (rowCount - 1)) * 2 - 1;
-
-      double spreadX; // how far left/right this row's heads reach
-      double headY; // how high this row's heads sit (smaller = higher)
-      double rowSize; // back row is taller, front row is shorter
-      if (rows == 1) {
-        spreadX = math.min(84.0, 26.0 * (total - 1));
-        headY = 122.0;
-        rowSize = 1.0;
-      } else if (row == 0) {
-        spreadX = 88.0; // back row
-        headY = 104.0;
-        rowSize = 1.08;
-      } else if (row == 1) {
-        spreadX = 60.0; // middle row
-        headY = 124.0;
-        rowSize = 1.0;
+  // Downloads one model and sends it to the scene, ONCE. If the pre-loader is
+  // already busy with this model, a tap on "+" simply waits for that same job
+  // instead of downloading the model a second time.
+  Future<void> _ensureModelInScene(String src) {
+    if (!_sceneReady) return Future.value(); // retried when the page says 'ready'
+    return _modelJobs.putIfAbsent(src, () async {
+      _sentModels.add(src);
+      if (src.startsWith('http://') || src.startsWith('https://')) {
+        // SERVER model: only hand the link over. The page downloads it by itself
+        // and reports back 'modelready:' / 'modelerror:'.
+        if (mounted) setState(() => _loadingModels.add(src));
+        await _runJs('bloomLoadUrl(${jsonEncode(src)});');
       } else {
-        spreadX = 32.0; // front row
-        headY = 144.0;
-        rowSize = 0.9;
+        // BUILT-IN model: it is inside the app, so Flutter hands over its bytes.
+        final Uint8List? bytes = await _loadAssetBytes(src);
+        if (bytes == null) {
+          _sentModels.remove(src);
+          _failedModels.add(src);
+        } else {
+          await _runJs(
+              'bloomLoadModel(${jsonEncode(src)}, ${jsonEncode(base64Encode(bytes))});');
+        }
       }
-
-      placed.add({
-        'name': item['name'],
-        'src': item['src'],
-        'index': item['index'],
-        'row': row,
-        'norm': norm,
-        'scale': baseScale * rowSize * (1 - 0.08 * norm * norm),
-        'hx': _stemBaseX + norm * spreadX,
-        // outer flowers sit a little lower, like a natural dome
-        'hy': headY + 16.0 * norm * norm,
-        // outer flowers lean outward; their stems tilt toward the middle
-        'theta': norm * 0.30,
-      });
-    }
-
-    // Paint order: back row first, and inside a row the outer flowers first,
-    // so the middle flower of the front row ends up on top.
-    placed.sort((a, b) {
-      final int byRow = (a['row'] as int).compareTo(b['row'] as int);
-      if (byRow != 0) return byRow;
-      return (b['norm'] as double).abs().compareTo((a['norm'] as double).abs());
     });
+  }
 
-    // ---- 5. Turn every placement into a positioned 3D viewer ----
-    final List<Widget> layers = [];
-    for (int k = 0; k < placed.length; k++) {
-      final p = placed[k];
-      final String name = p['name'] as String;
-      final String src = p['src'] as String;
-      final int itemIndex = p['index'] as int;
-      final double scale = p['scale'] as double;
-      final double hx = p['hx'] as double;
-      final double hy = p['hy'] as double;
-      final double theta = p['theta'] as double;
+  // Remembers which models the flower list uses (the first few only).
+  void _rememberSources(List<Map<String, dynamic>> rows) {
+    for (final row in rows) {
+      if (_knownSources.length >= _maxPrefetch) break;
+      _knownSources.add(_modelSourceFor(row));
+    }
+    _prefetchAll();
+  }
 
-      final double w = _flowerBoxW * scale;
-      final double h = _flowerBoxH * scale;
-
-      // Camera framing per flower type (unchanged from before)
-      String cameraTarget = "0m 0.08m 0m";
-      String cameraOrbit = "0deg 75deg 90%";
-      final String nameLower = name.toLowerCase();
-      if (src.contains('Rose') || nameLower.contains('rose')) {
-        cameraTarget = "0m 0.09m 0m";
-        cameraOrbit = "0deg 75deg 88%";
-      } else if (src.contains('Sunflower') || nameLower.contains('sunflower')) {
-        cameraTarget = "0m 0.09m 0m";
-        cameraOrbit = "0deg 75deg 88%";
-      } else if (src.contains('lily') || nameLower.contains('lily')) {
-        cameraTarget = "0m 0.10m 0m";
-        cameraOrbit = "0deg 75deg 90%";
-      } else if (src.contains('tulip') || nameLower.contains('tulip')) {
-        cameraTarget = "0m 0.09m 0m";
-        cameraOrbit = "0deg 75deg 88%";
+  // Loads those models in the background, one at a time, so the first tap on
+  // "+" does not have to wait for a download.
+  Future<void> _prefetchAll() async {
+    if (!_sceneReady || _prefetching) return;
+    _prefetching = true;
+    try {
+      for (final src in _knownSources.toList()) {
+        if (_failedModels.contains(src)) continue;
+        await _ensureModelInScene(src);
       }
+    } finally {
+      _prefetching = false;
+    }
+  }
 
-      // The LAST layer is painted on top, so it is the one the finger can touch.
-      final bool isLead = k == placed.length - 1;
+  // Makes the scene match the picked flowers. Called after every + / - tap.
+  // Taps that arrive while a send is running are merged into one more pass.
+  Future<void> _syncScene() async {
+    if (!_sceneReady) return; // runs again when the page says 'ready'
+    if (_syncing) {
+      _syncAgain = true;
+      return;
+    }
+    _syncing = true;
+    try {
+      do {
+        _syncAgain = false;
+        final List<Map<String, dynamic>> desired = _desiredFlowers();
 
-      layers.add(
-        Positioned(
-          left: hx - w / 2,
-          top: hy - h * _headFromTop,
-          width: w,
-          height: h,
-          child: Transform.rotate(
-            angle: theta,
-            // Tilt around the flower HEAD, so the head stays where we put it
-            alignment: Alignment(0, _headFromTop * 2 - 1),
-            child: ModelViewer(
-              key: ValueKey('model_${name}_${itemIndex}_${k}_${_isArEnabled}_$src'),
-              src: src,
-              ar: isLead && _isArEnabled,
-              autoRotate: isLead,
-              cameraControls: isLead,
-              // Spin-only: no pinch zoom, no panning, no tilting up/down.
-              disableZoom: true,
-              disablePan: true,
-              disableTap: true,
-              minCameraOrbit: 'auto 75deg auto',
-              maxCameraOrbit: 'auto 75deg auto',
-              backgroundColor: Colors.transparent,
-              arModes: const ['scene-viewer', 'webxr', 'quick-look'],
-              cameraOrbit: cameraOrbit,
-              cameraTarget: cameraTarget,
-              fieldOfView: "auto",
-              loading: Loading.eager,
+        // 1. Make sure the scene has every model it needs (usually it already
+        // does, because the pre-loader sent them while the customer was browsing).
+        for (final d in desired) {
+          final String src = d['src'] as String;
+          if (_failedModels.contains(src)) continue;
+          await _ensureModelInScene(src);
+        }
+
+        // 2. Final update (also removes the stand-in of a model that failed).
+        await _pushFlowers();
+
+        // 3. Note flowers that have no usable 3D model.
+        int missing = 0;
+        for (final d in desired) {
+          if (_failedModels.contains(d['src'])) missing += d['count'] as int;
+        }
+        if (mounted) {
+          setState(() {
+            _sceneSynced = true;
+            _flowerNote =
+            missing > 0 ? '$missing flower(s) have no 3D model yet.' : null;
+          });
+        }
+      } while (_syncAgain);
+    } finally {
+      _syncing = false;
+    }
+  }
+
+  // The hint shown over the scene while no flower is picked.
+  Widget _buildEmptyHint() {
+    return Align(
+      alignment: const Alignment(0, -0.62),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.local_florist_outlined,
+              size: 52,
+              color: _isArEnabled
+                  ? Colors.white.withOpacity(0.55)
+                  : _kRose.withOpacity(0.55)),
+          const SizedBox(height: 10),
+          Text(
+            'YOUR BOUQUET IS EMPTY',
+            style: GoogleFonts.inter(
+              fontSize: 12,
+              fontWeight: FontWeight.bold,
+              color: _isArEnabled
+                  ? Colors.white.withOpacity(0.85)
+                  : _kRose.withOpacity(0.8),
+              letterSpacing: 2,
             ),
           ),
-        ),
-      );
-    }
-
-    return Stack(
-      clipBehavior: Clip.none,
-      children: layers,
+          const SizedBox(height: 4),
+          Text(
+            'Pick a flower from the list',
+            style: GoogleFonts.inter(
+              fontSize: 11,
+              color: _isArEnabled
+                  ? Colors.white.withOpacity(0.6)
+                  : _kRose.withOpacity(0.6),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -643,68 +720,40 @@ class _BuilderPageState extends State<BuilderPage> {
           // 0. BACKDROP (camera, or a soft gradient when there is no camera)
           _buildBackdrop(),
 
-          // 1. BOUQUET SYSTEM: wrapper + flowers. The wrapper is ALWAYS drawn
-          // (even with an empty bouquet) so it never "disappears".
+          // 1. THE 3D BOUQUET: wrapper + flowers in ONE scene. Drag sideways on
+          // it to turn the whole bouquet 360 degrees (it also spins slowly by itself).
           Positioned(
             top: 100, // Pushed down to clear the top logo bar
             bottom: 100 + bottomInset, // Pushed up to clear AR toggles + system bar
             left: 16,
             // Dynamically adjust right padding based on device width and panel state to prevent squishing
             right: _isMenuOpen && _showPanel ? (narrow ? 300 : 370) : 16,
-            child: Center(
-              // The FittedBox ensures the 320x440 wrapper AND the 3D models
-              // scale up or down proportionally on ANY screen size
-              child: FittedBox(
-                fit: BoxFit.contain,
-                child: SizedBox(
-                  width: 320,
-                  height: 440,
-                  child: Stack(
-                    clipBehavior: Clip.none,
-                    children: [
-                      // Soft ground shadow so the bouquet looks like it stands
-                      Positioned(
-                        left: 70,
-                        right: 70,
-                        top: 396,
-                        height: 14,
-                        child: IgnorePointer(
-                          child: DecoratedBox(
-                            decoration: BoxDecoration(
-                              color: Colors.black.withOpacity(0.10),
-                              borderRadius: const BorderRadius.all(
-                                  Radius.elliptical(90, 12)),
-                              boxShadow: [
-                                BoxShadow(
-                                    color: Colors.black.withOpacity(0.28),
-                                    blurRadius: 18,
-                                    spreadRadius: 2),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
-
-                      // Layer 1: Back Wrapper (Outer fanning sheets)
-                      if (_showWrapper)
-                        _buildWrapperLayer(
-                          modelPath: _wrapperBackModel,
-                          painter: BouquetBackWrapperPainter(),
-                        ),
-
-                      // Layer 2: Harmonized flowers (or the "empty" hint)
-                      _buildModelLayer(),
-
-                      // Layer 3: Front Wrapper (White collar tissue, handle, crimson bow)
-                      if (_showWrapper)
-                        _buildWrapperLayer(
-                          modelPath: _wrapperFrontModel,
-                          painter: BouquetFrontWrapperPainter(),
-                        ),
-                    ],
+            child: Stack(
+              children: [
+                Positioned.fill(child: WebViewWidget(controller: _web)),
+                if (_selectedItems.isEmpty) IgnorePointer(child: _buildEmptyHint()),
+                // Small status line: loading, or what could not be loaded.
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  child: IgnorePointer(
+                    child: Text(
+                      !_sceneSynced
+                          ? 'Building your 3D bouquet...'
+                          : _loadingModels.isNotEmpty
+                          ? 'Loading 3D flower...'
+                          : [_wrapperNote, _flowerNote]
+                          .whereType<String>()
+                          .join(' '),
+                      textAlign: TextAlign.center,
+                      style: GoogleFonts.inter(
+                          fontSize: 11,
+                          color: _isArEnabled ? Colors.white70 : _kRoseDeep),
+                    ),
                   ),
                 ),
-              ),
+              ],
             ),
           ),
 
@@ -790,6 +839,10 @@ class _BuilderPageState extends State<BuilderPage> {
                   _buildSearchSection(),
                   const SizedBox(height: 12),
                   Expanded(child: _buildFlowerSelection()),
+                  if (_showWrapper && _wrapperModel != null) ...[
+                    const SizedBox(height: 12),
+                    _buildWrapperColorSection(),
+                  ],
                   const SizedBox(height: 12),
                   _buildSummaryPanel(),
                 ],
@@ -877,7 +930,10 @@ class _BuilderPageState extends State<BuilderPage> {
               heroTag: 'toggle_wrapper',
               backgroundColor:
               _showWrapper ? _kAmber : Colors.white.withOpacity(0.95),
-              onPressed: () => setState(() => _showWrapper = !_showWrapper),
+              onPressed: () {
+                setState(() => _showWrapper = !_showWrapper);
+                _applyWrapperVisibility();
+              },
               tooltip: 'Toggle Wrapper Cover',
               child: Icon(Icons.layers_clear_outlined,
                   color: _showWrapper ? Colors.white : _kAmber),
@@ -1232,6 +1288,72 @@ class _BuilderPageState extends State<BuilderPage> {
     );
   }
 
+  // The "WRAPPER COLOUR" panel: a row of round swatches.
+  Widget _buildWrapperColorSection() {
+    return _buildAestheticPanel(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.palette_outlined, size: 14, color: _kAmberDeep),
+              const SizedBox(width: 6),
+              Text(
+                'WRAPPER COLOUR',
+                style: GoogleFonts.inter(
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                    color: _kRoseDeep,
+                    letterSpacing: 1.5),
+              ),
+              const Spacer(),
+              Text(
+                _wrapSwatch.name,
+                style: GoogleFonts.inter(fontSize: 10, color: Colors.grey[600]),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: _kWrapSwatches.map(_buildWrapSwatch).toList(),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // One round colour button. The picked one gets an amber ring.
+  Widget _buildWrapSwatch(_WrapSwatch swatch) {
+    final bool picked = identical(swatch, _wrapSwatch);
+    return GestureDetector(
+      onTap: () {
+        if (picked) return;
+        setState(() => _wrapSwatch = swatch);
+        _applyWrapperColor(); // instant: no reload, the scene just recolours
+      },
+      child: Container(
+        width: 30,
+        height: 30,
+        margin: const EdgeInsets.only(right: 10),
+        decoration: BoxDecoration(
+          color: swatch.color ?? Colors.white,
+          shape: BoxShape.circle,
+          border: Border.all(
+            color: picked ? _kAmber : _kRose.withOpacity(0.25),
+            width: picked ? 2.5 : 1,
+          ),
+        ),
+        // "Original" has no colour, so it shows a small reset icon instead.
+        child: swatch.color == null
+            ? const Icon(Icons.format_color_reset, size: 15, color: _kRose)
+            : null,
+      ),
+    );
+  }
+
   Widget _buildSummaryPanel() {
     final int stems = _selectedItems.length;
     return _buildAestheticPanel(
@@ -1341,542 +1463,492 @@ class _BuilderPageState extends State<BuilderPage> {
       ),
     );
   }
+
+  // ---------------------------------------------------------------------
+  // The 3D scene page (three.js, a JavaScript 3D library). It is loaded from
+  // the internet when the screen opens, so this screen needs a connection.
+  // ---------------------------------------------------------------------
+  static const String _sceneHtml = r'''
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<style>
+  html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; touch-action: none; }
+  canvas { display: block; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+
+// ---- Tweak the look here -------------------------------------------------
+const CONFIG = {
+  wrapperHeight: 2.2,    // wrapper height in scene units
+  wrapperTiltXDeg: 0,    // use 90, -90 or 180 if wrapper.glb loads lying down / upside down
+  mouthRatio: 0.70,      // width of the wrapper OPENING as a fraction of the wrapper's widest width
+  mouthY: 0.79,          // height of the opening plane (fraction of wrapper height; the tallest paper tips are higher)
+  headLift: 0.0,        // height of the head centres vs the wrapper rim (fraction of wrapper height; negative = nested slightly inside)
+  dome: 0.08,            // the middle heads sit this much higher than the edge ones (a gentle dome, like a real bouquet)
+  spread: 0.72,          // how far from the middle the outer heads may go (fraction of the opening radius)
+  headWidth: 0.38,       // width of EVERY flower head, as a fraction of the wrapper opening (never changes with the count)
+  gap: 0.90,             // spacing between heads when there is room (1 = just touching, lower = overlapping a bit)
+  headFrac: 0.88,        // fallback only: how high up a flower its head centre is (each model is measured)
+  faceAxis: 'z',         // which way the flower's FACE points in its own 3D model when the stem is upright:
+                         //   'z' = toward you (most models), '-z', 'x', '-x', or 'y' = straight up along the stem
+  fanYawDeg: 50,         // flowers on the left/right turn their faces this much to the left/right (a fan, like a real bouquet)
+  faceElevationDeg: 40,  // how far the faces tilt UP from sideways (0 = look straight out, 90 = look straight up)
+  clipBelow: 0.55,       // flower parts below this point inside the wrapper are hidden (0 = at the waist, 1 = at the rim)
+  camLift: 0.25,         // how far above the bouquet the camera sits (0 = eye level, bigger = looks more down into it)
+  autoSpin: 0,           // 0 = the bouquet only turns when the customer drags it
+  viewHeight: 3.1,       // how much of the scene must fit on screen (height)
+  viewWidth: 2.5,        // ... and (width)
+  lookY: 1.15,           // the camera looks at this height
+  // Wrapper paper look: matte, soft and even (not glossy plastic)
+  wrapperRoughness: 0.92, // 0 = shiny, 1 = fully matte
+  wrapperMetalness: 0,    // paper is not metal
+  wrapperEnv: 0.55,       // how strongly the room reflects on it (lower = flatter, softer)
+  sunLight: 0.55,         // the one directional light (lower = softer shadows)
+  fillLight: 1.1          // even light from all sides (higher = brighter creases)
+};
+// --------------------------------------------------------------------------
+
+function post(msg) {
+  if (window.BloomChannel) window.BloomChannel.postMessage(msg);
 }
 
-class BouquetBackWrapperPainter extends CustomPainter {
-  @override
-  void paint(Canvas canvas, Size size) {
-    final width = size.width;
-    final height = size.height;
-    final rect = Rect.fromLTWH(-60, 0, width + 120, height);
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setClearColor(0x000000, 0);              // transparent: the camera shows through
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.localClippingEnabled = true;             // lets us cut the hidden lower part of the flowers
+document.body.appendChild(renderer.domElement);
 
-    canvas.save();
-    canvas.translate(width * 0.5, height * 0.64);
-    canvas.scale(0.80, 0.80);
-    canvas.translate(-width * 0.5, -height * 0.64);
+const scene = new THREE.Scene();
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;   // soft studio light
+const sun = new THREE.DirectionalLight(0xffffff, CONFIG.sunLight);
+sun.position.set(3, 6, 4);
+scene.add(sun);
+scene.add(new THREE.HemisphereLight(0xffffff, 0xe8e8f0, CONFIG.fillLight));   // soft light from every side
 
-    // Soft drop shadow for paper depth & ambient occlusion
-    final dropShadow = Paint()
-      ..color = const Color(0x3D000000)
-      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 6.0);
+const camera = new THREE.PerspectiveCamera(35, 1, 0.1, 100);
 
-    // 0. Solid Center Backing Sheet Shader
-    final backingPaint = Paint()
-      ..shader = const LinearGradient(
-        begin: Alignment.bottomCenter,
-        end: Alignment.topCenter,
-        colors: [Color(0xFF381B20), Color(0xFF63333B), Color(0xFF8C4C56)],
-        stops: [0.0, 0.45, 1.0],
-      ).createShader(rect);
+// "spin" holds the wrapper AND the flowers, so they always rotate TOGETHER.
+const spin = new THREE.Group();
+const wrapperGroup = new THREE.Group();
+const flowerGroup = new THREE.Group();
+spin.add(wrapperGroup);
+spin.add(flowerGroup);
+scene.add(spin);
 
-    // 1. Far Back Left Wing Shader
-    final farLeftPaint = Paint()
-      ..shader = const LinearGradient(
-        begin: Alignment.bottomRight,
-        end: Alignment.topLeft,
-        colors: [Color(0xFF452026), Color(0xFF753A44), Color(0xFF9E5460)],
-      ).createShader(rect);
+// Soft shadow on the "floor" (does not spin).
+(function addShadow() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const g = c.getContext('2d');
+  const grad = g.createRadialGradient(64, 64, 4, 64, 64, 62);
+  grad.addColorStop(0, 'rgba(0,0,0,0.45)');
+  grad.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 128, 128);
+  const mesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(2.2, 2.2),
+    new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(c), transparent: true, depthWrite: false })
+  );
+  mesh.rotation.x = -Math.PI / 2;
+  mesh.position.y = 0.01;
+  scene.add(mesh);
+})();
 
-    // 2. Far Back Right Wing Shader
-    final farRightPaint = Paint()
-      ..shader = const LinearGradient(
-        begin: Alignment.bottomLeft,
-        end: Alignment.topRight,
-        colors: [Color(0xFF452026), Color(0xFF753A44), Color(0xFF9E5460)],
-      ).createShader(rect);
+const loader = new GLTFLoader();
+// Many exported models are compressed (Draco / Meshopt). Without these two
+// decoders such a model silently fails to load and the flower never appears.
+const draco = new DRACOLoader();
+draco.setDecoderPath('https://unpkg.com/three@0.160.0/examples/jsm/libs/draco/gltf/');
+loader.setDRACOLoader(draco);
+loader.setMeshoptDecoder(MeshoptDecoder);
+// A simple stand-in flower (green stem + pink bud). It is shown instantly while
+// the real 3D model is still downloading, then swapped for the real one.
+const placeholder = (function () {
+  const g = new THREE.Group();
+  const stem = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.012, 0.012, 0.8, 8),
+    new THREE.MeshStandardMaterial({ color: 0x4f7a3a, roughness: 0.8 })
+  );
+  stem.position.y = 0.4;
+  const bud = new THREE.Mesh(
+    new THREE.SphereGeometry(0.09, 20, 14),
+    new THREE.MeshStandardMaterial({ color: 0xe8a0b4, roughness: 0.6 })
+  );
+  bud.position.y = 0.86;
+  bud.scale.y = 1.25;
+  g.add(stem, bud);
+  g.userData.width = 0.18;     // widest part, at height 1 (used by the fit rule)
+  g.userData.headFrac = 0.86;  // how high the bud sits
+  return g;
+})();
+const modelCache = {};      // model source -> ready-to-clone flower (scaled, bottom-centred)
+let desired = [];           // [{src, count}] sent by Flutter
+// Measured from the REAL wrapper model when it loads (these are only fallbacks):
+//   waistY = height of the narrow "tie" where the stems are gathered
+//   rimY   = height of the top edge
+//   openR  = radius of the opening at the top
+let fit = { waistY: CONFIG.wrapperHeight * 0.4, rimY: CONFIG.wrapperHeight, openR: CONFIG.wrapperHeight * 0.35 };
+let wrapperColor = '';      // '' = keep the wrapper's own colours
+let wrapperVisible = true;
 
-    // 3. Medium Layer Left Fold Shader
-    final medLeftPaint = Paint()
-      ..shader = const LinearGradient(
-        begin: Alignment.bottomRight,
-        end: Alignment.topLeft,
-        colors: [Color(0xFF5A2A32), Color(0xFF944F5B), Color(0xFFBF7582)],
-      ).createShader(rect);
+function b64ToBuffer(b64) {
+  return fetch('data:application/octet-stream;base64,' + b64).then(r => r.arrayBuffer());
+}
+function parseGlb(buffer) {
+  return new Promise((resolve, reject) => loader.parse(buffer, '', resolve, reject));
+}
+function fail(err) { post('error:' + ((err && err.message) || err)); }
 
-    // 4. Medium Layer Right Fold Shader
-    final medRightPaint = Paint()
-      ..shader = const LinearGradient(
-        begin: Alignment.bottomLeft,
-        end: Alignment.topRight,
-        colors: [Color(0xFF5A2A32), Color(0xFF944F5B), Color(0xFFBF7582)],
-      ).createShader(rect);
-
-    // 5. Inner Decorative Folds Shader (Lighter Peach-Rose)
-    final innerLeftPaint = Paint()
-      ..shader = const LinearGradient(
-        begin: Alignment.bottomRight,
-        end: Alignment.topLeft,
-        colors: [Color(0xFF82414C), Color(0xFFC47D8A), Color(0xFFE8A8B4)],
-      ).createShader(rect);
-
-    final innerRightPaint = Paint()
-      ..shader = const LinearGradient(
-        begin: Alignment.bottomLeft,
-        end: Alignment.topRight,
-        colors: [Color(0xFF82414C), Color(0xFFC47D8A), Color(0xFFE8A8B4)],
-      ).createShader(rect);
-
-    // Gold/Cream Metallic Accent Edging
-    final goldEdgePaint = Paint()
-      ..shader = const LinearGradient(
-        begin: Alignment.centerLeft,
-        end: Alignment.centerRight,
-        colors: [Color(0xFFE8C897), Color(0xFFFFF6E5), Color(0xFFD4AF37)],
-      ).createShader(rect);
-
-    // White Tissue Paper Liner with soft gradient
-    final tissuePaint = Paint()
-      ..shader = const LinearGradient(
-        begin: Alignment.bottomCenter,
-        end: Alignment.topCenter,
-        colors: [Color(0xFFDCDCDC), Color(0xFFF7F7F7), Color(0xFFFFFFFF)],
-      ).createShader(rect);
-
-    final path = Path();
-
-    // 0. Solid Center Backing Sheet
-    final backingPath = Path();
-    backingPath.moveTo(60.0, height * 0.12);
-    backingPath.quadraticBezierTo(
-        width * 0.50, height * 0.04, width - 60.0, height * 0.12);
-    backingPath.quadraticBezierTo(
-        width * 0.78, height * 0.42, width * 0.50, height * 0.70);
-    backingPath.quadraticBezierTo(
-        width * 0.22, height * 0.42, 60.0, height * 0.12);
-    backingPath.close();
-    canvas.drawPath(backingPath, backingPaint);
-
-    // 1. Far Back Left Wing (Trimming maroon width by ~15% to avoid bulkiness)
-    path.reset();
-    path.moveTo(width * 0.5, height * 0.70);
-    path.quadraticBezierTo(width * 0.12, height * 0.45, -20.0, height * 0.15);
-    path.quadraticBezierTo(width * 0.18, height * 0.08, 62.0, height * 0.05);
-    path.quadraticBezierTo(
-        width * 0.38, height * 0.15, width * 0.5, height * 0.40);
-    path.close();
-    canvas.drawPath(path.shift(const Offset(0, 3)), dropShadow);
-    canvas.drawPath(path, farLeftPaint);
-
-    // 2. Far Back Right Wing
-    path.reset();
-    path.moveTo(width * 0.5, height * 0.70);
-    path.quadraticBezierTo(
-        width * 0.88, height * 0.45, width + 20.0, height * 0.15);
-    path.quadraticBezierTo(
-        width * 0.82, height * 0.08, width - 62.0, height * 0.05);
-    path.quadraticBezierTo(
-        width * 0.62, height * 0.15, width * 0.5, height * 0.40);
-    path.close();
-    canvas.drawPath(path.shift(const Offset(0, 3)), dropShadow);
-    canvas.drawPath(path, farRightPaint);
-
-    // 3. Medium Layer Left Fold
-    path.reset();
-    path.moveTo(width * 0.5, height * 0.70);
-    path.quadraticBezierTo(width * 0.20, height * 0.52, -2.0, height * 0.28);
-    path.quadraticBezierTo(width * 0.25, height * 0.22, 80.0, height * 0.18);
-    path.quadraticBezierTo(
-        width * 0.42, height * 0.32, width * 0.5, height * 0.55);
-    path.close();
-    canvas.drawPath(path.shift(const Offset(1, 3)), dropShadow);
-    canvas.drawPath(path, medLeftPaint);
-
-    // Gold/Cream highlight edge for Medium Left Fold
-    final highlightPath = Path();
-    highlightPath.moveTo(-2.0, height * 0.28);
-    highlightPath.quadraticBezierTo(
-        width * 0.25, height * 0.22, 80.0, height * 0.18);
-    highlightPath.lineTo(75.0, height * 0.19);
-    highlightPath.quadraticBezierTo(
-        width * 0.23, height * 0.23, 2.0, height * 0.29);
-    highlightPath.close();
-    canvas.drawPath(highlightPath, goldEdgePaint);
-
-    // 4. Medium Layer Right Fold
-    path.reset();
-    path.moveTo(width * 0.5, height * 0.70);
-    path.quadraticBezierTo(
-        width * 0.80, height * 0.52, width + 2.0, height * 0.28);
-    path.quadraticBezierTo(
-        width * 0.75, height * 0.22, width - 80.0, height * 0.18);
-    path.quadraticBezierTo(
-        width * 0.58, height * 0.32, width * 0.5, height * 0.55);
-    path.close();
-    canvas.drawPath(path.shift(const Offset(-1, 3)), dropShadow);
-    canvas.drawPath(path, medRightPaint);
-
-    // Highlight edge for Medium Right Fold
-    highlightPath.reset();
-    highlightPath.moveTo(width + 2.0, height * 0.28);
-    highlightPath.quadraticBezierTo(
-        width * 0.75, height * 0.22, width - 80.0, height * 0.18);
-    highlightPath.lineTo(width - 75.0, height * 0.19);
-    highlightPath.quadraticBezierTo(
-        width * 0.73, height * 0.23, width - 2.0, height * 0.29);
-    highlightPath.close();
-    canvas.drawPath(highlightPath, goldEdgePaint);
-
-    // 5. Inner Decorative Folds
-    // Inner Left fold
-    path.reset();
-    path.moveTo(width * 0.5, height * 0.70);
-    path.quadraticBezierTo(width * 0.30, height * 0.45, 42.0, height * 0.35);
-    path.lineTo(98.0, height * 0.24);
-    path.quadraticBezierTo(
-        width * 0.46, height * 0.40, width * 0.5, height * 0.62);
-    path.close();
-    canvas.drawPath(path.shift(const Offset(1, 2)), dropShadow);
-    canvas.drawPath(path, innerLeftPaint);
-
-    // Inner Right fold
-    path.reset();
-    path.moveTo(width * 0.5, height * 0.70);
-    path.quadraticBezierTo(
-        width * 0.70, height * 0.45, width - 42.0, height * 0.35);
-    path.lineTo(width - 98.0, height * 0.24);
-    path.quadraticBezierTo(
-        width * 0.54, height * 0.40, width * 0.5, height * 0.62);
-    path.close();
-    canvas.drawPath(path.shift(const Offset(-1, 2)), dropShadow);
-    canvas.drawPath(path, innerRightPaint);
-
-    // PRISTINE WHITE TISSUE PAPER LINER (Fanned outward to cleanly frame flowers and define shape)
-    path.reset();
-    path.moveTo(width * 0.22, height * 0.70);
-    path.quadraticBezierTo(
-        width * 0.08, height * 0.42, width * 0.08, height * 0.26);
-    path.quadraticBezierTo(
-        width * 0.32, height * 0.34, width * 0.50, height * 0.32);
-    path.quadraticBezierTo(
-        width * 0.68, height * 0.34, width * 0.92, height * 0.26);
-    path.quadraticBezierTo(
-        width * 0.92, height * 0.42, width * 0.78, height * 0.70);
-    path.close();
-    canvas.drawPath(path, tissuePaint);
-    canvas.restore();
-  }
-
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+function materialsOf(obj) {
+  if (!obj.isMesh) return [];
+  return Array.isArray(obj.material) ? obj.material : [obj.material];
 }
 
-class BouquetFrontWrapperPainter extends CustomPainter {
-  @override
-  void paint(Canvas canvas, Size size) {
-    final width = size.width;
-    final height = size.height;
-    final rect = Rect.fromLTWH(-20, 0, width + 40, height);
+// Tints every material of the wrapper, or puts the original colours back.
+function applyWrapperColor() {
+  wrapperGroup.traverse(obj => {
+    materialsOf(obj).forEach(m => {
+      if (!m.color) return;
+      if (!m.userData.origColor) m.userData.origColor = m.color.clone();
+      if (wrapperColor) m.color.set(wrapperColor);
+      else m.color.copy(m.userData.origColor);
+    });
+  });
+}
 
-    canvas.save();
-    canvas.translate(width * 0.5, height * 0.64);
-    canvas.scale(0.80, 0.80);
-    canvas.translate(-width * 0.5, -height * 0.64);
+// Looks at every point of the wrapper and works out where its waist and opening are.
+function measureWrapper() {
+  spin.updateMatrixWorld(true);
+  const H = CONFIG.wrapperHeight;
+  const SLICES = 40;
+  const widest = new Array(SLICES).fill(0);   // widest point of each horizontal slice
+  const v = new THREE.Vector3();
+  wrapperGroup.traverse(o => {
+    if (!o.isMesh || !o.geometry.attributes.position) return;
+    const pos = o.geometry.attributes.position;
+    for (let k = 0; k < pos.count; k++) {
+      v.fromBufferAttribute(pos, k).applyMatrix4(o.matrixWorld);
+      const r = Math.hypot(v.x, v.z);
+      const s = Math.min(SLICES - 1, Math.max(0, Math.floor(v.y / H * SLICES)));
+      if (r > widest[s]) widest[s] = r;
+    }
+  });
 
-    // Drop Shadow for Ambient Occlusion
-    final dropShadow = Paint()
-      ..color = const Color(0x40000000)
-      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 7.0);
+  // Waist = the narrowest slice in the middle part of the wrapper.
+  let bestSlice = -1, bestWidth = Infinity;
+  for (let s = Math.floor(SLICES * 0.25); s <= Math.floor(SLICES * 0.7); s++) {
+    const w = ((widest[s - 1] || widest[s]) + widest[s] + (widest[s + 1] || widest[s])) / 3;
+    if (w > 0 && w < bestWidth) { bestWidth = w; bestSlice = s; }
+  }
+  fit.waistY = bestSlice >= 0 ? (bestSlice + 0.5) / SLICES * H : H * 0.4;
 
-    final softShadow = Paint()
-      ..color = const Color(0x28000000)
-      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 4.0);
+  // The opening: the widest part of the wrapper is its full width; the mouth is a fixed
+  // share of that. (Reading the opening from the paper tips is unreliable: they are thin.)
+  const maxR = Math.max.apply(null, widest);
+  fit.openR = Math.max(H * 0.2, CONFIG.mouthRatio * maxR);
+  fit.rimY = CONFIG.mouthY * H;                                   // the plane the heads sit on
+  fit.waistY = Math.min(H * 0.6, Math.max(H * 0.3, fit.waistY));  // keep the waist believable
+  post('info:wrapper widest=' + (maxR * 2).toFixed(2) + ' height=' + H + ' waistY=' + fit.waistY.toFixed(2) +
+       ' mouthR=' + fit.openR.toFixed(2) + ' mouthY=' + fit.rimY.toFixed(2));
+}
 
-    // Shaders for Front Wrapper Folds
-    final tissuePaint = Paint()
-      ..shader = const LinearGradient(
-        begin: Alignment.bottomCenter,
-        end: Alignment.topCenter,
-        colors: [Color(0xFFDCDCDC), Color(0xFFF7F7F7), Color(0xFFFFFFFF)],
-      ).createShader(rect);
+// Where do the heads go? A list of {x, z, u} spots on the wrapper opening.
+//   u = 0 in the middle ... 1 at the outer edge (used to make a gentle dome).
+const GOLDEN = 2.399963;   // golden angle: spreads points evenly, like sunflower seeds
+function layoutHeads(n, headW, R) {
+  const pts = [];
+  if (n === 1) return [{ x: 0, z: 0, u: 0 }];
+  if (n <= 6) {
+    // A few flowers: one in the middle (from 5 up) and the rest in a ring, just touching.
+    const ring = n >= 5 ? n - 1 : n;
+    const rho = Math.min(R, (headW * 0.5 / Math.sin(Math.PI / ring)) * 0.9);
+    if (n >= 5) pts.push({ x: 0, z: 0, u: 0 });
+    for (let k = 0; k < ring; k++) {
+      const a = (k / ring) * Math.PI * 2 + 0.4;
+      pts.push({ x: Math.sin(a) * rho, z: -Math.cos(a) * rho, u: rho / R });
+    }
+    return pts;
+  }
+  // Many flowers: a sunflower-seed spiral. The heads keep their size and spacing;
+  // only when the opening is full do they start to overlap (the spiral is squeezed to fit).
+  const c = Math.min(headW * CONFIG.gap / 1.8, R / Math.sqrt(n));
+  for (let i = 0; i < n; i++) {
+    const r = c * Math.sqrt(i + 0.5);
+    const a = i * GOLDEN;
+    pts.push({ x: Math.sin(a) * r, z: -Math.cos(a) * r, u: r / R });
+  }
+  return pts;
+}
 
-    final frontLeftPaint = Paint()
-      ..shader = const LinearGradient(
-        begin: Alignment.bottomRight,
-        end: Alignment.topLeft,
-        colors: [Color(0xFF6B333B), Color(0xFFB06873), Color(0xFFD997A0)],
-      ).createShader(rect);
+const UP = new THREE.Vector3(0, 1, 0);
 
-    final frontRightPaint = Paint()
-      ..shader = const LinearGradient(
-        begin: Alignment.bottomLeft,
-        end: Alignment.topRight,
-        colors: [Color(0xFF52252C), Color(0xFF8F4D57), Color(0xFFC27B86)],
-      ).createShader(rect);
+// Everything of a flower that is far down INSIDE the wrapper is invisible anyway,
+// but leaves and stems can poke through the paper at the waist. So the part of each
+// flower below this height is cut off. (Not when the wrapper is hidden.)
+const clipPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+function applyFlowerClip() {
+  clipPlane.constant = -(fit.waistY + CONFIG.clipBelow * (fit.rimY - fit.waistY));
+  const templates = Object.values(modelCache).concat([placeholder]);
+  templates.forEach(tpl => tpl.traverse(o => {
+    materialsOf(o).forEach(m => {
+      const want = wrapperVisible ? [clipPlane] : null;
+      if ((m.clippingPlanes && m.clippingPlanes.length) !== (want && want.length)) m.needsUpdate = true;
+      m.clippingPlanes = want;
+    });
+  }));
+}
 
-    final goldEdgePaint = Paint()
-      ..shader = const LinearGradient(
-        begin: Alignment.centerLeft,
-        end: Alignment.centerRight,
-        colors: [Color(0xFFE8C897), Color(0xFFFFF6E5), Color(0xFFD4AF37)],
-      ).createShader(rect);
+// Turns a flower so (1) its stem points along `dir` and (2) its FACE looks toward the
+// FRONT of the bouquet and a bit upward, fanned slightly to the left or right depending
+// on which side of the bouquet the flower is on. Like a real florist bouquet, nothing
+// faces the back: from behind you only see the wrapper. (The flowers cannot be turned
+// one by one, so they are placed facing the right way from the start.)
+const _Y = new THREE.Vector3(), _Z = new THREE.Vector3(), _X = new THREE.Vector3(), _F = new THREE.Vector3();
+const _M = new THREE.Matrix4();
+function orientFlower(q, dir, p, i) {
+  if (CONFIG.faceAxis === 'y') { q.setFromUnitVectors(UP, dir); return; }
 
-    final skirtPaint = Paint()
-      ..shader = const LinearGradient(
-        begin: Alignment.topCenter,
-        end: Alignment.bottomCenter,
-        colors: [Color(0xFF5C2C33), Color(0xFF8F4D58), Color(0xFFB8727E)],
-      ).createShader(rect);
+  // The direction the face should look: toward the front (+z), fanned left/right by
+  // where the flower stands (left flowers look a bit left, right ones a bit right),
+  // and tilted upward.
+  const xn = Math.max(-1, Math.min(1, p.x / (fit.openR * CONFIG.spread)));
+  const yaw = THREE.MathUtils.degToRad(CONFIG.fanYawDeg) * xn;
+  const elev = THREE.MathUtils.degToRad(CONFIG.faceElevationDeg + 8 * Math.sin(i * 2.1));
+  _F.set(Math.sin(yaw) * Math.cos(elev), Math.sin(elev), Math.cos(yaw) * Math.cos(elev)).normalize();
 
-    final skirtLeftPaint = Paint()
-      ..shader = const LinearGradient(
-        begin: Alignment.topRight,
-        end: Alignment.bottomLeft,
-        colors: [Color(0xFF38181D), Color(0xFF6E363E), Color(0xFF99535E)],
-      ).createShader(rect);
+  // Keep the face direction at a right angle to the stem, then build the flower's 3 axes.
+  _Y.copy(dir);
+  _F.addScaledVector(_Y, -_F.dot(_Y));
+  if (_F.lengthSq() < 1e-6) { q.setFromUnitVectors(UP, dir); return; }
+  _F.normalize();
+  switch (CONFIG.faceAxis) {
+    case '-z': _Z.copy(_F).negate(); _X.crossVectors(_Y, _Z); break;
+    case 'x':  _X.copy(_F); _Z.crossVectors(_X, _Y); break;
+    case '-x': _X.copy(_F).negate(); _Z.crossVectors(_X, _Y); break;
+    default:   _Z.copy(_F); _X.crossVectors(_Y, _Z);      // 'z'
+  }
+  _M.makeBasis(_X, _Y, _Z);
+  q.setFromRotationMatrix(_M);
+}
 
-    final skirtRightPaint = Paint()
-      ..shader = const LinearGradient(
-        begin: Alignment.topLeft,
-        end: Alignment.bottomRight,
-        colors: [Color(0xFF421E23), Color(0xFF7A3C45), Color(0xFFA65E69)],
-      ).createShader(rect);
+// Builds the bouquet. For each flower we first decide WHERE ITS HEAD goes (a spot
+// inside the wrapper opening), then we size and tilt the flower so the head lands
+// exactly there, with the stem running back down to the wrapper's waist.
+function rebuild() {
+  while (flowerGroup.children.length) flowerGroup.remove(flowerGroup.children[0]);
+  applyFlowerClip();
 
-    final path = Path();
-
-    // --- 0. FRONT WRAPPING COLLAR ---
-    // White Tissue Paper Collar (Lining inside front paper - pushed outward to define shape)
-    final frontTissue = Path();
-    frontTissue.moveTo(width * 0.16, height * 0.70);
-    frontTissue.quadraticBezierTo(
-        width * 0.04, height * 0.42, width * 0.05, height * 0.28);
-    frontTissue.quadraticBezierTo(
-        width * 0.35, height * 0.36, width * 0.50, height * 0.34);
-    frontTissue.quadraticBezierTo(
-        width * 0.65, height * 0.36, width * 0.95, height * 0.28);
-    frontTissue.quadraticBezierTo(
-        width * 0.96, height * 0.42, width * 0.84, height * 0.70);
-    frontTissue.close();
-    canvas.drawPath(frontTissue, tissuePaint);
-
-    // Front Left Outer Paper Fold (Trimmed width by ~15%)
-    final frontLeft = Path();
-    frontLeft.moveTo(width * 0.50, height * 0.70);
-    frontLeft.quadraticBezierTo(
-        width * 0.14, height * 0.46, width * 0.11, height * 0.32);
-    frontLeft.quadraticBezierTo(
-        width * 0.35, height * 0.37, width * 0.61, height * 0.43);
-    frontLeft.quadraticBezierTo(
-        width * 0.55, height * 0.58, width * 0.50, height * 0.70);
-    frontLeft.close();
-    canvas.drawPath(frontLeft.shift(const Offset(1, 3)), dropShadow);
-    canvas.drawPath(frontLeft, frontLeftPaint);
-
-    // Gold/Cream border on Front Left Fold
-    final frontLeftEdge = Path();
-    frontLeftEdge.moveTo(width * 0.11, height * 0.32);
-    frontLeftEdge.quadraticBezierTo(
-        width * 0.35, height * 0.37, width * 0.61, height * 0.43);
-    frontLeftEdge.lineTo(width * 0.60, height * 0.44);
-    frontLeftEdge.quadraticBezierTo(
-        width * 0.35, height * 0.38, width * 0.12, height * 0.33);
-    frontLeftEdge.close();
-    canvas.drawPath(frontLeftEdge, goldEdgePaint);
-
-    // Front Right Outer Paper Fold (Trimmed width by ~15%)
-    final frontRight = Path();
-    frontRight.moveTo(width * 0.50, height * 0.70);
-    frontRight.quadraticBezierTo(
-        width * 0.86, height * 0.46, width * 0.89, height * 0.32);
-    frontRight.quadraticBezierTo(
-        width * 0.65, height * 0.37, width * 0.39, height * 0.43);
-    frontRight.quadraticBezierTo(
-        width * 0.45, height * 0.58, width * 0.50, height * 0.70);
-    frontRight.close();
-    canvas.drawPath(frontRight.shift(const Offset(-2, 3)), dropShadow);
-    canvas.drawPath(frontRight, frontRightPaint);
-
-    // Gold/Cream border on Front Right Fold
-    final frontRightEdge = Path();
-    frontRightEdge.moveTo(width * 0.89, height * 0.32);
-    frontRightEdge.quadraticBezierTo(
-        width * 0.65, height * 0.37, width * 0.39, height * 0.43);
-    frontRightEdge.lineTo(width * 0.40, height * 0.44);
-    frontRightEdge.quadraticBezierTo(
-        width * 0.65, height * 0.38, width * 0.88, height * 0.33);
-    frontRightEdge.close();
-    canvas.drawPath(frontRightEdge, goldEdgePaint);
-
-    // --- 1. THE LUXURY PLEATED LOWER WRAPPER SLING ("Skirt") ---
-    // Background layer of skirt
-    path.reset();
-    path.moveTo(width * 0.42, height * 0.70);
-    path.lineTo(width * 0.58, height * 0.70);
-    path.quadraticBezierTo(
-        width * 0.62, height * 0.88, width * 0.71, height * 0.98);
-    path.lineTo(width * 0.29, height * 0.98);
-    path.quadraticBezierTo(
-        width * 0.38, height * 0.88, width * 0.42, height * 0.70);
-    path.close();
-    canvas.drawPath(path.shift(const Offset(0, 4)), dropShadow);
-    canvas.drawPath(path, skirtPaint);
-
-    // Sculpted Left pleated sheet
-    path.reset();
-    path.moveTo(width * 0.42, height * 0.70);
-    path.lineTo(width * 0.50, height * 0.70);
-    path.quadraticBezierTo(
-        width * 0.36, height * 0.85, width * 0.25, height * 0.98);
-    path.lineTo(width * 0.20, height * 0.98);
-    path.quadraticBezierTo(
-        width * 0.32, height * 0.85, width * 0.42, height * 0.70);
-    path.close();
-    canvas.drawPath(path, skirtLeftPaint);
-
-    // Sculpted Right pleated sheet
-    path.reset();
-    path.moveTo(width * 0.50, height * 0.70);
-    path.lineTo(width * 0.58, height * 0.70);
-    path.quadraticBezierTo(
-        width * 0.64, height * 0.85, width * 0.80, height * 0.98);
-    path.lineTo(width * 0.75, height * 0.98);
-    path.quadraticBezierTo(
-        width * 0.68, height * 0.85, width * 0.58, height * 0.70);
-    path.close();
-    canvas.drawPath(path, skirtRightPaint);
-
-    // Gold highlight liner on right crease
-    final creasePath = Path();
-    creasePath.moveTo(width * 0.60, height * 0.70);
-    creasePath.quadraticBezierTo(
-        width * 0.70, height * 0.85, width * 0.84, height * 0.98);
-    creasePath.lineTo(width * 0.82, height * 0.98);
-    creasePath.quadraticBezierTo(
-        width * 0.68, height * 0.85, width * 0.58, height * 0.70);
-    creasePath.close();
-    canvas.drawPath(creasePath, goldEdgePaint);
-
-    // --- 2. HIGH-END SATIN RED RIBBON BOW WITH REALISTIC SHADING ---
-    const double bowX = 160.0;
-    const double bowY = 315.0;
-
-    final ribbonGradient = const LinearGradient(
-      begin: Alignment.topLeft,
-      end: Alignment.bottomRight,
-      colors: [Color(0xFFFF4D4D), Color(0xFFD32F2F), Color(0xFF7A0000)],
-      stops: [0.0, 0.5, 1.0],
-    ).createShader(const Rect.fromLTWH(bowX - 80, bowY - 40, 160, 160));
-
-    final ribbonPaint = Paint()..shader = ribbonGradient;
-
-    final ribbonShadowGrad = const LinearGradient(
-      begin: Alignment.topCenter,
-      end: Alignment.bottomCenter,
-      colors: [Color(0xFF520000), Color(0xFF2B0000)],
-    ).createShader(const Rect.fromLTWH(bowX - 80, bowY - 40, 160, 160));
-
-    final ribbonShadowPaint = Paint()..shader = ribbonShadowGrad;
-
-    final ribbonSheenPaint = Paint()
-      ..shader = const LinearGradient(
-        begin: Alignment.topCenter,
-        end: Alignment.bottomCenter,
-        colors: [Color(0x88FFFFFF), Color(0x00FFFFFF)],
-      ).createShader(const Rect.fromLTWH(bowX - 80, bowY - 40, 160, 160));
-
-    // Shadow cast by bow onto wrapper
-    final bowShadow = Path();
-    bowShadow.addOval(
-        Rect.fromCircle(center: const Offset(bowX, bowY + 8), radius: 36));
-    canvas.drawPath(bowShadow, dropShadow);
-
-    // Left Loop of Ribbon
-    path.reset();
-    path.moveTo(bowX - 10, bowY);
-    path.cubicTo(
-        bowX - 58, bowY - 35, bowX - 68, bowY + 7, bowX - 10, bowY + 11);
-    path.close();
-    canvas.drawPath(path, ribbonPaint);
-
-    // Inner shadow of Left Loop
-    path.reset();
-    path.moveTo(bowX - 10, bowY);
-    path.cubicTo(
-        bowX - 42, bowY - 22, bowX - 48, bowY - 5, bowX - 10, bowY + 5);
-    path.close();
-    canvas.drawPath(path, ribbonShadowPaint);
-
-    // Sheen highlight on Left Loop
-    path.reset();
-    path.moveTo(bowX - 18, bowY - 12);
-    path.cubicTo(
-        bowX - 45, bowY - 28, bowX - 55, bowY - 10, bowX - 35, bowY - 2);
-    path.close();
-    canvas.drawPath(path, ribbonSheenPaint);
-
-    // Right Loop of Ribbon
-    path.reset();
-    path.moveTo(bowX + 10, bowY);
-    path.cubicTo(
-        bowX + 58, bowY - 35, bowX + 68, bowY + 7, bowX + 10, bowY + 11);
-    path.close();
-    canvas.drawPath(path, ribbonPaint);
-
-    // Inner shadow of Right Loop
-    path.reset();
-    path.moveTo(bowX + 10, bowY);
-    path.cubicTo(
-        bowX + 42, bowY - 22, bowX + 48, bowY - 5, bowX + 10, bowY + 5);
-    path.close();
-    canvas.drawPath(path, ribbonShadowPaint);
-
-    // Sheen highlight on Right Loop
-    path.reset();
-    path.moveTo(bowX + 18, bowY - 12);
-    path.cubicTo(
-        bowX + 45, bowY - 28, bowX + 55, bowY - 10, bowX + 35, bowY - 2);
-    path.close();
-    canvas.drawPath(path, ribbonSheenPaint);
-
-    // Elegant Left Hanging Ribbon Tail
-    path.reset();
-    path.moveTo(bowX - 6, bowY + 11);
-    path.quadraticBezierTo(bowX - 35, bowY + 45, bowX - 45, bowY + 105);
-    path.lineTo(bowX - 25, bowY + 105);
-    path.lineTo(bowX - 18, bowY + 95);
-    path.lineTo(bowX - 11, bowY + 100);
-    path.quadraticBezierTo(bowX - 5, bowY + 50, bowX, bowY + 11);
-    path.close();
-    canvas.drawPath(path.shift(const Offset(1, 2)), softShadow);
-    canvas.drawPath(path, ribbonPaint);
-
-    // Elegant Right Hanging Ribbon Tail
-    path.reset();
-    path.moveTo(bowX + 6, bowY + 11);
-    path.quadraticBezierTo(bowX + 35, bowY + 45, bowX + 45, bowY + 105);
-    path.lineTo(bowX + 25, bowY + 105);
-    path.lineTo(bowX + 18, bowY + 95);
-    path.lineTo(bowX + 11, bowY + 100);
-    path.quadraticBezierTo(bowX + 5, bowY + 50, bowX, bowY + 11);
-    path.close();
-    canvas.drawPath(path.shift(const Offset(-1, 2)), softShadow);
-    canvas.drawPath(path, ribbonPaint);
-
-    // Center Knot (Sculpted 3D Knot with radial highlight)
-    final knotRect = Rect.fromCenter(
-        center: const Offset(bowX, bowY + 4), width: 28, height: 22);
-    final knotGradient = const RadialGradient(
-      center: Alignment(-0.3, -0.4),
-      radius: 0.8,
-      colors: [Color(0xFFFF6B6B), Color(0xFFC62828), Color(0xFF5E0000)],
-    ).createShader(knotRect);
-
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(knotRect, const Radius.circular(7)),
-      Paint()..shader = knotGradient,
-    );
-
-    // Knot wrinkle highlights
-    final knotHighlight = Paint()
-      ..color = const Color(0x66FFFFFF)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.5;
-    canvas.drawLine(const Offset(bowX - 6, bowY - 2),
-        const Offset(bowX - 4, bowY + 8), knotHighlight);
-    canvas.drawLine(const Offset(bowX + 2, bowY - 2),
-        const Offset(bowX + 4, bowY + 8), knotHighlight);
-    canvas.restore();
+  // Mix the flower types (round-robin) so they are not grouped by kind.
+  const lanes = desired
+    .map(d => ({ tpl: modelCache[d.src] || placeholder, left: d.count }));
+  const list = [];
+  let added = true;
+  while (added) {
+    added = false;
+    lanes.forEach(l => { if (l.left > 0) { list.push(l.tpl); l.left--; added = true; } });
   }
 
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+  const n = list.length;
+  if (n === 0) return;
+  const H = CONFIG.wrapperHeight;
+  const headW = CONFIG.headWidth * 2 * fit.openR;        // the SAME for every flower, whatever n is
+  const spots = layoutHeads(n, headW, fit.openR * CONFIG.spread);
+  const base = new THREE.Vector3(0, fit.waistY, 0);      // where all the stems gather
+
+  list.forEach((tpl, i) => {
+    const p = spots[i];
+    const headFrac = tpl.userData.headFrac || CONFIG.headFrac;   // measured on this flower model
+
+    // 1. Where the head centre must end up.
+    const headY = fit.rimY + CONFIG.headLift * H + CONFIG.dome * H * (1 - p.u * p.u);
+    const target = new THREE.Vector3(p.x, headY, p.z);
+    const dir = target.clone().sub(base).normalize();    // the way the stem leans
+
+    // 2. Size: every head has the same width. It depends only on the flower model and
+    //    the wrapper, NEVER on how many flowers there are. (A very long flower is capped
+    //    so its stem never pokes out of the bottom of the wrapper.)
+    const highestHead = fit.rimY + CONFIG.headLift * H + CONFIG.dome * H;
+    const s = Math.min(headW / (tpl.userData.width || 1), (highestHead - fit.waistY * 0.5) / headFrac);
+
+    const inst = SkeletonUtils.clone(tpl);
+    inst.scale.setScalar(s);
+
+    // 3. Tilt the flower along the stem direction and slide it so the head lands on the spot.
+    const pivot = new THREE.Group();
+    pivot.add(inst);
+    orientFlower(pivot.quaternion, dir, p, i);
+    pivot.position.copy(target).addScaledVector(dir, -headFrac * s);
+    flowerGroup.add(pivot);
+  });
+}
+
+async function setWrapper(b64) {
+  const gltf = await parseGlb(await b64ToBuffer(b64));
+  const model = gltf.scene;
+  model.rotation.x = THREE.MathUtils.degToRad(CONFIG.wrapperTiltXDeg);
+
+  model.traverse(obj => {
+    materialsOf(obj).forEach(m => {
+      m.side = THREE.DoubleSide;                       // show inside AND outside of the paper
+      if (m.metalness !== undefined) m.metalness = CONFIG.wrapperMetalness;   // matte paper, not shiny
+      if (m.roughness !== undefined) m.roughness = CONFIG.wrapperRoughness;
+      m.envMapIntensity = CONFIG.wrapperEnv;
+      m.needsUpdate = true;
+    });
+  });
+
+  // Scale to a fixed height, centre it, and stand its tip on y = 0.
+  let box = new THREE.Box3().setFromObject(model);
+  const size = box.getSize(new THREE.Vector3());
+  model.scale.setScalar(CONFIG.wrapperHeight / (size.y || 1));
+  box = new THREE.Box3().setFromObject(model);
+  const centre = box.getCenter(new THREE.Vector3());
+  model.position.set(-centre.x, -box.min.y, -centre.z);
+
+  while (wrapperGroup.children.length) wrapperGroup.remove(wrapperGroup.children[0]);
+  wrapperGroup.add(model);
+  wrapperGroup.visible = wrapperVisible;
+  applyWrapperColor();
+  measureWrapper();   // find the waist and the opening of THIS wrapper
+  rebuild();          // flowers re-fit to them
+}
+
+// Turns the raw bytes of a flower .glb into a ready-to-clone template.
+async function loadFlowerBuffer(src, buffer) {
+  const gltf = await parseGlb(buffer);
+  const model = gltf.scene;
+
+  // Normalise to height 1 with the bottom-centre at the origin.
+  // rebuild() later multiplies it to the size that fits THIS wrapper.
+  let box = new THREE.Box3().setFromObject(model);
+  const size = box.getSize(new THREE.Vector3());
+  model.scale.setScalar(1 / (size.y || 1));
+  box = new THREE.Box3().setFromObject(model);
+  const centre = box.getCenter(new THREE.Vector3());
+  model.position.set(-centre.x, -box.min.y, -centre.z);
+
+  const holder = new THREE.Group();     // keeps the offset above when the flower is cloned
+  holder.add(model);
+
+  // Measure the HEAD. Leaves and stems can be wider than the head, so only the TOP
+  // 40% of the flower is looked at: that is where the head is on every flower.
+  // From it we learn how high the head centre sits and how wide the head is.
+  holder.updateMatrixWorld(true);
+  const SL = 25;
+  const FIRST = Math.floor(SL * 0.6);
+  const wide = new Array(SL).fill(0);
+  const v = new THREE.Vector3();
+  holder.traverse(o => {
+    if (!o.isMesh || !o.geometry.attributes.position) return;
+    const pos = o.geometry.attributes.position;
+    for (let k = 0; k < pos.count; k++) {
+      v.fromBufferAttribute(pos, k).applyMatrix4(o.matrixWorld);
+      const s = Math.min(SL - 1, Math.max(0, Math.floor(v.y * SL)));
+      const half = Math.max(Math.abs(v.x), Math.abs(v.z));
+      if (half > wide[s]) wide[s] = half;
+    }
+  });
+  let topMax = 0;
+  for (let s = FIRST; s < SL; s++) topMax = Math.max(topMax, wide[s]);
+  let sum = 0, cnt = 0;
+  for (let s = FIRST; s < SL; s++) if (wide[s] >= topMax * 0.7) { sum += s + 0.5; cnt++; }
+  holder.userData.headFrac = cnt ? Math.min(0.98, Math.max(0.6, sum / cnt / SL)) : CONFIG.headFrac;
+  // A head is never thinner than 12% or wider than 60% of the flower's height.
+  holder.userData.width = Math.min(0.6, Math.max(0.12, topMax * 2));
+  post('info:flower ' + src.slice(-40) + ' headFrac=' + holder.userData.headFrac.toFixed(2) +
+       ' headWidth(at height 1)=' + (topMax * 2).toFixed(2));
+  modelCache[src] = holder;
+  rebuild();
+  post('modelready:' + src);
+}
+
+// Built-in models: Flutter sends the bytes (they live inside the app).
+async function loadFlower(src, b64) {
+  await loadFlowerBuffer(src, await b64ToBuffer(b64));
+}
+
+// Server models: THIS PAGE fetches the link straight from the server, like the
+// old model-viewer did. Flutter never touches the file.
+async function loadFlowerFromUrl(src) {
+  const res = await fetch(src);
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  await loadFlowerBuffer(src, await res.arrayBuffer());
+}
+
+// ---- Functions Flutter calls ----------------------------------------------
+window.bloomSetWrapper = b64 => { setWrapper(b64).catch(fail); };
+window.bloomSetWrapperColor = hex => { wrapperColor = hex || ''; applyWrapperColor(); };
+window.bloomShowWrapper = visible => { wrapperVisible = !!visible; wrapperGroup.visible = wrapperVisible; applyFlowerClip(); };
+window.bloomLoadModel = (src, b64) => {
+  loadFlower(src, b64).catch(err => post('modelerror:' + src + '|' + ((err && err.message) || err)));
+};
+window.bloomLoadUrl = src => {
+  loadFlowerFromUrl(src).catch(err => post('modelerror:' + src + '|' + ((err && err.message) || err)));
+};
+window.bloomSetFlowers = list => { desired = list || []; rebuild(); };
+
+// ---- Camera: always fits the whole bouquet, on any screen shape ------------
+function fitCamera() {
+  const w = window.innerWidth, h = window.innerHeight;
+  if (!w || !h) return;
+  renderer.setSize(w, h);
+  camera.aspect = w / h;
+  const half = Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2);
+  const distH = (CONFIG.viewHeight / 2) / half;
+  const distW = (CONFIG.viewWidth / 2) / (half * camera.aspect);
+  const dist = Math.max(distH, distW);
+  camera.position.set(0, CONFIG.lookY + dist * CONFIG.camLift, dist);   // a bit from above, so the flowers inside the opening are visible
+  camera.lookAt(0, CONFIG.lookY, 0);
+  camera.updateProjectionMatrix();
+}
+fitCamera();
+window.addEventListener('resize', fitCamera);
+
+// ---- Drag sideways to turn the bouquet 360 degrees (no auto-spin) ------------
+let dragging = false;
+let lastX = 0;
+renderer.domElement.addEventListener('pointerdown', e => { dragging = true; lastX = e.clientX; });
+window.addEventListener('pointerup', () => { dragging = false; });
+window.addEventListener('pointercancel', () => { dragging = false; });
+window.addEventListener('pointermove', e => {
+  if (!dragging) return;
+  spin.rotation.y += (e.clientX - lastX) * 0.01;
+  lastX = e.clientX;
+});
+
+let lastW = 0, lastH = 0;
+renderer.setAnimationLoop(() => {
+  // The page can start with a 0 x 0 size; catch up as soon as it has one.
+  if (window.innerWidth !== lastW || window.innerHeight !== lastH) {
+    lastW = window.innerWidth;
+    lastH = window.innerHeight;
+    fitCamera();
+  }
+  if (!dragging && CONFIG.autoSpin) spin.rotation.y += CONFIG.autoSpin;
+  renderer.render(scene, camera);
+});
+
+post('ready');   // tells Flutter: "send me the models now"
+</script>
+</body>
+</html>
+''';
 }

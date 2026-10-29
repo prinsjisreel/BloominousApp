@@ -347,16 +347,26 @@ class StylistImageService {
     }
     throw StylistImageException(
       'Your preview was created but could not be downloaded. Please try again.'
+<<<<<<< HEAD
       '${_showProviderDetails ? ' ($lastNote)' : ''}',
+=======
+          '${_showProviderDetails ? ' ($lastNote)' : ''}',
+>>>>>>> 5bdbd9e (some bug fix aned revise)
       code: 'DOWNLOAD_FAILED',
     );
   }
 
   /// Same shape as OrderSubmissionService: fresh ID token, timeout, one error type.
   static Future<Map<String, dynamic>> _post(
+<<<<<<< HEAD
     Map<String, dynamic> payload, {
     Duration timeout = const Duration(seconds: 40),
   }) async {
+=======
+      Map<String, dynamic> payload, {
+        Duration timeout = const Duration(seconds: 40),
+      }) async {
+>>>>>>> 5bdbd9e (some bug fix aned revise)
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) {
       throw StylistImageException('Please sign in to use the Visual Stylist.', code: 'NO_SESSION');

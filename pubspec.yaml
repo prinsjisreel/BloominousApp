@@ -60,4 +60,5 @@ flutter:
     - assets/models/Rose.glb
     - assets/models/Sunflower.glb
     - assets/models/flowerBear.glb
+    - assets/models/wrapper.glb
     - assets/images/logo.jpg
