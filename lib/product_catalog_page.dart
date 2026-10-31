@@ -11,6 +11,7 @@ import 'auth_page.dart';
 import 'ai_assistant_page.dart';
 import 'flora_chat_page.dart';
 import 'product_detail_page.dart';
+import 'restriction_appeal_card.dart';
 
 class ProductCatalogPage extends StatefulWidget {
   const ProductCatalogPage({super.key});
@@ -85,8 +86,12 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
         .listen((doc) {
       if (!mounted || !doc.exists || doc.data() == null) return;
       final data = doc.data()!;
-      final bool isRestricted = data['isRestricted'] ?? false;
       final restrictedUntil = data['restrictedUntil'];
+      // ACTIVE restriction = flagged AND (no end date OR the end date is
+      // still ahead). Same rule as the server, which lifts an expired
+      // restriction by itself.
+      final bool isRestricted = data['isRestricted'] == true &&
+          !(restrictedUntil is Timestamp && !restrictedUntil.toDate().isAfter(DateTime.now()));
 
       String? untilText;
       if (isRestricted && restrictedUntil is Timestamp) {
@@ -698,66 +703,14 @@ class _ProductCatalogPageState extends State<ProductCatalogPage>
     });
   }
 
+  /// The restriction banner WITH the clickable appeal text. All of its
+  /// look and behavior lives in restriction_appeal_card.dart, so the catalog
+  /// and the checkout always show the same thing.
   Widget _buildRestrictionBanner(bool isDark) {
-    return Container(
-      margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-      decoration: BoxDecoration(
-        color: isDark ? const Color(0xFF3A1418) : const Color(0xFFFDF0F0),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(
-          color: (isDark ? Colors.red[300]! : Colors.red[200]!).withOpacity(0.5),
-        ),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Container(
-            padding: const EdgeInsets.all(8),
-            decoration: BoxDecoration(
-              color: Colors.red.withOpacity(isDark ? 0.2 : 0.12),
-              shape: BoxShape.circle,
-            ),
-            child: Icon(Icons.shield_rounded,
-                color: isDark ? Colors.red[300] : Colors.red[600], size: 18),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'SECURITY PROTOCOL RESTRICTION TRIGGERED',
-                  style: TextStyle(
-                    fontWeight: FontWeight.w800,
-                    fontSize: 11,
-                    letterSpacing: 0.2,
-                    color: isDark ? Colors.red[200] : Colors.red[900],
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  'Your account was restricted ${_restrictedUntilText ?? "for 30 days"}. A verification code will be required to place an order.',
-                  style: TextStyle(
-                    fontSize: 11.5,
-                    fontWeight: FontWeight.w600,
-                    color: isDark ? Colors.red[100] : Colors.red[700],
-                  ),
-                ),
-              ],
-            ),
-          ),
-          InkWell(
-            onTap: () => setState(() => _restrictionBannerDismissed = true),
-            borderRadius: BorderRadius.circular(12),
-            child: Padding(
-              padding: const EdgeInsets.all(4),
-              child: Icon(Icons.close_rounded,
-                  size: 18, color: isDark ? Colors.red[300] : Colors.red[400]),
-            ),
-          ),
-        ],
-      ),
+    return RestrictionNotice(
+      compact: true,
+      untilText: _restrictedUntilText,
+      onDismiss: () => setState(() => _restrictionBannerDismissed = true),
     );
   }
 

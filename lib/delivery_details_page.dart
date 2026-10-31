@@ -20,6 +20,7 @@ import 'delivery_schedule.dart';
 import 'delivery_schedule_section.dart';
 import 'saved_address_service.dart';
 import 'saved_addresses_sheet.dart';
+import 'restriction_appeal_card.dart';
 
 const Map<String, String> postalCodes = {
   "Meycauayan": "3020",
@@ -159,24 +160,22 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
   // search must stay quiet, or a suggestion list would pop open by itself.
   bool _suppressStreetSearch = false;
 
-  // --- Account-restriction / phone-trust-restore state ---
-  // FRAUD ACTIVITY MODEL: there is no fraud score anymore. The server
-  // (submit_order.php) records fraud activities for admins to review and
-  // only blocks an order in three situations, all mirrored here:
-  //   - isRestricted == true -> phone verification required (any payment method)
-  //   - status == 'blocked'  -> no orders at all
-  //   - banned device match  -> server restricts the account on the spot
+  // --- Account-restriction state ---
+  // The server (submit_order.php) refuses an order in these situations, all
+  // mirrored here so the screen explains it BEFORE the customer taps:
+  //   - active restriction -> NO payment method works. The only way back is
+  //     an admin approving the customer's appeal (or the 30 days ending).
+  //   - status == 'blocked' -> no orders at all
+  //   - banned device match -> server restricts the account on the spot
   //     (this listener then sees isRestricted flip to true live)
+  // Phone verification no longer lifts a restriction (it used to).
   StreamSubscription<DocumentSnapshot>? _fraudStatusSub;
   bool _isAccountRestricted = false;
   bool _isAccountBlocked = false;
+  // Same answer the server gives (bloom_customer_cod_blocked in
+  // includes/fraud_activity.php): true = Cash on Delivery is not offered.
+  bool _isCodBlocked = false;
   String? _restrictedUntilText;
-  bool _otpVerifiedThisSession = false;
-  bool _isVerifyingPhone = false;
-  String? _phoneVerificationId;
-  int _resendCooldown = 0;
-  Timer? _resendTimer;
-  final TextEditingController _otpInputController = TextEditingController();
   // -------------------------------------------------------
 
   static const double feePerKm = 1.0;
@@ -184,15 +183,6 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
   static const Map<String, String> _nominatimHeaders = {
     'User-Agent': 'BloominousApp/1.0 (contact: support@bloominous.example)',
   };
-
-  static const String _restoreTrustEndpoint =
-      'https://honeydew-duck-132160.hostingersite.com/restore_trust.php';
-
-  // check_phone_risk.php requires only a Firebase ID token — same
-  // platform-agnostic shape as record_email_risk.php — so this is
-  // reused as-is from web, no separate mobile endpoint needed.
-  static const String _phoneRiskEndpoint =
-      'https://honeydew-duck-132160.hostingersite.com/check_phone_risk.php';
 
   @override
   void initState() {
@@ -210,8 +200,6 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
   @override
   void dispose() {
     _fraudStatusSub?.cancel();
-    _resendTimer?.cancel();
-    _otpInputController.dispose();
     _streetSearchDebounce?.cancel();
     streetController.removeListener(_onStreetTextChanged);
     postalCodeController.removeListener(_updateFullAddress);
@@ -361,9 +349,13 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
 
       // "== true" instead of "?? false": a missing OR non-boolean value
       // safely counts as "not restricted" instead of crashing.
-      final bool isRestricted = data['isRestricted'] == true;
-      final bool isBlocked = data['status'] == 'blocked';
       final restrictedUntil = data['restrictedUntil'];
+      // ACTIVE restriction = flagged AND (no end date OR the end date is
+      // still ahead). Same rule as bloom_restriction_state() on the server,
+      // which lifts an expired restriction by itself.
+      final bool isRestricted = data['isRestricted'] == true &&
+          !(restrictedUntil is Timestamp && !restrictedUntil.toDate().isAfter(DateTime.now()));
+      final bool isBlocked = data['status'] == 'blocked';
 
       String? untilText;
       if (isRestricted && restrictedUntil is Timestamp) {
@@ -375,13 +367,60 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
         }
       }
 
+      final bool codBlocked = _codBlockedFor(data);
+
       setState(() {
         _isAccountRestricted = isRestricted;
         _isAccountBlocked = isBlocked;
+        _isCodBlocked = codBlocked;
         _restrictedUntilText = untilText;
-        if (!isRestricted) _otpVerifiedThisSession = false;
+        // The customer had COD selected and the account just lost it:
+        // move them to GCash instead of leaving a choice that will fail.
+        if (codBlocked && selectedPaymentMethod == 'cod') {
+          selectedPaymentMethod = 'gcash';
+        }
       });
     }, onError: (e) => debugPrint('Account status listener error: $e'));
+  }
+
+  /// The words shown for the Cash on Delivery choice.
+  String get _codLabel => sendAsGift
+      ? 'Cash on Delivery (unavailable for gifts)'
+      : _isCodBlocked
+      ? 'Cash on Delivery (unavailable for this account)'
+      : 'Cash on Delivery';
+
+  /// Mirror of the server's bloom_customer_cod_blocked(): COD is hidden when
+  ///   - the account is banned, OR
+  ///   - a restriction is ACTIVE right now (an expired one doesn't count), OR
+  ///   - the account's risk score is 50 or more, unless an admin cleared it
+  ///     as a "false alarm" and nothing new was recorded since.
+  /// The server stays the real judge (it re-checks on Place Order); this copy
+  /// only lets the screen hide COD up front, like the website does.
+  bool _codBlockedFor(Map<String, dynamic> data) {
+    if (data['isBanned'] == true) return true;
+
+    // Active restriction = flagged AND (no end date OR end date still ahead).
+    final until = data['restrictedUntil'];
+    final bool restrictionActive = data['isRestricted'] == true &&
+        !(until is Timestamp && !until.toDate().isAfter(DateTime.now()));
+    if (restrictionActive) return true;
+
+    final rawScore = data['riskScore'] ?? data['fraudScore'] ?? 0;
+    final int score = rawScore is num ? rawScore.toInt() : (int.tryParse('$rawScore') ?? 0);
+    if (score < 50) return false;
+
+    // High score, but an admin may have cleared it as a false alarm.
+    final review = data['fraudReview'];
+    if (review is Map && review['decision'] == 'false_alarm') {
+      final reviewedAt = review['reviewedAt'];
+      final lastActivity = data['lastFraudActivityAt'];
+      if (reviewedAt is Timestamp) {
+        if (lastActivity is! Timestamp) return false; // cleared, nothing newer
+        if (!reviewedAt.toDate().isBefore(lastActivity.toDate())) return false;
+      }
+    }
+    return true;
   }
 
   void _updateFullAddress() {
@@ -870,7 +909,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
           _outsideDeliveryArea = true;
           _outsideAreaMessage = shownRadiusKm != null
               ? '$shownBranchName delivers within ${shownRadiusKm.toStringAsFixed(shownRadiusKm % 1 == 0 ? 0 : 1)} km, '
-                  'and this address is about ${(shownMeters / 1000).toStringAsFixed(1)} km away.'
+              'and this address is about ${(shownMeters / 1000).toStringAsFixed(1)} km away.'
               : 'We could not find a branch that delivers to this address.';
           nearestBranchName = '';
           distanceKm = 0;
@@ -1347,6 +1386,19 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
   }
 
   void _handlePlaceOrderTapped() {
+    // Restricted accounts can't order with ANY payment method until an admin
+    // approves their appeal (the server answers RESTRICTED). The button is
+    // already disabled; this is the safety net.
+    if (_isAccountRestricted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Your account is restricted, so ordering is paused. You can order again once your appeal is approved.'),
+          backgroundColor: Colors.redAccent,
+        ),
+      );
+      return;
+    }
+
     // Blocked accounts can't order at all (the server answers BLOCKED).
     // Stopping here saves a pointless round trip and explains why.
     if (_isAccountBlocked) {
@@ -1370,348 +1422,14 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
       return;
     }
 
-    // Check the delivery date/time BEFORE the phone-verification sheet, so a
-    // customer never verifies their phone only to be stopped by a bad time.
+    // Check the delivery date/time before anything is sent.
     final scheduleError = DeliveryScheduleRules.validate(_currentSchedule());
     if (scheduleError != null) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(scheduleError)));
       return;
     }
 
-    if (_isAccountRestricted && !_otpVerifiedThisSession) {
-      _showPhoneVerificationSheet();
-      return;
-    }
-
     _processCheckout(selectedPaymentMethod);
-  }
-
-  /// UX-tier pre-check (see check_phone_risk.php) — stops an obviously
-  /// disposable/VOIP number before spending an SMS credit and gives
-  /// instant feedback. NOT the real enforcement boundary; submit_order.php
-  /// runs its own unbypassable version of this same check regardless of
-  /// what happens here. Fails OPEN on any error, same policy as web's
-  /// checkout.php.
-  Future<bool> _checkPhoneRiskPreCheck(String normalizedPhone) async {
-    try {
-      final user = FirebaseAuth.instance.currentUser;
-      if (user == null) return true;
-      final idToken = await user.getIdToken();
-
-      final response = await http
-          .post(
-        Uri.parse(_phoneRiskEndpoint),
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer $idToken',
-        },
-        body: jsonEncode({'phone': normalizedPhone}),
-      )
-          .timeout(const Duration(seconds: 8));
-
-      if (response.statusCode != 200) return true;
-
-      final data = jsonDecode(response.body) as Map<String, dynamic>;
-      if (data['success'] != true) return true;
-
-      if (data['block'] == true) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(data['reason'] as String? ??
-                  'This phone number can\'t be used for verification.'),
-              backgroundColor: Colors.redAccent,
-            ),
-          );
-        }
-        return false;
-      }
-      return true;
-    } catch (e) {
-      debugPrint('Phone risk pre-check failed, proceeding anyway: $e');
-      return true;
-    }
-  }
-
-  Future<void> _startPhoneVerification(String rawPhone) async {
-    setState(() => _isVerifyingPhone = true);
-    String phoneNumber = rawPhone.trim();
-    if (!phoneNumber.startsWith('+')) {
-      if (phoneNumber.startsWith('09')) {
-        phoneNumber = '+63${phoneNumber.substring(2)}';
-      } else if (phoneNumber.startsWith('9')) {
-        phoneNumber = '+63$phoneNumber';
-      } else {
-        phoneNumber = '+63$phoneNumber';
-      }
-    }
-
-    // Cheapest, fastest check first — same ordering principle used
-    // throughout this project's fraud pipeline (rate limit before
-    // anything paid, etc.).
-    final allowed = await _checkPhoneRiskPreCheck(phoneNumber);
-    if (!allowed) {
-      setState(() => _isVerifyingPhone = false);
-      return;
-    }
-
-    try {
-      await FirebaseAuth.instance.verifyPhoneNumber(
-        phoneNumber: phoneNumber,
-        timeout: const Duration(seconds: 60),
-        verificationCompleted: (PhoneAuthCredential credential) async {
-          await _linkPhoneCredential(credential);
-        },
-        verificationFailed: (FirebaseAuthException e) {
-          setState(() => _isVerifyingPhone = false);
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('Verification failed: ${e.message}')),
-            );
-          }
-        },
-        codeSent: (String verificationId, int? resendToken) {
-          setState(() {
-            _phoneVerificationId = verificationId;
-            _isVerifyingPhone = false;
-          });
-          _startResendCooldown();
-        },
-        codeAutoRetrievalTimeout: (String verificationId) {
-          _phoneVerificationId = verificationId;
-        },
-      );
-    } catch (e) {
-      setState(() => _isVerifyingPhone = false);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not send verification code: $e')),
-        );
-      }
-    }
-  }
-
-  void _startResendCooldown() {
-    _resendTimer?.cancel();
-    setState(() => _resendCooldown = 60);
-    _resendTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (!mounted) return;
-      setState(() {
-        if (_resendCooldown > 0) {
-          _resendCooldown--;
-        } else {
-          timer.cancel();
-        }
-      });
-    });
-  }
-
-  Future<void> _linkPhoneCredential(PhoneAuthCredential credential) async {
-    setState(() => _isVerifyingPhone = true);
-    try {
-      final user = FirebaseAuth.instance.currentUser;
-      if (user == null) throw 'No active session. Please sign in again.';
-
-      try {
-        await user.linkWithCredential(credential);
-      } on FirebaseAuthException catch (e) {
-        if (e.code != 'provider-already-linked') rethrow;
-      }
-
-      final freshToken = await user.getIdToken(true);
-
-      final response = await http.post(
-        Uri.parse(_restoreTrustEndpoint),
-        headers: {'Authorization': 'Bearer $freshToken'},
-      );
-
-      final result = jsonDecode(response.body) as Map<String, dynamic>;
-      if (result['success'] != true) {
-        throw result['message'] ?? 'Could not restore trust. Please try again.';
-      }
-
-      setState(() {
-        _otpVerifiedThisSession = true;
-        _isVerifyingPhone = false;
-      });
-
-      if (mounted) {
-        Navigator.pop(context);
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Identity verified! Placing your order...'),
-            backgroundColor: Colors.green,
-          ),
-        );
-        _processCheckout(selectedPaymentMethod);
-      }
-    } catch (e) {
-      setState(() => _isVerifyingPhone = false);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Verification failed: $e')),
-        );
-      }
-    }
-  }
-
-  void _showPhoneVerificationSheet() {
-    _otpInputController.clear();
-    _phoneVerificationId = null;
-    _resendCooldown = 0;
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (sheetContext) {
-        return StatefulBuilder(
-          builder: (context, setModalState) {
-            final isDark = Theme.of(context).brightness == Brightness.dark;
-            return Padding(
-              padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
-              child: Container(
-                padding: const EdgeInsets.all(24),
-                decoration: BoxDecoration(
-                  color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
-                  borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
-                ),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Container(
-                      width: 40,
-                      height: 4,
-                      margin: const EdgeInsets.only(bottom: 20),
-                      alignment: Alignment.center,
-                      child: Container(
-                        width: 40,
-                        height: 4,
-                        decoration: BoxDecoration(
-                          color: isDark ? Colors.grey[700] : Colors.grey[300],
-                          borderRadius: BorderRadius.circular(4),
-                        ),
-                      ),
-                    ),
-                    Text('Identity Verification',
-                        style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 18,
-                            color: isDark ? Colors.white : Colors.black)),
-                    const SizedBox(height: 8),
-                    Text(
-                      _phoneVerificationId == null
-                          ? 'Verify your phone number to place orders on this account again.'
-                          : 'Enter the 6-digit code sent to your phone.',
-                      style: TextStyle(fontSize: 12, color: isDark ? Colors.grey[400] : Colors.grey[600]),
-                    ),
-                    const SizedBox(height: 20),
-                    if (_phoneVerificationId == null) ...[
-                      Container(
-                        padding: const EdgeInsets.all(14),
-                        decoration: BoxDecoration(
-                          color: isDark ? const Color(0xFF2A2A2A) : const Color(0xFFF8F8F6),
-                          borderRadius: BorderRadius.circular(14),
-                        ),
-                        child: Row(
-                          children: [
-                            const Icon(Icons.phone_android, color: Color(0xFFF4B400), size: 20),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: Text('We will send a code to ${phoneController.text}',
-                                  style: TextStyle(
-                                      fontSize: 13, color: isDark ? Colors.white : Colors.black87)),
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(height: 20),
-                      SizedBox(
-                        height: 50,
-                        child: ElevatedButton(
-                          onPressed: _isVerifyingPhone
-                              ? null
-                              : () async {
-                            await _startPhoneVerification(phoneController.text);
-                            setModalState(() {});
-                          },
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: const Color(0xFFF4B400),
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                          ),
-                          child: _isVerifyingPhone
-                              ? const SizedBox(
-                              width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
-                              : const Text('SEND CODE', style: TextStyle(fontWeight: FontWeight.bold)),
-                        ),
-                      ),
-                    ] else ...[
-                      TextField(
-                        controller: _otpInputController,
-                        keyboardType: TextInputType.number,
-                        maxLength: 6,
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                            fontSize: 26,
-                            letterSpacing: 10,
-                            fontWeight: FontWeight.bold,
-                            color: isDark ? Colors.white : Colors.black),
-                        decoration: InputDecoration(
-                          counterText: '',
-                          hintText: '000000',
-                          filled: true,
-                          fillColor: isDark ? const Color(0xFF2A2A2A) : const Color(0xFFF8F8F6),
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(14),
-                            borderSide: BorderSide.none,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-                      SizedBox(
-                        height: 50,
-                        child: ElevatedButton(
-                          onPressed: _isVerifyingPhone
-                              ? null
-                              : () {
-                            if (_otpInputController.text.length != 6) return;
-                            final credential = PhoneAuthProvider.credential(
-                              verificationId: _phoneVerificationId!,
-                              smsCode: _otpInputController.text.trim(),
-                            );
-                            _linkPhoneCredential(credential);
-                          },
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: const Color(0xFFF4B400),
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                          ),
-                          child: _isVerifyingPhone
-                              ? const SizedBox(
-                              width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
-                              : const Text('VERIFY', style: TextStyle(fontWeight: FontWeight.bold)),
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      Center(
-                        child: TextButton(
-                          onPressed: (_resendCooldown > 0 || _isVerifyingPhone)
-                              ? null
-                              : () async {
-                            await _startPhoneVerification(phoneController.text);
-                            setModalState(() {});
-                          },
-                          child: Text(_resendCooldown > 0 ? 'Resend in ${_resendCooldown}s' : 'Resend Code'),
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-            );
-          },
-        );
-      },
-    );
   }
 
   Future<void> _processCheckout(String method) async {
@@ -1754,6 +1472,19 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
       return;
     }
 
+    // Restricted: nothing can be sent, whatever the payment method.
+    if (_isAccountRestricted) return;
+
+    // COD removed from this account: never send it (the server would refuse).
+    if (method == 'cod' && _isCodBlocked) {
+      setState(() => selectedPaymentMethod = 'gcash');
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text('Cash on Delivery isn\'t available for this account right now. Please choose GCash or Maya.')),
+      );
+      return;
+    }
+
     // Time may have passed since the customer picked a window (or since they
     // verified their phone), so check it again right before sending.
     final scheduleError = DeliveryScheduleRules.validate(_currentSchedule());
@@ -1789,7 +1520,6 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
         customerLng: _customerLng,
         destinationLat: sendAsGift ? _recipientLat : _customerLat,
         destinationLng: sendAsGift ? _recipientLng : _customerLng,
-        otpVerified: _otpVerifiedThisSession,
         notes: notesController.text,
         deliverySchedule: _currentSchedule(),
       );
@@ -1846,7 +1576,7 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
             SnackBar(
               content: Text(
                 'Order ${result.invoiceId} is saved but not paid yet. '
-                'You can find it under My Orders > To Pay.',
+                    'You can find it under My Orders > To Pay.',
               ),
               duration: const Duration(seconds: 6),
             ),
@@ -1867,12 +1597,16 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
       // banned-device match), but these setStates make the screen react
       // immediately instead of waiting for the listener.
       if (e.code == 'RESTRICTED') {
-        setState(() {
-          _isAccountRestricted = true;
-          _otpVerifiedThisSession = false;
-        });
+        setState(() => _isAccountRestricted = true);
       } else if (e.code == 'BLOCKED') {
         setState(() => _isAccountBlocked = true);
+      } else if (e.code == 'COD_RESTRICTED') {
+        // The server says COD is off for this account (our copy of the rule
+        // was out of date): hide it and fall back to an online method.
+        setState(() {
+          _isCodBlocked = true;
+          selectedPaymentMethod = 'gcash';
+        });
       } else if (e.code == 'OUT_OF_DELIVERY_AREA') {
         // Server says this address is outside the branch's radius.
         setState(() {
@@ -1917,8 +1651,8 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
   }
 
   Widget _buildAccountStatusBanner(bool isDark) {
-    // Blocked wins over restricted: a blocked account can't be fixed by
-    // phone verification, so showing the OTP message would mislead.
+    // Blocked wins over restricted: a blocked account can't appeal, so the
+    // restriction message would mislead.
     if (_isAccountBlocked) {
       return Container(
         width: double.infinity,
@@ -1958,46 +1692,8 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
       );
     }
 
-    final untilPart = _restrictedUntilText != null ? ' $_restrictedUntilText' : '';
-
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.amber.withOpacity(isDark ? 0.15 : 0.1),
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: Colors.amber.withOpacity(0.4)),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Icon(Icons.warning_amber_rounded, color: Colors.amber, size: 22),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  _otpVerifiedThisSession ? 'Identity Verified' : 'Account Temporarily Restricted',
-                  style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 12,
-                    color: isDark ? Colors.amber[200] : Colors.amber[900],
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  _otpVerifiedThisSession
-                      ? 'You\'ve verified your identity for this order. You can now place it normally.'
-                      : 'This account is restricted$untilPart following a review of recent account activity. A verification code sent to your phone is required to place an order.',
-                  style: TextStyle(fontSize: 11, color: isDark ? Colors.amber[100] : Colors.amber[800]),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
+    // Restricted: the notice explains it and carries the clickable appeal text.
+    return RestrictionNotice(untilText: _restrictedUntilText);
   }
 
   @override
@@ -2019,472 +1715,529 @@ class _DeliveryDetailsPageState extends State<DeliveryDetailsPage> {
       body: SafeArea(
         top: false,
         child: SingleChildScrollView(
-        padding: const EdgeInsets.fromLTRB(24, 24, 24, 40),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            if (_isAccountBlocked || _isAccountRestricted) ...[
-              _buildAccountStatusBanner(isDark),
-              const SizedBox(height: 16),
-            ],
-            _sectionCard(
-              context,
-              title: 'Recipient Information',
-              children: [
-                _polishedField(
-                  context: context,
-                  controller: recipientController,
-                  label: 'Recipient Name',
-                  icon: Icons.person_outline,
-                ),
-                const SizedBox(height: 14),
-                _polishedField(
-                  context: context,
-                  controller: phoneController,
-                  label: 'Phone Number',
-                  icon: Icons.phone_android_outlined,
-                  keyboardType: TextInputType.phone,
-                ),
+          padding: const EdgeInsets.fromLTRB(24, 24, 24, 40),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              if (_isAccountBlocked || _isAccountRestricted) ...[
+                _buildAccountStatusBanner(isDark),
+                const SizedBox(height: 16),
               ],
-            ),
+              _sectionCard(
+                context,
+                title: 'Recipient Information',
+                children: [
+                  _polishedField(
+                    context: context,
+                    controller: recipientController,
+                    label: 'Recipient Name',
+                    icon: Icons.person_outline,
+                  ),
+                  const SizedBox(height: 14),
+                  _polishedField(
+                    context: context,
+                    controller: phoneController,
+                    label: 'Phone Number',
+                    icon: Icons.phone_android_outlined,
+                    keyboardType: TextInputType.phone,
+                  ),
+                ],
+              ),
 
-            const SizedBox(height: 20),
+              const SizedBox(height: 20),
 
-            _sectionCard(
-              context,
-              title: 'Gift Checkout',
-              children: [
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: Text(
-                    "Send this order as a gift",
-                    style: TextStyle(
-                      fontWeight: FontWeight.bold,
-                      fontSize: 14,
-                      color: isDark ? Colors.white : Colors.black87,
-                    ),
-                  ),
-                  subtitle: Text(
-                    sendAsGift
-                        ? "You'll need to search and confirm the recipient's exact address below. Cash on Delivery is unavailable for gifts."
-                        : "Recipient contact details will be kept secure.",
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: isDark ? Colors.grey[400] : Colors.grey[600],
-                    ),
-                  ),
-                  value: sendAsGift,
-                  activeColor: const Color(0xFFF4B400),
-                  onChanged: (val) {
-                    setState(() {
-                      sendAsGift = val;
-                      _recipientLat = null;
-                      _recipientLng = null;
-                      distanceKm = 0;
-                      deliveryFee = 0;
-                      nearestBranchName = '';
-                      _outsideDeliveryArea = false;
-                      _outsideAreaMessage = '';
-                      if (val && selectedPaymentMethod == 'cod') {
-                        selectedPaymentMethod = 'gcash';
-                      }
-                    });
-                  },
-                ),
-              ],
-            ),
-
-            const SizedBox(height: 20),
-
-            _sectionCard(
-              context,
-              title: 'Saved Addresses',
-              children: [
-                OutlinedButton.icon(
-                  onPressed: _isApplyingSavedAddress ? null : _openAddressBook,
-                  icon: _isApplyingSavedAddress
-                      ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
-                      : const Icon(Icons.bookmarks_outlined, size: 18),
-                  label: Text(_savedAddresses.isEmpty
-                      ? 'My Address (none saved yet)'
-                      : 'My Address (${_savedAddresses.length} saved)'),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: const Color(0xFFF4B400),
-                    side: const BorderSide(color: Color(0xFFF4B400)),
-                    padding: const EdgeInsets.symmetric(vertical: 14),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                  ),
-                ),
-                const SizedBox(height: 10),
-                if (_editingAddressId != null) ...[
-                  Text(
-                    'You are editing a saved address. Change the details below, then update it.',
-                    style: TextStyle(fontSize: 11, color: isDark ? Colors.grey[400] : Colors.grey[600]),
-                  ),
-                  const SizedBox(height: 10),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: ElevatedButton(
-                          onPressed: _isSavingAddress ? null : _updateEditedAddress,
-                          style: _actionButtonStyle(const Color(0xFFF4B400)),
-                          child: _isSavingAddress
-                              ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
-                              : const Text('UPDATE SAVED ADDRESS',
-                              style: TextStyle(fontWeight: FontWeight.w800, fontSize: 12)),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      TextButton(
-                        onPressed: _isSavingAddress ? null : () => setState(() => _editingAddressId = null),
-                        child: const Text('Cancel'),
-                      ),
-                    ],
-                  ),
-                ] else
-                  CheckboxListTile(
+              _sectionCard(
+                context,
+                title: 'Gift Checkout',
+                children: [
+                  SwitchListTile(
                     contentPadding: EdgeInsets.zero,
-                    controlAffinity: ListTileControlAffinity.leading,
-                    activeColor: const Color(0xFFF4B400),
-                    value: _saveAddressForLater &&
-                        _savedAddresses.length < SavedAddressService.maxAddresses,
-                    onChanged: _savedAddresses.length >= SavedAddressService.maxAddresses
-                        ? null
-                        : (val) => setState(() => _saveAddressForLater = val ?? false),
                     title: Text(
-                      'Save this address for next time',
+                      "Send this order as a gift",
                       style: TextStyle(
                         fontWeight: FontWeight.bold,
-                        fontSize: 13,
+                        fontSize: 14,
                         color: isDark ? Colors.white : Colors.black87,
                       ),
                     ),
                     subtitle: Text(
-                      _savedAddresses.length >= SavedAddressService.maxAddresses
-                          ? 'Your address book is full (${SavedAddressService.maxAddresses}). Delete one to save another.'
-                          : 'Saved to your account only, and shared with the website. Saved after your order is placed.',
+                      sendAsGift
+                          ? "You'll need to search and confirm the recipient's exact address below. Cash on Delivery is unavailable for gifts."
+                          : "Recipient contact details will be kept secure.",
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: isDark ? Colors.grey[400] : Colors.grey[600],
+                      ),
+                    ),
+                    value: sendAsGift,
+                    activeColor: const Color(0xFFF4B400),
+                    onChanged: (val) {
+                      setState(() {
+                        sendAsGift = val;
+                        _recipientLat = null;
+                        _recipientLng = null;
+                        distanceKm = 0;
+                        deliveryFee = 0;
+                        nearestBranchName = '';
+                        _outsideDeliveryArea = false;
+                        _outsideAreaMessage = '';
+                        if (val && selectedPaymentMethod == 'cod') {
+                          selectedPaymentMethod = 'gcash';
+                        }
+                      });
+                    },
+                  ),
+                ],
+              ),
+
+              const SizedBox(height: 20),
+
+              _sectionCard(
+                context,
+                title: 'Saved Addresses',
+                children: [
+                  OutlinedButton.icon(
+                    onPressed: _isApplyingSavedAddress ? null : _openAddressBook,
+                    icon: _isApplyingSavedAddress
+                        ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                        : const Icon(Icons.bookmarks_outlined, size: 18),
+                    label: Text(_savedAddresses.isEmpty
+                        ? 'My Address (none saved yet)'
+                        : 'My Address (${_savedAddresses.length} saved)'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFFF4B400),
+                      side: const BorderSide(color: Color(0xFFF4B400)),
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  if (_editingAddressId != null) ...[
+                    Text(
+                      'You are editing a saved address. Change the details below, then update it.',
                       style: TextStyle(fontSize: 11, color: isDark ? Colors.grey[400] : Colors.grey[600]),
                     ),
-                  ),
-              ],
-            ),
-
-            const SizedBox(height: 20),
-
-            _sectionCard(
-              context,
-              title: 'Delivery Location',
-              children: [
-                _psgcDropdown<PsgcItem>(
-                  context: context,
-                  label: 'Select Region',
-                  icon: Icons.map_outlined,
-                  value: selectedRegionCode,
-                  items: _regions,
-                  isLoading: _isLoadingRegions,
-                  onChanged: (item) => item != null ? _onRegionSelected(item) : null,
-                ),
-                const SizedBox(height: 14),
-                if (!_isMetroManilaSelected) ...[
-                  _psgcDropdown<PsgcItem>(
-                    context: context,
-                    label: 'Select Province',
-                    icon: Icons.explore_outlined,
-                    value: selectedProvinceCode,
-                    items: _provinces,
-                    isLoading: _isLoadingProvinces,
-                    enabled: selectedRegionCode != null,
-                    onChanged: (item) => item != null ? _onProvinceSelected(item) : null,
-                  ),
-                  const SizedBox(height: 14),
-                ],
-                _psgcDropdown<PsgcItem>(
-                  context: context,
-                  label: 'Select City/Municipality',
-                  icon: Icons.location_city_outlined,
-                  value: selectedCityCode,
-                  items: _cities,
-                  isLoading: _isLoadingCities,
-                  enabled: _cities.isNotEmpty,
-                  onChanged: (item) => item != null ? _onCitySelected(item) : null,
-                ),
-                const SizedBox(height: 14),
-                _psgcDropdown<PsgcItem>(
-                  context: context,
-                  label: 'Select Barangay',
-                  icon: Icons.home_work_outlined,
-                  value: selectedBarangayName,
-                  items: _barangays,
-                  isLoading: _isLoadingBarangays,
-                  enabled: selectedCityCode != null,
-                  useNameAsValue: true,
-                  onChanged: (item) {
-                    if (item == null) return;
-                    setState(() {
-                      selectedBarangayName = item.name;
-                      _updateFullAddress();
-                    });
-                  },
-                ),
-                const SizedBox(height: 14),
-                _polishedField(
-                  context: context,
-                  controller: postalCodeController,
-                  label: 'Postal Code',
-                  icon: Icons.local_post_office_outlined,
-                  keyboardType: TextInputType.number,
-                ),
-                const SizedBox(height: 14),
-                _polishedField(
-                  context: context,
-                  controller: streetController,
-                  label: sendAsGift
-                      ? 'Search recipient\'s Street / Building / House No.'
-                      : 'Street Name, Building, House No.',
-                  icon: Icons.edit_road_outlined,
-                  maxLines: 2,
-                  suffixIcon: _isSearchingStreet
-                      ? const Padding(
-                    padding: EdgeInsets.all(14),
-                    child: SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
-                  )
-                      : null,
-                ),
-                if (_streetSuggestions.isNotEmpty)
-                  Container(
-                    margin: const EdgeInsets.only(top: 8),
-                    decoration: BoxDecoration(
-                      color: isDark ? const Color(0xFF262626) : Colors.white,
-                      borderRadius: BorderRadius.circular(14),
-                      border: Border.all(
-                          color: isDark ? Colors.white.withOpacity(0.1) : Colors.grey.withOpacity(0.2)),
-                      boxShadow: [
-                        BoxShadow(
-                            color: Colors.black.withOpacity(isDark ? 0.2 : 0.06),
-                            blurRadius: 10,
-                            offset: const Offset(0, 4)),
-                      ],
-                    ),
-                    child: Column(
-                      children: _streetSuggestions
-                          .map((s) => ListTile(
-                        dense: true,
-                        leading: const Icon(Icons.location_on_outlined, color: Color(0xFFF4B400), size: 20),
-                        title: Text(s.displayName,
-                            style: TextStyle(fontSize: 12, color: isDark ? Colors.white : Colors.black87),
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis),
-                        onTap: () => _onStreetSuggestionSelected(s),
-                      ))
-                          .toList(),
-                    ),
-                  ),
-                if (sendAsGift && _recipientLat != null)
-                  Container(
-                    margin: const EdgeInsets.only(top: 10),
-                    padding: const EdgeInsets.all(10),
-                    decoration: BoxDecoration(
-                      color: Colors.green.withOpacity(isDark ? 0.15 : 0.08),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: const Row(
+                    const SizedBox(height: 10),
+                    Row(
                       children: [
-                        Icon(Icons.check_circle, color: Colors.green, size: 16),
-                        SizedBox(width: 8),
                         Expanded(
-                          child: Text(
-                            'Recipient address confirmed for delivery.',
-                            style: TextStyle(fontSize: 11, color: Colors.green),
+                          child: ElevatedButton(
+                            onPressed: _isSavingAddress ? null : _updateEditedAddress,
+                            style: _actionButtonStyle(const Color(0xFFF4B400)),
+                            child: _isSavingAddress
+                                ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                                : const Text('UPDATE SAVED ADDRESS',
+                                style: TextStyle(fontWeight: FontWeight.w800, fontSize: 12)),
                           ),
+                        ),
+                        const SizedBox(width: 8),
+                        TextButton(
+                          onPressed: _isSavingAddress ? null : () => setState(() => _editingAddressId = null),
+                          child: const Text('Cancel'),
                         ),
                       ],
                     ),
+                  ] else
+                    CheckboxListTile(
+                      contentPadding: EdgeInsets.zero,
+                      controlAffinity: ListTileControlAffinity.leading,
+                      activeColor: const Color(0xFFF4B400),
+                      value: _saveAddressForLater &&
+                          _savedAddresses.length < SavedAddressService.maxAddresses,
+                      onChanged: _savedAddresses.length >= SavedAddressService.maxAddresses
+                          ? null
+                          : (val) => setState(() => _saveAddressForLater = val ?? false),
+                      title: Text(
+                        'Save this address for next time',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 13,
+                          color: isDark ? Colors.white : Colors.black87,
+                        ),
+                      ),
+                      subtitle: Text(
+                        _savedAddresses.length >= SavedAddressService.maxAddresses
+                            ? 'Your address book is full (${SavedAddressService.maxAddresses}). Delete one to save another.'
+                            : 'Saved to your account only, and shared with the website. Saved after your order is placed.',
+                        style: TextStyle(fontSize: 11, color: isDark ? Colors.grey[400] : Colors.grey[600]),
+                      ),
+                    ),
+                ],
+              ),
+
+              const SizedBox(height: 20),
+
+              _sectionCard(
+                context,
+                title: 'Delivery Location',
+                children: [
+                  _psgcDropdown<PsgcItem>(
+                    context: context,
+                    label: 'Select Region',
+                    icon: Icons.map_outlined,
+                    value: selectedRegionCode,
+                    items: _regions,
+                    isLoading: _isLoadingRegions,
+                    onChanged: (item) => item != null ? _onRegionSelected(item) : null,
                   ),
-              ],
-            ),
-
-            const SizedBox(height: 16),
-            _buildLocationMap(context),
-            const SizedBox(height: 12),
-
-            if (_outsideDeliveryArea)
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: Colors.red.withOpacity(isDark ? 0.15 : 0.08),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.red.withOpacity(0.4)),
-                ),
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Icon(Icons.location_off, color: Colors.red, size: 20),
-                    const SizedBox(width: 12),
-                    Expanded(
+                  const SizedBox(height: 14),
+                  if (!_isMetroManilaSelected) ...[
+                    _psgcDropdown<PsgcItem>(
+                      context: context,
+                      label: 'Select Province',
+                      icon: Icons.explore_outlined,
+                      value: selectedProvinceCode,
+                      items: _provinces,
+                      isLoading: _isLoadingProvinces,
+                      enabled: selectedRegionCode != null,
+                      onChanged: (item) => item != null ? _onProvinceSelected(item) : null,
+                    ),
+                    const SizedBox(height: 14),
+                  ],
+                  _psgcDropdown<PsgcItem>(
+                    context: context,
+                    label: 'Select City/Municipality',
+                    icon: Icons.location_city_outlined,
+                    value: selectedCityCode,
+                    items: _cities,
+                    isLoading: _isLoadingCities,
+                    enabled: _cities.isNotEmpty,
+                    onChanged: (item) => item != null ? _onCitySelected(item) : null,
+                  ),
+                  const SizedBox(height: 14),
+                  _psgcDropdown<PsgcItem>(
+                    context: context,
+                    label: 'Select Barangay',
+                    icon: Icons.home_work_outlined,
+                    value: selectedBarangayName,
+                    items: _barangays,
+                    isLoading: _isLoadingBarangays,
+                    enabled: selectedCityCode != null,
+                    useNameAsValue: true,
+                    onChanged: (item) {
+                      if (item == null) return;
+                      setState(() {
+                        selectedBarangayName = item.name;
+                        _updateFullAddress();
+                      });
+                    },
+                  ),
+                  const SizedBox(height: 14),
+                  _polishedField(
+                    context: context,
+                    controller: postalCodeController,
+                    label: 'Postal Code',
+                    icon: Icons.local_post_office_outlined,
+                    keyboardType: TextInputType.number,
+                  ),
+                  const SizedBox(height: 14),
+                  _polishedField(
+                    context: context,
+                    controller: streetController,
+                    label: sendAsGift
+                        ? 'Search recipient\'s Street / Building / House No.'
+                        : 'Street Name, Building, House No.',
+                    icon: Icons.edit_road_outlined,
+                    maxLines: 2,
+                    suffixIcon: _isSearchingStreet
+                        ? const Padding(
+                      padding: EdgeInsets.all(14),
+                      child: SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                    )
+                        : null,
+                  ),
+                  if (_streetSuggestions.isNotEmpty)
+                    Container(
+                      margin: const EdgeInsets.only(top: 8),
+                      decoration: BoxDecoration(
+                        color: isDark ? const Color(0xFF262626) : Colors.white,
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(
+                            color: isDark ? Colors.white.withOpacity(0.1) : Colors.grey.withOpacity(0.2)),
+                        boxShadow: [
+                          BoxShadow(
+                              color: Colors.black.withOpacity(isDark ? 0.2 : 0.06),
+                              blurRadius: 10,
+                              offset: const Offset(0, 4)),
+                        ],
+                      ),
                       child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: _streetSuggestions
+                            .map((s) => ListTile(
+                          dense: true,
+                          leading: const Icon(Icons.location_on_outlined, color: Color(0xFFF4B400), size: 20),
+                          title: Text(s.displayName,
+                              style: TextStyle(fontSize: 12, color: isDark ? Colors.white : Colors.black87),
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis),
+                          onTap: () => _onStreetSuggestionSelected(s),
+                        ))
+                            .toList(),
+                      ),
+                    ),
+                  if (sendAsGift && _recipientLat != null)
+                    Container(
+                      margin: const EdgeInsets.only(top: 10),
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: Colors.green.withOpacity(isDark ? 0.15 : 0.08),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: const Row(
                         children: [
-                          Text('Outside our delivery area',
-                              style: TextStyle(
-                                  fontWeight: FontWeight.bold,
-                                  fontSize: 13,
-                                  color: isDark ? Colors.white : Colors.black87)),
-                          const SizedBox(height: 2),
-                          Text(_outsideAreaMessage,
-                              style: TextStyle(
-                                  fontSize: 12,
-                                  color: isDark ? Colors.grey[300] : Colors.grey[700])),
+                          Icon(Icons.check_circle, color: Colors.green, size: 16),
+                          SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'Recipient address confirmed for delivery.',
+                              style: TextStyle(fontSize: 11, color: Colors.green),
+                            ),
+                          ),
                         ],
                       ),
                     ),
-                  ],
-                ),
+                ],
               ),
 
-            if (nearestBranchName.isNotEmpty && !_outsideDeliveryArea)
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: Colors.blue.withOpacity(isDark ? 0.12 : 0.05),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.blue.withOpacity(0.2)),
+              const SizedBox(height: 16),
+              _buildLocationMap(context),
+              const SizedBox(height: 12),
+
+              if (_outsideDeliveryArea)
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.red.withOpacity(isDark ? 0.15 : 0.08),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.red.withOpacity(0.4)),
+                  ),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Icon(Icons.location_off, color: Colors.red, size: 20),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text('Outside our delivery area',
+                                style: TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 13,
+                                    color: isDark ? Colors.white : Colors.black87)),
+                            const SizedBox(height: 2),
+                            Text(_outsideAreaMessage,
+                                style: TextStyle(
+                                    fontSize: 12,
+                                    color: isDark ? Colors.grey[300] : Colors.grey[700])),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
-                child: Row(
-                  children: [
-                    const Icon(Icons.storefront, color: Colors.blue, size: 20),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
+
+              if (nearestBranchName.isNotEmpty && !_outsideDeliveryArea)
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.blue.withOpacity(isDark ? 0.12 : 0.05),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.blue.withOpacity(0.2)),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.storefront, color: Colors.blue, size: 20),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text('Nearest Branch: $nearestBranchName',
+                                style: TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 13,
+                                    color: isDark ? Colors.white : Colors.black87)),
+                            Text(
+                              isUsingRealRoadDistance
+                                  ? 'Google Maps Road Distance: ${distanceKm.toStringAsFixed(1)} KM'
+                                  : 'Est. Road Distance: ${distanceKm.toStringAsFixed(1)} KM',
+                              style: TextStyle(
+                                color: isUsingRealRoadDistance
+                                    ? Colors.green[isDark ? 300 : 700]
+                                    : (isDark ? Colors.grey[400] : Colors.grey[600]),
+                                fontSize: 12,
+                                fontWeight: isUsingRealRoadDistance ? FontWeight.bold : FontWeight.normal,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+
+              const SizedBox(height: 8),
+              if (!sendAsGift)
+                TextButton.icon(
+                  onPressed: isCalculatingFee || isAutoFillingAddress ? null : _handleGetCurrentLocation,
+                  icon: (isCalculatingFee || isAutoFillingAddress)
+                      ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.my_location),
+                  label: const Text('Get Current Location'),
+                ),
+
+              const SizedBox(height: 12),
+
+              _sectionCard(
+                context,
+                title: 'Order Notes',
+                children: [
+                  _polishedField(
+                    context: context,
+                    controller: notesController,
+                    label: 'Specific instructions (Optional)',
+                    icon: Icons.notes,
+                    maxLines: 3,
+                  ),
+                ],
+              ),
+
+              const SizedBox(height: 20),
+
+              _sectionCard(
+                context,
+                title: 'Delivery Date & Time',
+                children: [
+                  DeliveryScheduleSection(
+                    isScheduled: _scheduleEnabled,
+                    date: _scheduleDate,
+                    slot: _scheduleSlot,
+                    onModeChanged: _onScheduleModeChanged,
+                    onPickDate: _pickScheduleDate,
+                    onSlotSelected: (slot) => setState(() => _scheduleSlot = slot),
+                  ),
+                ],
+              ),
+
+              const SizedBox(height: 20),
+
+              _sectionCard(
+                context,
+                title: 'Payment Method',
+                children: [
+                  DropdownButtonFormField<String>(
+                    value: selectedPaymentMethod,
+                    // RESPONSIVE: fill the card's width instead of growing to
+                    // the widest item (the long Cash on Delivery sentence),
+                    // which is what overflowed the row on narrow phones.
+                    isExpanded: true,
+                    dropdownColor: isDark ? const Color(0xFF262626) : Colors.white,
+                    style: TextStyle(color: isDark ? Colors.white : Colors.black87, fontSize: 14),
+                    decoration: _fieldDecoration(context, 'Select Payment Method', Icons.payment_outlined),
+                    // What the CLOSED field shows: one line, "..." if too long.
+                    // Same order as `items` below (GCash, Maya, COD).
+                    selectedItemBuilder: (context) => [
+                      for (final label in ['GCash', 'Maya', _codLabel])
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis),
+                        ),
+                    ],
+                    items: [
+                      const DropdownMenuItem(value: 'gcash', child: Text('GCash')),
+                      const DropdownMenuItem(value: 'maya', child: Text('Maya')),
+                      DropdownMenuItem(
+                        value: 'cod',
+                        // COD is disabled for gift orders AND for accounts the
+                        // server refuses COD for (restricted / high risk /
+                        // banned). Same rules as the website's checkout and
+                        // submit_order.php.
+                        enabled: !sendAsGift && !_isCodBlocked,
+                        child: Text(
+                          _codLabel,
+                          style: TextStyle(
+                              color: (sendAsGift || _isCodBlocked) ? Colors.grey : null),
+                        ),
+                      ),
+                    ],
+                    // null = the whole dropdown is greyed out and can't be opened:
+                    // a restricted account has NO usable payment method.
+                    onChanged: _isAccountRestricted
+                        ? null
+                        : (val) {
+                      if (val == null) return;
+                      if (val == 'cod' && (sendAsGift || _isCodBlocked)) return;
+                      setState(() => selectedPaymentMethod = val);
+                    },
+                  ),
+                  // Explain WHY COD is greyed out (never mentions scores).
+                  if (_isCodBlocked && !sendAsGift && !_isAccountRestricted) ...[
+                    const SizedBox(height: 12),
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFF4B400).withOpacity(isDark ? 0.12 : 0.10),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: const Color(0xFFF4B400).withOpacity(0.35)),
+                      ),
+                      child: Row(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text('Nearest Branch: $nearestBranchName',
+                          const Icon(Icons.info_outline, size: 18, color: Color(0xFFF4B400)),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Text(
+                              'Cash on Delivery isn\'t available for this account right now. '
+                                  'Please pay with GCash or Maya.',
                               style: TextStyle(
-                                  fontWeight: FontWeight.bold,
-                                  fontSize: 13,
-                                  color: isDark ? Colors.white : Colors.black87)),
-                          Text(
-                            isUsingRealRoadDistance
-                                ? 'Google Maps Road Distance: ${distanceKm.toStringAsFixed(1)} KM'
-                                : 'Est. Road Distance: ${distanceKm.toStringAsFixed(1)} KM',
-                            style: TextStyle(
-                              color: isUsingRealRoadDistance
-                                  ? Colors.green[isDark ? 300 : 700]
-                                  : (isDark ? Colors.grey[400] : Colors.grey[600]),
-                              fontSize: 12,
-                              fontWeight: isUsingRealRoadDistance ? FontWeight.bold : FontWeight.normal,
+                                fontSize: 12,
+                                color: isDark ? Colors.grey[300] : Colors.grey[800],
+                              ),
                             ),
                           ),
                         ],
                       ),
                     ),
                   ],
-                ),
+                ],
               ),
 
-            const SizedBox(height: 8),
-            if (!sendAsGift)
-              TextButton.icon(
-                onPressed: isCalculatingFee || isAutoFillingAddress ? null : _handleGetCurrentLocation,
-                icon: (isCalculatingFee || isAutoFillingAddress)
-                    ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
-                    : const Icon(Icons.my_location),
-                label: const Text('Get Current Location'),
-              ),
+              const SizedBox(height: 24),
+              _buildOrderSummary(context),
+              const SizedBox(height: 28),
 
-            const SizedBox(height: 12),
-
-            _sectionCard(
-              context,
-              title: 'Order Notes',
-              children: [
-                _polishedField(
-                  context: context,
-                  controller: notesController,
-                  label: 'Specific instructions (Optional)',
-                  icon: Icons.notes,
-                  maxLines: 3,
-                ),
-              ],
-            ),
-
-            const SizedBox(height: 20),
-
-            _sectionCard(
-              context,
-              title: 'Delivery Date & Time',
-              children: [
-                DeliveryScheduleSection(
-                  isScheduled: _scheduleEnabled,
-                  date: _scheduleDate,
-                  slot: _scheduleSlot,
-                  onModeChanged: _onScheduleModeChanged,
-                  onPickDate: _pickScheduleDate,
-                  onSlotSelected: (slot) => setState(() => _scheduleSlot = slot),
-                ),
-              ],
-            ),
-
-            const SizedBox(height: 20),
-
-            _sectionCard(
-              context,
-              title: 'Payment Method',
-              children: [
-                DropdownButtonFormField<String>(
-                  value: selectedPaymentMethod,
-                  dropdownColor: isDark ? const Color(0xFF262626) : Colors.white,
-                  style: TextStyle(color: isDark ? Colors.white : Colors.black87, fontSize: 14),
-                  decoration: _fieldDecoration(context, 'Select Payment Method', Icons.payment_outlined),
-                  items: [
-                    const DropdownMenuItem(value: 'gcash', child: Text('GCash')),
-                    const DropdownMenuItem(value: 'maya', child: Text('Maya')),
-                    DropdownMenuItem(
-                      value: 'cod',
-                      // COD is disabled ONLY for gift orders — same rule as
-                      // web and submit_order.php. Account restrictions apply
-                      // to every payment method equally (phone OTP), so they
-                      // don't change which methods are listed here.
-                      enabled: !sendAsGift,
+              if (isLoading)
+                const Center(child: CircularProgressIndicator(color: Color(0xFFF4B400)))
+              else
+                SizedBox(
+                  height: 58,
+                  child: ElevatedButton(
+                    // null = disabled: blocked AND restricted accounts can't order.
+                    onPressed: (_isAccountBlocked || _isAccountRestricted) ? null : _handlePlaceOrderTapped,
+                    style: _actionButtonStyle(const Color(0xFFF4B400)),
+                    // FittedBox shrinks the label to fit ONE line on any width,
+                    // instead of wrapping inside the 58px-high button.
+                    child: FittedBox(
+                      fit: BoxFit.scaleDown,
                       child: Text(
-                        sendAsGift ? 'Cash on Delivery (unavailable for gifts)' : 'Cash on Delivery',
-                        style: TextStyle(color: sendAsGift ? Colors.grey : null),
+                        _isAccountBlocked
+                            ? 'ORDERING UNAVAILABLE'
+                            : _isAccountRestricted
+                            ? 'ORDERING PAUSED - ACCOUNT RESTRICTED'
+                            : 'PLACE ORDER',
+                        maxLines: 1,
+                        style: const TextStyle(fontWeight: FontWeight.w800, letterSpacing: 1),
                       ),
                     ),
-                  ],
-                  onChanged: (val) {
-                    if (val == null) return;
-                    if (val == 'cod' && sendAsGift) return;
-                    setState(() => selectedPaymentMethod = val);
-                  },
-                ),
-              ],
-            ),
-
-            const SizedBox(height: 24),
-            _buildOrderSummary(context),
-            const SizedBox(height: 28),
-
-            if (isLoading)
-              const Center(child: CircularProgressIndicator(color: Color(0xFFF4B400)))
-            else
-              SizedBox(
-                height: 58,
-                child: ElevatedButton(
-                  // null = disabled: a blocked account can't order.
-                  onPressed: _isAccountBlocked ? null : _handlePlaceOrderTapped,
-                  style: _actionButtonStyle(const Color(0xFFF4B400)),
-                  child: Text(
-                    _isAccountBlocked ? 'ORDERING UNAVAILABLE' : 'PLACE ORDER',
-                    style: const TextStyle(fontWeight: FontWeight.w800, letterSpacing: 1),
                   ),
                 ),
-              ),
-          ],
-        ),
-      )
-          .animate()
-          .fadeIn(duration: 400.ms, curve: Curves.easeOut)
-          .slideX(begin: -0.15, end: 0, duration: 400.ms, curve: Curves.easeOut),
+            ],
+          ),
+        )
+            .animate()
+            .fadeIn(duration: 400.ms, curve: Curves.easeOut)
+            .slideX(begin: -0.15, end: 0, duration: 400.ms, curve: Curves.easeOut),
       ),
     );
   }
